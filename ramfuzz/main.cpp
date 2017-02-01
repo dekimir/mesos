@@ -1,100 +1,84 @@
 #include "fuzz.hpp"
 
+using namespace google::protobuf;
+using namespace ramfuzz::runtime;
+
+namespace {
+
+const Descriptor* makeDesc(gen& g)
+{
+  FileDescriptorProto fp;
+  fp.mutable_message_type()->AddAllocated(
+    g.make<DescriptorProto>(g.or_subclass));
+  return g.make<DescriptorPool>()->BuildFile(fp)->message_type(0);
+}
+
+const FieldDescriptor* makeField(gen& g)
+{
+  FileDescriptorProto fp;
+  fp.mutable_message_type()->AddAllocated(
+    g.make<DescriptorProto>(g.or_subclass));
+  fp.mutable_message_type(0)->mutable_field()->AddAllocated(
+    g.make<FieldDescriptorProto>(g.or_subclass));
+  return g.make<DescriptorPool>()->BuildFile(fp)->message_type(0)->field(0);
+}
+
+const OneofDescriptor* makeOneof(gen& g)
+{
+  // Seems like OneofDescriptorProto only houses the name -- the fields are
+  // inserted right into the parent proto by the parser.  But then how does
+  // OneofDescriptor get its FieldDescriptors??  Heh, descriptor.cc:4522
+  // comments "We need to fill these in later". :) Hm, CrossLinkMessage() seems
+  // to access a field's containing_oneof() -- where is that set?  I guess
+  // FieldDescriptors are made with the appropriate OneofDescriptor* already set
+  // (likely from the FieldDescriptorProto::oneof_index, set by the parser).
+  FileDescriptorProto fp;
+  fp.mutable_message_type()->AddAllocated(
+    g.make<DescriptorProto>(g.or_subclass));
+  fp.mutable_message_type(0)->mutable_field()->AddAllocated(
+    g.make<FieldDescriptorProto>(g.or_subclass));
+  fp.mutable_message_type(0)->mutable_field(0)->set_oneof_index(
+    *g.make<int32_t>());
+  fp.mutable_message_type(0)->mutable_oneof_decl()->AddAllocated(
+    g.make<OneofDescriptorProto>());
+  return g.make<DescriptorPool>()
+    ->BuildFile(fp)
+    ->message_type(0)
+    ->field(0)
+    ->containing_oneof();
+}
+
+const EnumValueDescriptor* makeEnumVal(gen& g)
+{
+  EnumDescriptorProto ep;
+  ep.mutable_value()->AddAllocated(g.make<EnumValueDescriptorProto>());
+  FileDescriptorProto fp;
+  fp.mutable_enum_type()->AddAllocated(
+    g.make<EnumDescriptorProto>(g.or_subclass));
+  return g.make<DescriptorPool>()->BuildFile(fp)->enum_type(0)->value(0);
+}
+
+} // anonymous namespace
+
 namespace ramfuzz {
 
-// Descriptor
-rfgoogle_protobuf_Descriptor::control
-rfgoogle_protobuf_Descriptor::control::make(runtime::gen&)
+harness<Descriptor>::harness(runtime::gen& g)
+  : g(g), obj(*const_cast<Descriptor*>(makeDesc(g)))
 {
 }
 
-template <>
-void runtime::gen::set_any<google::protobuf::Descriptor>(
-  google::protobuf::Descriptor&)
+harness<FieldDescriptor>::harness(runtime::gen& g)
+  : g(g), obj(*const_cast<FieldDescriptor*>(makeField(g)))
 {
 }
 
-template <>
-void runtime::gen::set_any<google::protobuf::Descriptor>(
-  google::protobuf::Descriptor*&)
+harness<OneofDescriptor>::harness(runtime::gen& g)
+  : g(g), obj(*const_cast<OneofDescriptor*>(makeOneof(g)))
 {
 }
 
-template <>
-void runtime::gen::set_any<google::protobuf::Descriptor>(
-  const google::protobuf::Descriptor*&)
-{
-}
-
-// FieldDescriptor
-rfgoogle_protobuf_FieldDescriptor::control
-rfgoogle_protobuf_FieldDescriptor::control::make(runtime::gen&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::FieldDescriptor>(
-  google::protobuf::FieldDescriptor&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::FieldDescriptor>(
-  google::protobuf::FieldDescriptor*&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::FieldDescriptor>(
-  const google::protobuf::FieldDescriptor*&)
-{
-}
-
-// OneofDescriptor
-rfgoogle_protobuf_OneofDescriptor::control
-rfgoogle_protobuf_OneofDescriptor::control::make(runtime::gen&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::OneofDescriptor>(
-  google::protobuf::OneofDescriptor&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::OneofDescriptor>(
-  google::protobuf::OneofDescriptor*&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::OneofDescriptor>(
-  const google::protobuf::OneofDescriptor*&)
-{
-}
-
-// EnumValueDescriptor
-rfgoogle_protobuf_EnumValueDescriptor::control
-rfgoogle_protobuf_EnumValueDescriptor::control::make(runtime::gen&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::EnumDescriptor>(
-  google::protobuf::EnumDescriptor&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::EnumDescriptor>(
-  google::protobuf::EnumDescriptor*&)
-{
-}
-
-template <>
-void runtime::gen::set_any<google::protobuf::EnumDescriptor>(
-  const google::protobuf::EnumDescriptor*&)
+harness<EnumValueDescriptor>::harness(runtime::gen& g)
+  : g(g), obj(*const_cast<EnumValueDescriptor*>(makeEnumVal(g)))
 {
 }
 
@@ -102,12 +86,8 @@ unsigned runtime::spinlimit = 10;
 
 } // namespace ramfuzz
 
-using namespace ramfuzz;
-using namespace ramfuzz::runtime;
-
 int main(int argc, char* argv[])
 {
-  gen g(argc, argv);
-  auto c = spin_roulette<rfmesos_MesosSchedulerDriver::control>(g);
-  return bool(c);
+  using namespace ramfuzz::runtime;
+  return gen(argc, argv).make<mesos::MesosSchedulerDriver>()->abort();
 }
