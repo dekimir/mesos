@@ -88,6 +88,5 @@ unsigned runtime::spinlimit = 10;
 
 int main(int argc, char* argv[])
 {
-  using namespace ramfuzz::runtime;
   return gen(argc, argv).make<mesos::MesosSchedulerDriver>()->abort();
 }
