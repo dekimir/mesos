@@ -8,7 +8,7 @@ PB=$MB/3rdparty/protobuf-2.6.1/src
 GP=$PB/google/protobuf
 INC="-I$MI -I$MBI -I$PB"
 
-~/src/llvmbuild/bin/ramfuzz \
+~/src/lb/bin/ramfuzz \
     $GP/descriptor.h \
     $GP/descriptor.pb.h \
     $GP/descriptor_database.h \
