@@ -10,6 +10,6 @@ RF=~/src/ramfuzz
 INC="-I$MI -I$MBI -I$PB -I$RF/runtime"
 
 
-c++ -std=c++11 -g $INC \
+c++ -std=c++11 -g -fsanitize=address $INC \
     ${1:-main.cpp} missimpl.cpp fuzz.cpp $RF/runtime/ramfuzz-rt.cpp \
     /usr/local/lib/libmesos-1.1.0.dylib
