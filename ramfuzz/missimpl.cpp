@@ -15,6 +15,14 @@ const Descriptor* makeDesc(gen& g)
   return g.make<DescriptorPool>()->BuildFile(fp)->message_type(0);
 }
 
+const FileDescriptor* makeFileDesc(gen& g)
+{
+  FileDescriptorProto fp;
+  fp.mutable_message_type()->AddAllocated(
+    g.make<DescriptorProto>(g.or_subclass));
+  return g.make<DescriptorPool>()->BuildFile(fp);
+}
+
 const FieldDescriptor* makeField(gen& g)
 {
   FileDescriptorProto fp;
@@ -81,6 +89,11 @@ harness<OneofDescriptor>::harness(runtime::gen& g)
 
 harness<EnumValueDescriptor>::harness(runtime::gen& g)
   : g(g), obj(*const_cast<EnumValueDescriptor*>(makeEnumVal(g)))
+{
+}
+
+harness<FileDescriptor>::harness(runtime::gen& g)
+  : g(g), obj(*const_cast<FileDescriptor*>(makeFileDesc(g)))
 {
 }
 
