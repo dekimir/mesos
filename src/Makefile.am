@@ -365,6 +365,7 @@ V1_JAVA_PROTOS =							\
   java/generated/org/apache/mesos/v1/maintenance/Protos.java		\
   java/generated/org/apache/mesos/v1/master/Protos.java			\
   java/generated/org/apache/mesos/v1/quota/Protos.java			\
+  java/generated/org/apache/mesos/v1/resource_provider/Protos.java	\
   java/generated/org/apache/mesos/v1/scheduler/Protos.java
 
 V1_PYTHON_PROTOS =                                                      \
@@ -375,6 +376,7 @@ V1_PYTHON_PROTOS =                                                      \
   python/interface/src/mesos/v1/interface/master_pb2.py                 \
   python/interface/src/mesos/v1/interface/mesos_pb2.py                  \
   python/interface/src/mesos/v1/interface/quota_pb2.py                  \
+  python/interface/src/mesos/v1/interface/resource_provider_pb2.py      \
   python/interface/src/mesos/v1/interface/scheduler_pb2.py
 
 BUILT_SOURCES +=							\
@@ -421,19 +423,15 @@ java/generated/org/apache/mesos/scheduler/Protos.java: $(SCHEDULER_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
-java/generated/org/apache/mesos/v1/executor/Protos.java: $(V1_EXECUTOR_PROTO)
-	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
-
-java/generated/org/apache/mesos/v1/quota/Protos.java: $(V1_QUOTA_PROTO)
-	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
-
 java/generated/org/apache/mesos/v1/agent/Protos.java: $(V1_AGENT_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
 java/generated/org/apache/mesos/v1/allocator/Protos.java: $(V1_ALLOCATOR_PROTO)
+	$(MKDIR_P) $(@D)
+	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
+
+java/generated/org/apache/mesos/v1/executor/Protos.java: $(V1_EXECUTOR_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
@@ -446,6 +444,14 @@ java/generated/org/apache/mesos/v1/master/Protos.java: $(V1_MASTER_PROTO)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
 java/generated/org/apache/mesos/v1/Protos.java: $(V1_MESOS_PROTO)
+	$(MKDIR_P) $(@D)
+	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
+
+java/generated/org/apache/mesos/v1/quota/Protos.java: $(V1_QUOTA_PROTO)
+	$(MKDIR_P) $(@D)
+	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
+
+java/generated/org/apache/mesos/v1/resource_provider/Protos.java: $(V1_RESOURCE_PROVIDER_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) $(PROTOCFLAGS) --java_out=java/generated $^
 
@@ -514,6 +520,12 @@ python/interface/src/mesos/v1/interface/mesos_pb2.py: $(V1_MESOS_PROTO)
 python/interface/src/mesos/v1/interface/quota_pb2.py: $(V1_QUOTA_PROTO)
 	$(MKDIR_P) $(@D)
 	$(PROTOC) -I$(top_srcdir)/include/mesos/v1/quota $(PROTOCFLAGS)		\
+		--python_out=python/interface/src/mesos/v1/interface $^
+	$(SED) -i.bak 's/mesos\.mesos_pb2/mesos_pb2/' $@ && rm $@.bak
+
+python/interface/src/mesos/v1/interface/resource_provider_pb2.py: $(V1_RESOURCE_PROVIDER_PROTO)
+	$(MKDIR_P) $(@D)
+	$(PROTOC) -I$(top_srcdir)/include/mesos/v1/resource_provider $(PROTOCFLAGS)	\
 		--python_out=python/interface/src/mesos/v1/interface $^
 	$(SED) -i.bak 's/mesos\.mesos_pb2/mesos_pb2/' $@ && rm $@.bak
 
@@ -880,6 +892,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   authorizer/authorizer.cpp						\
   authorizer/local/authorizer.cpp					\
   checks/checker.cpp							\
+  checks/checker_process.cpp						\
   checks/health_checker.cpp						\
   common/attributes.cpp							\
   common/command_utils.cpp						\
@@ -1011,6 +1024,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   authentication/cram_md5/auxprop.hpp					\
   authorizer/local/authorizer.hpp					\
   checks/checker.hpp							\
+  checks/checker_process.hpp						\
   checks/health_checker.hpp						\
   common/build.hpp							\
   common/command_utils.hpp						\
@@ -1448,6 +1462,7 @@ libmesos_la_SOURCES =							\
   $(OCI_SPEC_PROTO)							\
   $(OVERSUBSCRIPTION_PROTO)						\
   $(QUOTA_PROTO)							\
+  $(RESOURCE_PROVIDER_PROTO)						\
   $(SCHEDULER_PROTO)							\
   $(STATE_PROTO)							\
   $(URI_PROTO)								\
@@ -1458,6 +1473,7 @@ libmesos_la_SOURCES =							\
   $(V1_MASTER_PROTO)							\
   $(V1_MESOS_PROTO)							\
   $(V1_QUOTA_PROTO)							\
+  $(V1_RESOURCE_PROVIDER_PROTO)						\
   $(V1_SCHEDULER_PROTO)
 
 libmesos_la_LDFLAGS = -release $(PACKAGE_VERSION)
@@ -1768,6 +1784,7 @@ libjava_la_DEPENDENCIES =						\
   $(V1_MASTER_PROTO)							\
   $(V1_MESOS_PROTO)							\
   $(V1_QUOTA_PROTO)							\
+  $(V1_RESOURCE_PROVIDER_PROTO)						\
   $(V1_SCHEDULER_PROTO)
 
 # We don't add libjava.la to libmesos_no_3rdparty.la so we don't

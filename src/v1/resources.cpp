@@ -261,6 +261,15 @@ bool operator==(const Resource& left, const Resource& right)
     return false;
   }
 
+  // Check ResourceProviderID.
+  if (left.has_provider_id() != right.has_provider_id()) {
+    return false;
+  }
+
+  if (left.has_provider_id() && left.provider_id() != right.provider_id()) {
+    return false;
+  }
+
   // Check SharedInfo.
   if (left.has_shared() != right.has_shared()) {
     return false;
@@ -355,7 +364,7 @@ static bool addable(const Resource& left, const Resource& right)
     return false;
   }
 
-  // Check ResourceProvider.
+  // Check ResourceProviderID.
   if (left.has_provider_id() != right.has_provider_id()) {
     return false;
   }
@@ -441,7 +450,7 @@ static bool subtractable(const Resource& left, const Resource& right)
     return false;
   }
 
-  // Check ResourceProvider.
+  // Check ResourceProviderID.
   if (left.has_provider_id() != right.has_provider_id()) {
     return false;
   }
@@ -459,7 +468,8 @@ static bool contains(const Resource& left, const Resource& right)
 {
   // NOTE: This is a necessary condition for 'contains'.
   // 'subtractable' will verify name, role, type, ReservationInfo,
-  // DiskInfo, SharedInfo and RevocableInfo compatibility.
+  // DiskInfo, SharedInfo, RevocableInfo, and ResourceProviderID
+  // compatibility.
   if (!subtractable(left, right)) {
     return false;
   }
@@ -1256,6 +1266,7 @@ Resources Resources::createStrippedScalarQuantity() const
   foreach (const Resource& resource, resources) {
     if (resource.type() == Value::SCALAR) {
       Resource scalar = resource;
+      scalar.clear_provider_id();
       scalar.clear_allocation_info();
       scalar.clear_reservation();
       scalar.clear_disk();
