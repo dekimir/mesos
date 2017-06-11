@@ -2491,6 +2491,20 @@ EXTRA_DIST +=							\
   examples/python/test_executor.py				\
   examples/python/test_framework.py
 
+ramfuzz_tests_CPPFLAGS = $(mesos_tests_CPPFLAGS)
+ramfuzz_tests_LDADD = libmesos.la $(mesos_tests_LDADD)
+
+check_PROGRAMS += ramfuzz-tests
+
+ramfuzz_tests_SOURCES =						\
+  tests/ramfuzz/http_tests.cpp					\
+  tests/ramfuzz/gtest_main.cc
+
+ramfuzz_tests_DEPENDENCIES =					\
+  ../3rdparty/libgmock.la					\
+  libmesos.la							\
+  $(MESOS_TEST_MODULES)
+
 
 dist_check_SCRIPTS +=						\
   tests/balloon_framework_test.sh				\
@@ -2571,6 +2585,9 @@ uninstall-hook:
 # http://lists.gnu.org/archive/html/automake/2013-01/msg00051.html
 check-local: tests
 	$(TEST_DRIVER) ./mesos-tests
+
+check-ramfuzz: ramfuzz-tests all $(check_PROGRAMS)
+	$(TEST_DRIVER) ./ramfuzz-tests
 
 if INSTALL_TESTS
 # If we enabled test installation, we can run the tests from the
