@@ -2491,14 +2491,15 @@ EXTRA_DIST +=							\
   examples/python/test_executor.py				\
   examples/python/test_framework.py
 
-ramfuzz_tests_CPPFLAGS = $(mesos_tests_CPPFLAGS)
+ramfuzz_tests_CPPFLAGS = $(mesos_tests_CPPFLAGS) -I../../ramfuzz -I../../../ramfuzz/runtime
 ramfuzz_tests_LDADD = libmesos.la $(mesos_tests_LDADD)
 
 check_PROGRAMS += ramfuzz-tests
 
 ramfuzz_tests_SOURCES =						\
   tests/ramfuzz/http_tests.cpp					\
-  tests/ramfuzz/gtest_main.cc
+  tests/ramfuzz/gtest_main.cc					\
+  tests/ramfuzz/fuzz.cpp
 
 ramfuzz_tests_DEPENDENCIES =					\
   ../3rdparty/libgmock.la					\

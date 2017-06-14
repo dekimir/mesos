@@ -29,6 +29,8 @@
 
 #include "messages/messages.hpp"
 
+#include "fuzz.hpp"
+
 using namespace mesos;
 using namespace mesos::internal;
 
@@ -148,6 +150,32 @@ TEST(HTTPTest, ModelTask)
   EXPECT_EQ(expected.get(), object);
 }
 
+class RamFuzzTest : public ::testing::Test {
+protected:
+  static ramfuzz::runtime::gen rfg;
+};
+
+ramfuzz::runtime::gen RamFuzzTest::rfg;
+unsigned ramfuzz::runtime::spinlimit = 3;
+
+using RamFuzz_HTTPTest = RamFuzzTest;
+
+TEST_F(RamFuzz_HTTPTest, ModelResources)
+{
+  rfg.make<Resources>(rfg.or_subclass);
+
+  // Invariant: resources are grouped by (name, revocation) in a Resources
+  // object.  There should be exactly one Resources element (between begin() and
+  // end()) for each distinct (name, revocation) pair put into the object.
+  //  - operations that add name/revocation pairs: text parsing, +, +=, -, -=
+
+  // Invariant: a group's value is a particular combo of members' values.
+
+  // Invariant: JSON model is an array of name*:value pairs, where name* may
+  // include "_revocable".
+  //  - obvious problem: a resource's original name may end with "_revocable";
+  //    negligible, as humans pick those names
+}
 
 // This test verifies that Resources model combines all resources of different
 // roles and filters out revocable resources.
