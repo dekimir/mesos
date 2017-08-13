@@ -36,3 +36,4 @@ missing
 GPATH
 GRTAGS
 GTAGS
+/src/tests/ramfuzz/fuzz.cpp
