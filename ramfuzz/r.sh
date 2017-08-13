@@ -21,9 +21,12 @@ INC="-I$MI -I$MBI -I$PB -I$BOO -I$STO -I$GL -I$PJ"
     $GP/io/zero_copy_stream.h \
     $GP/message.h \
     $GP/message_lite.h \
+    $GP/repeated_field.h \
     $GP/unknown_field_set.h \
     $MI/mesos/resources.hpp \
     $PM/mesos.pb.h \
+    $STO/stout/none.hpp \
+    $STO/stout/option.hpp \
     -- -xc++ -std=c++11 $INC
 
 echo '#include <google/protobuf/io/coded_stream_inl.h>' >> fuzz.cpp
