@@ -2588,6 +2588,8 @@ check_PROGRAMS += ramfuzz-tests
 ramfuzz_tests_SOURCES =						\
   tests/ramfuzz/http_tests.cpp					\
   tests/ramfuzz/gtest_main.cc					\
+  tests/ramfuzz/ramfuzz-rt.cpp					\
+  tests/ramfuzz/missimpl.cpp					\
   tests/ramfuzz/fuzz.cpp
 
 ramfuzz_tests_DEPENDENCIES =					\

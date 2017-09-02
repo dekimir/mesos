@@ -37,3 +37,5 @@ GPATH
 GRTAGS
 GTAGS
 /src/tests/ramfuzz/fuzz.cpp
+/src/tests/ramfuzz/missimpl.cpp
+/src/tests/ramfuzz/ramfuzz-rt.cpp
