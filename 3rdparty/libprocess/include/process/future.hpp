@@ -175,32 +175,34 @@ public:
   template <typename F>
   const Future<T>& onDiscard(_Deferred<F>&& deferred) const
   {
-    return onDiscard(deferred.operator std::function<void()>());
+    return onDiscard(std::move(deferred).operator std::function<void()>());
   }
 
   template <typename F>
   const Future<T>& onReady(_Deferred<F>&& deferred) const
   {
-    return onReady(deferred.operator std::function<void(const T&)>());
+    return onReady(
+        std::move(deferred).operator std::function<void(const T&)>());
   }
 
   template <typename F>
   const Future<T>& onFailed(_Deferred<F>&& deferred) const
   {
     return onFailed(
-        deferred.operator std::function<void(const std::string&)>());
+        std::move(deferred).operator std::function<void(const std::string&)>());
   }
 
   template <typename F>
   const Future<T>& onDiscarded(_Deferred<F>&& deferred) const
   {
-    return onDiscarded(deferred.operator std::function<void()>());
+    return onDiscarded(std::move(deferred).operator std::function<void()>());
   }
 
   template <typename F>
   const Future<T>& onAny(_Deferred<F>&& deferred) const
   {
-    return onAny(deferred.operator std::function<void(const Future<T>&)>());
+    return onAny(
+        std::move(deferred).operator std::function<void(const Future<T>&)>());
   }
 
 private:
@@ -334,21 +336,22 @@ public:
   // and associates the result of the callback with the future that is
   // returned to the caller (which may be of a different type).
   template <typename X>
-  Future<X> then(const lambda::function<Future<X>(const T&)>& f) const;
+  Future<X> then(lambda::function<Future<X>(const T&)> f) const;
 
   template <typename X>
-  Future<X> then(const lambda::function<X(const T&)>& f) const;
+  Future<X> then(lambda::function<X(const T&)> f) const;
 
   template <typename X>
-  Future<X> then(const lambda::function<Future<X>()>& f) const
+  Future<X> then(lambda::function<Future<X>()> f) const
   {
-    return then(lambda::function<Future<X>(const T&)>(lambda::bind(f)));
+    return then(
+        lambda::function<Future<X>(const T&)>(lambda::bind(std::move(f))));
   }
 
   template <typename X>
-  Future<X> then(const lambda::function<X()>& f) const
+  Future<X> then(lambda::function<X()> f) const
   {
-    return then(lambda::function<X(const T&)>(lambda::bind(f)));
+    return then(lambda::function<X(const T&)>(lambda::bind(std::move(f))));
   }
 
 private:
@@ -360,7 +363,7 @@ private:
   {
     // note the then<X> is necessary to not have an infinite loop with
     // then(F&& f)
-    return then<X>(f.operator std::function<Future<X>(const T&)>());
+    return then<X>(std::move(f).operator std::function<Future<X>(const T&)>());
   }
 
   // Refer to the less preferred version of `onReady` for why these SFINAE
@@ -373,13 +376,13 @@ private:
               F>::type()>::type>::type>
   Future<X> then(_Deferred<F>&& f, LessPrefer) const
   {
-    return then<X>(f.operator std::function<Future<X>()>());
+    return then<X>(std::move(f).operator std::function<Future<X>()>());
   }
 
   template <typename F, typename X = typename internal::unwrap<typename result_of<F(const T&)>::type>::type> // NOLINT(whitespace/line_length)
   Future<X> then(F&& f, Prefer) const
   {
-    return then<X>(std::function<Future<X>(const T&)>(f));
+    return then<X>(std::function<Future<X>(const T&)>(std::forward<F>(f)));
   }
 
   // Refer to the less preferred version of `onReady` for why these SFINAE
@@ -392,7 +395,7 @@ private:
               F>::type()>::type>::type>
   Future<X> then(F&& f, LessPrefer) const
   {
-    return then<X>(std::function<Future<X>()>(f));
+    return then<X>(std::function<Future<X>()>(std::forward<F>(f)));
   }
 
 public:
@@ -1396,14 +1399,14 @@ void after(
 
 template <typename T>
 template <typename X>
-Future<X> Future<T>::then(const lambda::function<Future<X>(const T&)>& f) const
+Future<X> Future<T>::then(lambda::function<Future<X>(const T&)> f) const
 {
   std::shared_ptr<Promise<X>> promise(new Promise<X>());
 
   lambda::function<void(const Future<T>&)> thenf =
-    lambda::bind(&internal::thenf<T, X>, f, promise, lambda::_1);
+    lambda::bind(&internal::thenf<T, X>, std::move(f), promise, lambda::_1);
 
-  onAny(thenf);
+  onAny(std::move(thenf));
 
   // Propagate discarding up the chain. To avoid cyclic dependencies,
   // we keep a weak future in the callback.
@@ -1416,14 +1419,14 @@ Future<X> Future<T>::then(const lambda::function<Future<X>(const T&)>& f) const
 
 template <typename T>
 template <typename X>
-Future<X> Future<T>::then(const lambda::function<X(const T&)>& f) const
+Future<X> Future<T>::then(lambda::function<X(const T&)> f) const
 {
   std::shared_ptr<Promise<X>> promise(new Promise<X>());
 
   lambda::function<void(const Future<T>&)> then =
-    lambda::bind(&internal::then<T, X>, f, promise, lambda::_1);
+    lambda::bind(&internal::then<T, X>, std::move(f), promise, lambda::_1);
 
-  onAny(then);
+  onAny(std::move(then));
 
   // Propagate discarding up the chain. To avoid cyclic dependencies,
   // we keep a weak future in the callback.
@@ -1619,6 +1622,97 @@ void discardPromises(std::set<Promise<T>*>* promises, const Future<T>& future)
       return;
     }
   }
+}
+
+
+// Returns a future that will not propagate a discard through to the
+// future passed in as an argument. This can be very valuable if you
+// want to block some future from getting discarded.
+//
+// Example:
+//
+//   Promise<int> promise;
+//   Future<int> future = undiscardable(promise.future());
+//   future.discard();
+//   assert(!promise.future().hasDiscard());
+//
+// Or another example, when chaining futures:
+//
+//   Future<int> future = undiscardable(
+//       foo()
+//         .then([]() { ...; })
+//         .then([]() { ...; }));
+//
+// This will guarantee that a discard _will not_ propagate to `foo()`
+// or any of the futures returned from the invocations of `.then()`.
+template <typename T>
+Future<T> undiscardable(const Future<T>& future)
+{
+  std::shared_ptr<Promise<T>> promise(new Promise<T>());
+  future.onAny([promise](const Future<T>& future) {
+    promise->associate(future);
+  });
+  return promise->future();
+}
+
+
+// Decorator that for some callable `f` invokes
+// `undiscardable(f(args))` for some `args`. This is used by the
+// overload of `undiscardable()` that takes callables instead of a
+// specialization of `Future`.
+//
+// TODO(benh): Factor out a generic decorator pattern to be used in
+// other circumstances, e.g., to replace `_Deferred`.
+template <typename F>
+struct UndiscardableDecorator
+{
+  template <
+    typename G,
+    typename std::enable_if<
+      std::is_constructible<F, G>::value, int>::type = 0>
+  UndiscardableDecorator(G&& g) : f(std::forward<G>(g)) {}
+
+  template <typename... Args>
+  auto operator()(Args&&... args)
+    -> decltype(std::declval<F&>()(std::forward<Args>(args)...))
+  {
+    using Result =
+      typename std::decay<decltype(f(std::forward<Args>(args)...))>::type;
+
+    static_assert(
+        is_specialization_of<Future, Result>::value,
+        "Expecting Future<T> to be returned from undiscarded(...)");
+
+    return undiscardable(f(std::forward<Args>(args)...));
+  }
+
+  F f;
+};
+
+
+// An overload of `undiscardable()` above that takes and returns a
+// callable. The returned callable has decorated the provided callable
+// `f` such that when the returned callable is invoked it will in turn
+// invoke `undiscardable(f(args))` for some `args`. See
+// `UndiscardableDecorator` above for more details.
+//
+// Example:
+//
+//   Future<int> future = foo()
+//     .then(undiscardable([]() { ...; }));
+//
+// This guarantees that even if `future` is discarded the discard will
+// not propagate into the lambda passed into `.then()`.
+template <
+  typename F,
+  typename std::enable_if<
+    !is_specialization_of<
+      Future,
+      typename std::decay<F>::type>::value, int>::type = 0>
+UndiscardableDecorator<typename std::decay<F>::type> undiscardable(F&& f)
+{
+  return UndiscardableDecorator<
+    typename std::decay<F>::type>(std::forward<F>(f));
 }
 
 }  // namespace process {

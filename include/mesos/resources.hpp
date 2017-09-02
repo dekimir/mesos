@@ -53,13 +53,13 @@
 
 namespace mesos {
 
-// NOTE: Resource objects stored in the class are always valid and
-// kept combined if possible. It is the caller's responsibility to
-// validate any Resource object or repeated Resource protobufs before
-// constructing a Resources object. Otherwise, invalid Resource
-// objects will be silently stripped. Invalid Resource objects will
-// also be silently ignored when used in arithmetic operations (e.g.,
-// +=, -=, etc.).
+// NOTE: Resource objects stored in the class are always valid, are in
+// the "post-reservation-refinement" format, and kept combined if possible.
+// It is the caller's responsibility to validate any Resource object or
+// repeated Resource protobufs before constructing a Resources object.
+// Otherwise, invalid Resource objects will be silently stripped.
+// Invalid Resource objects will also be silently ignored when used in
+// arithmetic operations (e.g., +=, -=, etc.).
 class Resources
 {
 private:
@@ -263,15 +263,12 @@ public:
   static Option<Error> validate(
       const google::protobuf::RepeatedPtrField<Resource>& resources);
 
-  // NOTE: The following predicate functions assume that the given
-  // resource is validated.
+  // NOTE: The following predicate functions assume that the given resource is
+  // validated, and is in the "post-reservation-refinement" format. That is,
+  // the reservation state is represented by `Resource.reservations` field,
+  // and `Resource.role` and `Resource.reservation` fields are not set.
   //
-  // Valid states of (role, reservation) pair in the Resource object.
-  //   Unreserved         : ("*", None)
-  //   Static reservation : (R, None)
-  //   Dynamic reservation: (R, { principal: <framework_principal> })
-  //
-  // NOTE: ("*", { principal: <framework_principal> }) is invalid.
+  // See 'Resource Format' section in `mesos.proto` for more details.
 
   // Tests if the given Resource object is empty.
   static bool isEmpty(const Resource& resource);
@@ -285,6 +282,15 @@ public:
       const Resource& resource,
       const Option<std::string>& role = None());
 
+  // Tests if the given Resource object is allocatable to the given role.
+  // A resource object is allocatable to 'role' if:
+  //   * it is reserved to an ancestor of that role in the hierarchy, OR
+  //   * it is reserved to 'role' itself, OR
+  //   * it is unreserved.
+  static bool isAllocatableTo(
+      const Resource& resource,
+      const std::string& role);
+
   // Tests if the given Resource object is unreserved.
   static bool isUnreserved(const Resource& resource);
 
@@ -296,6 +302,13 @@ public:
 
   // Tests if the given Resource object is shared.
   static bool isShared(const Resource& resource);
+
+  // Tests if the given Resource object has refined reservations.
+  static bool hasRefinedReservations(const Resource& resource);
+
+  // Returns the role to which the given Resource object is reserved for.
+  // This must be called only when the resource is reserved!
+  static const std::string& reservationRole(const Resource& resource);
 
   // Returns the summed up Resources given a hashmap<Key, Resources>.
   //
@@ -380,6 +393,10 @@ public:
   // and will be ignored.
   Resources reserved(const Option<std::string>& role = None()) const;
 
+  // Returns resources allocatable to role. See `isAllocatableTo` for the
+  // definition of 'allocatableTo'.
+  Resources allocatableTo(const std::string& role) const;
+
   // Returns the unreserved resources.
   Resources unreserved() const;
 
@@ -402,22 +419,16 @@ public:
   // This must be called only when the resources are allocated!
   hashmap<std::string, Resources> allocations() const;
 
-  // Returns a Resources object with the same amount of each resource
-  // type as these Resources, but with all Resource objects marked as
-  // the specified (role, reservation) pair. This is used to cross
-  // reservation boundaries without affecting the actual resources.
-  // If the optional ReservationInfo is given, the resource's
-  // 'reservation' field is set. Otherwise, the resource's
-  // 'reservation' field is cleared.
-  // Returns an Error when the role is invalid or the reservation
-  // is set when the role is '*'.
-  Try<Resources> flatten(
-      const std::string& role,
-      const Option<Resource::ReservationInfo>& reservation = None()) const;
+  // Returns a `Resources` object with the new reservation added to the back.
+  // The new reservation must be a valid refinement of the current reservation.
+  Resources pushReservation(const Resource::ReservationInfo& reservation) const;
 
-  // Equivalent to `flatten("*")` except it returns a Resources directly
-  // because the result is always a valid in this case.
-  Resources flatten() const;
+  // Returns a `Resources` object with the last reservation removed.
+  // Every resource in `Resources` must have `resource.reservations_size() > 0`.
+  Resources popReservation() const;
+
+  // Returns a `Resources` object with all of the reservations removed.
+  Resources toUnreserved() const;
 
   // Returns a Resources object that contains all the scalar resources
   // in this object, but with their AllocationInfo, ReservationInfo,

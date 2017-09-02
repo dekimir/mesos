@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <mesos/mesos.hpp>
+#include <mesos/resources.hpp>
 #include <mesos/roles.hpp>
 #include <mesos/type_utils.hpp>
 
@@ -68,7 +69,7 @@ const char RESOURCES_TARGET_FILE[] = "resources.target";
 const char SLAVES_DIR[] = "slaves";
 const char FRAMEWORKS_DIR[] = "frameworks";
 const char EXECUTORS_DIR[] = "executors";
-const char CONTAINERS_DIR[] = "runs";
+const char EXECUTOR_RUNS_DIR[] = "runs";
 
 
 Try<ExecutorRunPath> parseExecutorRunPath(
@@ -87,7 +88,8 @@ Try<ExecutorRunPath> parseExecutorRunPath(
         "the root directory: " + rootDir);
   }
 
-  vector<string> tokens = strings::tokenize(dir.substr(rootDir.size()), "/");
+  vector<string> tokens = strings::tokenize(
+      dir.substr(rootDir.size()), stringify(os::PATH_SEPARATOR));
 
   // A complete executor run path consists of at least 8 tokens, which
   // includes the four named directories and the four IDs.
@@ -101,7 +103,7 @@ Try<ExecutorRunPath> parseExecutorRunPath(
   if (tokens[0] == SLAVES_DIR &&
       tokens[2] == FRAMEWORKS_DIR &&
       tokens[4] == EXECUTORS_DIR &&
-      tokens[6] == CONTAINERS_DIR) {
+      tokens[6] == EXECUTOR_RUNS_DIR) {
     ExecutorRunPath path;
 
     path.slaveId.set_value(tokens[1]);
@@ -246,7 +248,7 @@ Try<list<string>> getExecutorRunPaths(
 {
   return fs::list(path::join(
       getExecutorPath(rootDir, slaveId, frameworkId, executorId),
-      CONTAINERS_DIR,
+      EXECUTOR_RUNS_DIR,
       "*"));
 }
 
@@ -260,7 +262,7 @@ string getExecutorRunPath(
 {
   return path::join(
       getExecutorPath(rootDir, slaveId, frameworkId, executorId),
-      CONTAINERS_DIR,
+      EXECUTOR_RUNS_DIR,
       stringify(containerId));
 }
 
@@ -309,7 +311,7 @@ string getExecutorLatestRunPath(
 {
   return path::join(
       getExecutorPath(rootDir, slaveId, frameworkId, executorId),
-      CONTAINERS_DIR,
+      EXECUTOR_RUNS_DIR,
       LATEST_SYMLINK);
 }
 
@@ -475,21 +477,24 @@ string getPersistentVolumePath(
     const string& rootDir,
     const Resource& volume)
 {
-  CHECK(volume.has_role());
+  CHECK_GT(volume.reservations_size(), 0);
   CHECK(volume.has_disk());
   CHECK(volume.disk().has_persistence());
 
+  const string& role = Resources::reservationRole(volume);
+
   // Additionally check that the role and the persistent ID are valid
   // before using them to construct a directory path.
-  CHECK_NONE(roles::validate(volume.role()));
+  CHECK_NONE(roles::validate(role));
   CHECK_NONE(common::validation::validateID(volume.disk().persistence().id()));
+
 
   // If no `source` is provided in `DiskInfo` volumes are mapped into
   // the `rootDir`.
   if (!volume.disk().has_source()) {
     return getPersistentVolumePath(
         rootDir,
-        volume.role(),
+        role,
         volume.disk().persistence().id());
   }
 
@@ -503,7 +508,7 @@ string getPersistentVolumePath(
       CHECK(volume.disk().source().path().has_root());
       return getPersistentVolumePath(
           volume.disk().source().path().root(),
-          volume.role(),
+          role,
           volume.disk().persistence().id());
     }
     case Resource::DiskInfo::Source::MOUNT: {

@@ -81,8 +81,6 @@ using mesos::master::detector::MasterDetector;
 using mesos::modules::Anonymous;
 using mesos::modules::ModuleManager;
 
-using mesos::master::detector::MasterDetector;
-
 using mesos::slave::QoSController;
 using mesos::slave::ResourceEstimator;
 
@@ -296,7 +294,13 @@ int main(int argc, char** argv)
         "Only one of `--ip` or `--ip_discovery_command` should be specified");
   }
 
+  if (flags.ip6_discovery_command.isSome() && flags.ip6.isSome()) {
+    EXIT(EXIT_FAILURE) << flags.usage(
+        "Only one of `--ip6` or `--ip6_discovery_command` should be specified");
+  }
+
   if (flags.ip_discovery_command.isSome()) {
+#ifndef __WINDOWS__
     Try<string> ipAddress = os::shell(flags.ip_discovery_command.get());
 
     if (ipAddress.isError()) {
@@ -304,8 +308,28 @@ int main(int argc, char** argv)
     }
 
     os::setenv("LIBPROCESS_IP", strings::trim(ipAddress.get()));
+#else
+    EXIT(EXIT_FAILURE)
+      << "The `--ip_discovery_command` is not yet supported on Windows";
+#endif // __WINDOWS__
   } else if (flags.ip.isSome()) {
     os::setenv("LIBPROCESS_IP", flags.ip.get());
+  }
+
+  if (flags.ip6_discovery_command.isSome()) {
+#ifndef __WINDOWS__
+    Try<string> ip6Address = os::shell(flags.ip6_discovery_command.get());
+    if (ip6Address.isError()) {
+      EXIT(EXIT_FAILURE) << ip6Address.error();
+    }
+
+    os::setenv("LIBPROCESS_IP6", strings::trim(ip6Address.get()));
+#else
+    EXIT(EXIT_FAILURE)
+      << "The `--ip6_discovery_command` is not yet supported on Windows";
+#endif // __WINDOWS__
+  } else if (flags.ip6.isSome()) {
+    os::setenv("LIBPROCESS_IP6", flags.ip6.get());
   }
 
   os::setenv("LIBPROCESS_PORT", stringify(flags.port));
@@ -465,7 +489,7 @@ int main(int argc, char** argv)
   }
 
   Try<MasterDetector*> detector_ = MasterDetector::create(
-      flags.master, flags.master_detector);
+      flags.master, flags.master_detector, flags.zk_session_timeout);
 
   if (detector_.isError()) {
     EXIT(EXIT_FAILURE)

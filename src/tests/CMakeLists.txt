@@ -35,7 +35,7 @@ if (NOT WIN32)
     kill_policy_test_helper.cpp
     containerizer/memory_test_helper.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 if (LINUX)
   set(TEST_HELPER_SRC
@@ -43,7 +43,7 @@ if (LINUX)
     containerizer/capabilities_test_helper.cpp
     containerizer/setns_test_helper.cpp
     )
-endif (LINUX)
+endif ()
 
 # Test utilities.
 #################
@@ -58,6 +58,7 @@ set(MESOS_TESTS_UTILS_SRC
   main.cpp
   mesos.cpp
   mock_docker.cpp
+  mock_fetcher.cpp
   mock_registrar.cpp
   mock_slave.cpp
   module.cpp
@@ -73,7 +74,7 @@ if (NOT WIN32)
     script.cpp
     containerizer/memory_test_helper.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 if (LINUX)
   set(MESOS_TESTS_UTILS_SRC
@@ -81,7 +82,7 @@ if (LINUX)
     containerizer/capabilities_test_helper.cpp
     containerizer/setns_test_helper.cpp
     )
-endif (LINUX)
+endif ()
 
 # All the test sources.
 #######################
@@ -94,6 +95,7 @@ set(MESOS_TESTS_SRC
   authentication_tests.cpp
   check_tests.cpp
   command_executor_tests.cpp
+  common_validation_tests.cpp
   credentials_tests.cpp
   default_executor_tests.cpp
   exception_tests.cpp
@@ -114,6 +116,8 @@ set(MESOS_TESTS_SRC
   protobuf_io_tests.cpp
   rate_limiting_tests.cpp
   resource_offers_tests.cpp
+  resource_provider_manager_tests.cpp
+  resource_provider_validation_tests.cpp
   resources_tests.cpp
   role_tests.cpp
   scheduler_driver_tests.cpp
@@ -135,7 +139,7 @@ if (ENABLE_SSL)
     ${MESOS_TESTS_SRC}
     secret_generator_tests.cpp
     )
-endif (ENABLE_SSL)
+endif ()
 
 set(MESOS_TESTS_SRC
   ${MESOS_TESTS_SRC}
@@ -146,6 +150,7 @@ set(MESOS_TESTS_SRC
 
 set(MESOS_TESTS_SRC
   ${MESOS_TESTS_SRC}
+  containerizer/containerizer_tests.cpp
   containerizer/docker_tests.cpp
   )
 
@@ -211,7 +216,7 @@ if (NOT WIN32)
     containerizer/provisioner_paths_tests.cpp
     containerizer/volume_sandbox_path_isolator_tests.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 if (LINUX)
   set(MESOS_TESTS_SRC
@@ -234,10 +239,11 @@ if (LINUX)
     containerizer/rootfs.cpp
     containerizer/runtime_isolator_tests.cpp
     containerizer/sched_tests.cpp
+    containerizer/volume_host_path_isolator_tests.cpp
     containerizer/volume_image_isolator_tests.cpp
     containerizer/volume_secret_isolator_tests.cpp
     )
-endif (LINUX)
+endif ()
 
 # INCLUDE DIRECTIVES (generates, e.g., -I/path/to/thing on Linux).
 ##################################################################
@@ -305,7 +311,7 @@ if (NOT WIN32)
     ${TEST_HTTP_EXECUTOR}
     ${TEST_HTTP_FRAMEWORK}
     )
-endif (NOT WIN32)
+endif ()
 
 add_dependencies(${TEST_HELPER_TARGET} ${MESOS_TESTS_DEPENDENCIES})
 

@@ -339,7 +339,8 @@ bool operator==(const MasterInfo& left, const MasterInfo& right)
     left.port() == right.port() &&
     left.pid() == right.pid() &&
     left.hostname() == right.hostname() &&
-    left.version() == right.version();
+    left.version() == right.version() &&
+    left.domain() == right.domain();
 }
 
 
@@ -355,7 +356,11 @@ bool operator==(
     return false;
   }
 
-  if (Resources(left.resources()) != Resources(right.resources())) {
+  if (left.type() != right.type()) {
+    return false;
+  }
+
+  if (left.name() != right.name()) {
     return false;
   }
 
@@ -385,7 +390,8 @@ bool operator==(const AgentInfo& left, const AgentInfo& right)
     Resources(left.resources()) == Resources(right.resources()) &&
     Attributes(left.attributes()) == Attributes(right.attributes()) &&
     left.id() == right.id() &&
-    left.port() == right.port();
+    left.port() == right.port() &&
+    left.domain() == right.domain();
 }
 
 
@@ -467,6 +473,12 @@ ostream& operator<<(ostream& stream, const ContainerInfo& containerInfo)
 }
 
 
+ostream& operator<<(ostream& stream, const DomainInfo& domainInfo)
+{
+  return stream << JSON::protobuf(domainInfo);
+}
+
+
 ostream& operator<<(ostream& stream, const ExecutorID& executorId)
 {
   return stream << executorId.value();
@@ -508,6 +520,14 @@ ostream& operator<<(
     const ResourceProviderID& resourceProviderId)
 {
   return stream << resourceProviderId.value();
+}
+
+
+ostream& operator<<(
+    ostream& stream,
+    const ResourceProviderInfo& resourceProviderInfo)
+{
+  return stream << JSON::protobuf(resourceProviderInfo);
 }
 
 
@@ -565,20 +585,6 @@ ostream& operator<<(ostream& stream, const TaskGroupInfo& taskGroupInfo)
 ostream& operator<<(ostream& stream, const TaskState& state)
 {
   return stream << TaskState_Name(state);
-}
-
-
-ostream& operator<<(ostream& stream, const vector<TaskID>& taskIds)
-{
-  stream << "[ ";
-  for (auto it = taskIds.begin(); it != taskIds.end(); ++it) {
-    if (it != taskIds.begin()) {
-      stream << ", ";
-    }
-    stream << *it;
-  }
-  stream << " ]";
-  return stream;
 }
 
 

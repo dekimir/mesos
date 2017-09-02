@@ -57,6 +57,8 @@ using std::set;
 using std::string;
 using std::vector;
 
+using process::Future;
+using process::Owned;
 using process::Failure;
 using process::Owned;
 
@@ -112,8 +114,7 @@ string serialize(
       return message.SerializeAsString();
     }
     case ContentType::JSON: {
-      JSON::Object object = JSON::protobuf(message);
-      return stringify(object);
+      return stringify(JSON::protobuf(message));
     }
     case ContentType::RECORDIO: {
       LOG(FATAL) << "Serializing a RecordIO stream is not supported";
@@ -267,6 +268,16 @@ JSON::Object model(const NetworkInfo& info)
 
   if (info.has_name()) {
     object.values["name"] = info.name();
+  }
+
+  if (info.port_mappings().size() > 0) {
+    JSON::Array array;
+    array.values.reserve(info.port_mappings().size()); // MESOS-2353
+    foreach (const NetworkInfo::PortMapping& portMapping,
+             info.port_mappings()) {
+      array.values.push_back(JSON::protobuf(portMapping));
+    }
+    object.values["port_mappings"] = std::move(array);
   }
 
   return object;
@@ -629,6 +640,15 @@ static void json(JSON::ObjectWriter* writer, const NetworkInfo& info)
   if (info.has_name()) {
     writer->field("name", info.name());
   }
+
+  if (info.port_mappings().size() > 0) {
+    writer->field("port_mappings", [&info](JSON::ArrayWriter* writer) {
+      foreach(const NetworkInfo::PortMapping& portMapping,
+              info.port_mappings()) {
+        writer->element(JSON::Protobuf(portMapping));
+      }
+    });
+  }
 }
 
 
@@ -712,6 +732,39 @@ void json(JSON::ObjectWriter* writer, const TaskStatus& status)
 
   if (status.has_healthy()) {
     writer->field("healthy", status.healthy());
+  }
+}
+
+
+static void json(
+    JSON::ObjectWriter* writer,
+    const DomainInfo::FaultDomain::RegionInfo& regionInfo)
+{
+  writer->field("name", regionInfo.name());
+}
+
+
+static void json(
+    JSON::ObjectWriter* writer,
+    const DomainInfo::FaultDomain::ZoneInfo& zoneInfo)
+{
+  writer->field("name", zoneInfo.name());
+}
+
+
+static void json(
+    JSON::ObjectWriter* writer,
+    const DomainInfo::FaultDomain& faultDomain)
+{
+    writer->field("region", faultDomain.region());
+    writer->field("zone", faultDomain.zone());
+}
+
+
+void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo)
+{
+  if (domainInfo.has_fault_domain()) {
+    writer->field("fault_domain", domainInfo.fault_domain());
   }
 }
 
@@ -813,10 +866,8 @@ bool approveViewFrameworkInfo(
     const Owned<ObjectApprover>& frameworksApprover,
     const FrameworkInfo& frameworkInfo)
 {
-  ObjectApprover::Object object;
-  object.framework_info = &frameworkInfo;
-
-  Try<bool> approved = frameworksApprover->approved(object);
+  Try<bool> approved =
+    frameworksApprover->approved(ObjectApprover::Object(frameworkInfo));
   if (approved.isError()) {
     LOG(WARNING) << "Error during FrameworkInfo authorization: "
                  << approved.error();
@@ -832,11 +883,8 @@ bool approveViewExecutorInfo(
     const ExecutorInfo& executorInfo,
     const FrameworkInfo& frameworkInfo)
 {
-  ObjectApprover::Object object;
-  object.executor_info = &executorInfo;
-  object.framework_info = &frameworkInfo;
-
-  Try<bool> approved = executorsApprover->approved(object);
+  Try<bool> approved = executorsApprover->approved(
+      ObjectApprover::Object(executorInfo, frameworkInfo));
   if (approved.isError()) {
     LOG(WARNING) << "Error during ExecutorInfo authorization: "
                  << approved.error();
@@ -852,11 +900,8 @@ bool approveViewTaskInfo(
     const TaskInfo& taskInfo,
     const FrameworkInfo& frameworkInfo)
 {
-  ObjectApprover::Object object;
-  object.task_info = &taskInfo;
-  object.framework_info = &frameworkInfo;
-
-  Try<bool> approved = tasksApprover->approved(object);
+  Try<bool> approved =
+    tasksApprover->approved(ObjectApprover::Object(taskInfo, frameworkInfo));
   if (approved.isError()) {
     LOG(WARNING) << "Error during TaskInfo authorization: " << approved.error();
     // TODO(joerg84): Consider exposing these errors to the caller.
@@ -871,11 +916,8 @@ bool approveViewTask(
     const Task& task,
     const FrameworkInfo& frameworkInfo)
 {
-  ObjectApprover::Object object;
-  object.task = &task;
-  object.framework_info = &frameworkInfo;
-
-  Try<bool> approved = tasksApprover->approved(object);
+  Try<bool> approved =
+    tasksApprover->approved(ObjectApprover::Object(task, frameworkInfo));
   if (approved.isError()) {
     LOG(WARNING) << "Error during Task authorization: " << approved.error();
     // TODO(joerg84): Consider exposing these errors to the caller.
@@ -888,9 +930,7 @@ bool approveViewTask(
 bool approveViewFlags(
     const Owned<ObjectApprover>& flagsApprover)
 {
-  ObjectApprover::Object object;
-
-  Try<bool> approved = flagsApprover->approved(object);
+  Try<bool> approved = flagsApprover->approved(ObjectApprover::Object());
   if (approved.isError()) {
     LOG(WARNING) << "Error during Flags authorization: " << approved.error();
     // TODO(joerg84): Consider exposing these errors to the caller.
@@ -946,10 +986,7 @@ bool approveViewRole(
     const Owned<ObjectApprover>& rolesApprover,
     const string& role)
 {
-  ObjectApprover::Object object;
-  object.value = &role;
-
-  Try<bool> approved = rolesApprover->approved(object);
+  Try<bool> approved = rolesApprover->approved(ObjectApprover::Object(role));
   if (approved.isError()) {
     LOG(WARNING) << "Error during Roles authorization: " << approved.error();
     // TODO(joerg84): Consider exposing these errors to the caller.
@@ -957,6 +994,39 @@ bool approveViewRole(
   }
   return approved.get();
 }
+
+
+bool authorizeResource(
+    const Resource& resource,
+    const Option<Owned<AuthorizationAcceptor>>& acceptor)
+{
+  if (acceptor.isNone()) {
+    return true;
+  }
+
+  // Necessary because recovered agents are presented in old format.
+  if (resource.has_role() && resource.role() != "*" &&
+      !acceptor.get()->accept(resource.role())) {
+    return false;
+  }
+
+  if (resource.has_allocation_info() &&
+      !acceptor.get()->accept(resource.allocation_info().role())) {
+    return false;
+  }
+
+  // Reservations follow a path model where each entry is a child of the
+  // previous one. Therefore, to accept the resource the acceptor has to
+  // accept all entries.
+  foreach (Resource::ReservationInfo reservation, resource.reservations()) {
+    if (!acceptor.get()->accept(reservation.role())) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 
 namespace {
 
@@ -1123,5 +1193,28 @@ void logRequest(const process::http::Request& request)
                 ? " with X-Forwarded-For='" + forwardedFor.get() + "'"
                 : "");
 }
+
+
+Future<Owned<AuthorizationAcceptor>> AuthorizationAcceptor::create(
+    const Option<Principal>& principal,
+    const Option<Authorizer*>& authorizer,
+    const authorization::Action& action)
+{
+  if (authorizer.isNone()) {
+    return Owned<AuthorizationAcceptor>(
+        new AuthorizationAcceptor(Owned<ObjectApprover>(
+            new AcceptingObjectApprover())));
+  }
+
+  const Option<authorization::Subject> subject =
+    authorization::createSubject(principal);
+
+  return authorizer.get()->getObjectApprover(subject, action)
+    .then([=](const Owned<ObjectApprover>& approver) {
+      return Owned<AuthorizationAcceptor>(
+          new AuthorizationAcceptor(approver));
+    });
+}
+
 
 }  // namespace mesos {

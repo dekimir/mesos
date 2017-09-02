@@ -24,6 +24,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 #include <mesos/module.hpp>
 #include <mesos/roles.hpp>
@@ -98,6 +99,8 @@ using std::list;
 using std::set;
 using std::shared_ptr;
 using std::string;
+using std::tie;
+using std::tuple;
 using std::vector;
 
 using process::await;
@@ -358,6 +361,10 @@ Master::Master(
   info_.mutable_address()->set_ip(stringify(self().address.ip));
   info_.mutable_address()->set_port(self().address.port);
   info_.mutable_address()->set_hostname(hostname);
+
+  if (flags.domain.isSome()) {
+    info_.mutable_domain()->CopyFrom(flags.domain.get());
+  }
 }
 
 
@@ -392,6 +399,7 @@ bool Framework::isTrackedUnderRole(const string& role) const
          master->roles.at(role)->frameworks.contains(id());
 }
 
+
 void Framework::trackUnderRole(const string& role)
 {
   CHECK(master->isWhitelistedRole(role))
@@ -404,6 +412,7 @@ void Framework::trackUnderRole(const string& role)
   }
   master->roles.at(role)->addFramework(this);
 }
+
 
 void Framework::untrackUnderRole(const string& role)
 {
@@ -762,7 +771,8 @@ void Master::initialize()
       defer(self(), &Master::offer, lambda::_1, lambda::_2),
       defer(self(), &Master::inverseOffer, lambda::_1, lambda::_2),
       flags.fair_sharing_excluded_resource_names,
-      flags.filter_gpu_resources);
+      flags.filter_gpu_resources,
+      flags.domain);
 
   // Parse the whitelist. Passing Allocator::updateWhitelist()
   // callback is safe because we shut down the whitelistWatcher in
@@ -892,10 +902,7 @@ void Master::initialize()
       &ExitedExecutorMessage::executor_id,
       &ExitedExecutorMessage::status);
 
-  install<UpdateSlaveMessage>(
-      &Master::updateSlave,
-      &UpdateSlaveMessage::slave_id,
-      &UpdateSlaveMessage::oversubscribed_resources);
+  install<UpdateSlaveMessage>(&Master::updateSlave);
 
   install<AuthenticateMessage>(
       &Master::authenticate,
@@ -1485,9 +1492,9 @@ void Master::visit(const MessageEvent& event)
   // framework and whether the framework has a principal so we use
   // these two temp variables to simplify the condition checks below.
   bool isRegisteredFramework =
-    frameworks.principals.contains(event.message->from);
+    frameworks.principals.contains(event.message.from);
   const Option<string> principal = isRegisteredFramework
-    ? frameworks.principals[event.message->from]
+    ? frameworks.principals[event.message.from]
     : Option<string>::none();
 
   // Increment the "message_received" counter if the message is from
@@ -1504,7 +1511,7 @@ void Master::visit(const MessageEvent& event)
 
   // All messages are filtered when non-leading.
   if (!elected()) {
-    VLOG(1) << "Dropping '" << event.message->name << "' message since "
+    VLOG(1) << "Dropping '" << event.message.name << "' message since "
             << "not elected yet";
     ++metrics->dropped_messages;
     return;
@@ -1518,7 +1525,7 @@ void Master::visit(const MessageEvent& event)
   // the additional queueing delay and the accumulated backlog
   // of messages post-recovery?
   if (!recovered.get().isReady()) {
-    VLOG(1) << "Dropping '" << event.message->name << "' message since "
+    VLOG(1) << "Dropping '" << event.message.name << "' message since "
             << "not recovered yet";
     ++metrics->dropped_messages;
     return;
@@ -1632,8 +1639,8 @@ void Master::_visit(const MessageEvent& event)
   // mapping may be deleted in handling 'UnregisterFrameworkMessage'
   // but its counter still needs to be incremented for this message.
   const Option<string> principal =
-    frameworks.principals.contains(event.message->from)
-      ? frameworks.principals[event.message->from]
+    frameworks.principals.contains(event.message.from)
+      ? frameworks.principals[event.message.from]
       : Option<string>::none();
 
   ProtobufProcess<Master>::visit(event);
@@ -1657,8 +1664,8 @@ void Master::exceededCapacity(
     const Option<string>& principal,
     uint64_t capacity)
 {
-  LOG(WARNING) << "Dropping message " << event.message->name << " from "
-               << event.message->from
+  LOG(WARNING) << "Dropping message " << event.message.name << " from "
+               << event.message.from
                << (principal.isSome() ? "(" + principal.get() + ")" : "")
                << ": capacity(" << capacity << ") exceeded";
 
@@ -1670,9 +1677,9 @@ void Master::exceededCapacity(
   // unrecoverable error and should take action to recover.
   FrameworkErrorMessage message;
   message.set_message(
-      "Message " + event.message->name +
+      "Message " + event.message.name +
       " dropped: capacity(" + stringify(capacity) + ") exceeded");
-  send(event.message->from, message);
+  send(event.message.from, message);
 }
 
 
@@ -2177,6 +2184,35 @@ void Master::detected(const Future<Option<MasterInfo>>& _leader)
     if (wasElected) {
       EXIT(EXIT_FAILURE) << "Lost leadership... committing suicide!";
     }
+
+    // If this master and the current leader both have a configured
+    // domain and the current leader is located in a different region,
+    // exit with an error message: this indicates a configuration
+    // error, since all masters must be in the same region.
+    if (leader->has_domain() && info_.has_domain()) {
+      const DomainInfo& leaderDomain = leader->domain();
+      const DomainInfo& selfDomain = info_.domain();
+
+      // We currently reject configured domains without fault domains,
+      // but that might change in the future. For compatibility with
+      // future versions of Mesos, we treat a master with a configured
+      // domain but no fault domain as equivalent to a master with no
+      // configured domain.
+      if (leaderDomain.has_fault_domain() && selfDomain.has_fault_domain()) {
+        const DomainInfo::FaultDomain::RegionInfo& leaderRegion =
+          leaderDomain.fault_domain().region();
+        const DomainInfo::FaultDomain::RegionInfo& selfRegion =
+          selfDomain.fault_domain().region();
+
+        if (leaderRegion != selfRegion) {
+          EXIT(EXIT_FAILURE) << "Leading master uses domain "
+                             << leaderDomain << "; this master is "
+                             << "configured to use domain "
+                             << selfDomain << "; all masters in the "
+                             << "same cluster must use the same region";
+        }
+      }
+    }
   }
 
   // Keep detecting.
@@ -2282,6 +2318,7 @@ void Master::drop(
                << ": " << message;
 }
 
+
 void Master::drop(
     Framework* framework,
     const scheduler::Call& call,
@@ -2332,7 +2369,7 @@ void Master::receive(
   Option<Error> error = validation::scheduler::call::validate(call);
 
   if (error.isSome()) {
-    drop(from, call, error.get().message);
+    drop(from, call, error->message);
     return;
   }
 
@@ -2667,6 +2704,11 @@ void Master::_subscribe(
     // Start the heartbeat after sending SUBSCRIBED event.
     framework->heartbeat();
 
+    if (!subscribers.subscribed.empty()) {
+      subscribers.send(
+          protobuf::master::event::createFrameworkAdded(*framework));
+    }
+
     return;
   }
 
@@ -2711,6 +2753,11 @@ void Master::_subscribe(
       http.close();
       return;
     }
+  }
+
+  if (!subscribers.subscribed.empty()) {
+    subscribers.send(
+        protobuf::master::event::createFrameworkUpdated(*framework));
   }
 
   // Broadcast the new framework pid to all the slaves. We have to
@@ -2962,6 +3009,11 @@ void Master::_subscribe(
     message.mutable_master_info()->MergeFrom(info_);
     framework->send(message);
 
+    if (!subscribers.subscribed.empty()) {
+      subscribers.send(
+          protobuf::master::event::createFrameworkAdded(*framework));
+    }
+
     return;
   }
 
@@ -3033,6 +3085,11 @@ void Master::_subscribe(
       // if necesssary.
       LOG(INFO) << "Framework " << *framework << " failed over";
       failoverFramework(framework, from);
+
+      if (!subscribers.subscribed.empty()) {
+        subscribers.send(
+            protobuf::master::event::createFrameworkUpdated(*framework));
+      }
     } else {
       LOG(INFO) << "Allowing framework " << *framework
                 << " to subscribe with an already used id";
@@ -3080,6 +3137,11 @@ void Master::_subscribe(
       message.mutable_framework_id()->MergeFrom(frameworkInfo.id());
       message.mutable_master_info()->MergeFrom(info_);
       framework->send(message);
+
+      if (!subscribers.subscribed.empty()) {
+        subscribers.send(
+            protobuf::master::event::createFrameworkUpdated(*framework));
+      }
       return;
     }
   } else {
@@ -3095,6 +3157,11 @@ void Master::_subscribe(
       message.set_message(activate.error());
       send(from, message);
       return;
+    }
+
+    if (!subscribers.subscribed.empty()) {
+      subscribers.send(
+          protobuf::master::event::createFrameworkUpdated(*framework));
     }
   }
 
@@ -3494,11 +3561,29 @@ Future<bool> Master::authorizeReserveResources(
   hashset<string> roles;
   list<Future<bool>> authorizations;
   foreach (const Resource& resource, reserve.resources()) {
-    if (!roles.contains(resource.role())) {
-      roles.insert(resource.role());
+    // NOTE: Since authorization happens __before__ validation and resource
+    // format conversion, we must look for roles that may appear in both
+    // "pre" and "post" reservation-refinement formats. This may not even be
+    // valid, but we rely on validation being performed aftewards.
+    string role;
+    if (resource.reservations_size() > 0) {
+      // Check for the role in the "post-reservation-refinement" format.
+      //
+      // If there is a stack of reservations, we only perform authorization
+      // for the most refined reservation, since we only support "pushing"
+      // one reservation at a time. That is, all of the previous reservations
+      // must have already been authorized.
+      role = resource.reservations().rbegin()->role();
+    } else {
+      // Check for the role in the "pre-reservation-refinement" format.
+      role = resource.role();
+    }
+
+    if (!roles.contains(role)) {
+      roles.insert(role);
 
       request.mutable_object()->mutable_resource()->CopyFrom(resource);
-      request.mutable_object()->set_value(resource.role());
+      request.mutable_object()->set_value(role);
       authorizations.push_back(authorizer.get()->authorized(request));
     }
   }
@@ -3548,16 +3633,24 @@ Future<bool> Master::authorizeUnreserveResources(
 
   list<Future<bool>> authorizations;
   foreach (const Resource& resource, unreserve.resources()) {
-    // NOTE: Since validation of this operation is performed after
-    // authorization, we must check here that this resource is
-    // dynamically reserved. If it isn't, the error will be caught
-    // during validation.
-    if (Resources::isDynamicallyReserved(resource) &&
-        resource.reservation().has_principal()) {
-      request.mutable_object()->mutable_resource()->CopyFrom(resource);
+    // NOTE: Since authorization happens __before__ validation and resource
+    // format conversion, we must look for the principal that may appear in
+    // both "pre" and "post" reservation-refinement formats. This may not be
+    // valid, but we rely on validation being performed later.
+    Option<string> principal;
+    if (resource.reservations_size() > 0 &&
+        resource.reservations().rbegin()->has_principal()) {
+      // Check for roles in the "post-reservation-refinement" format.
+      principal = resource.reservations().rbegin()->principal();
+    } else if (
+        resource.has_reservation() && resource.reservation().has_principal()) {
+      // Check for roles in the "pre-reservation-refinement" format.
+      principal = resource.reservation().principal();
+    }
 
-      request.mutable_object()->set_value(
-          resource.reservation().principal());
+    if (principal.isSome()) {
+      request.mutable_object()->mutable_resource()->CopyFrom(resource);
+      request.mutable_object()->set_value(principal.get());
 
       authorizations.push_back(authorizer.get()->authorized(request));
     }
@@ -3607,11 +3700,25 @@ Future<bool> Master::authorizeCreateVolume(
   hashset<string> roles;
   list<Future<bool>> authorizations;
   foreach (const Resource& volume, create.volumes()) {
-    if (!roles.contains(volume.role())) {
-      roles.insert(volume.role());
+    string role;
+    if (volume.reservations_size() > 0) {
+      // Check for role in the "post-reservation-refinement" format.
+      //
+      // If there is a stack of reservations, we only perform authorization
+      // for the most refined reservation, since we only support "pushing"
+      // one reservation at a time. That is, all of the previous reservations
+      // must have already been authorized.
+      role = volume.reservations().rbegin()->role();
+    } else {
+      // Check for role in the "pre-reservation-refinement" format.
+      role = volume.role();
+    }
+
+    if (!roles.contains(role)) {
+      roles.insert(role);
 
       request.mutable_object()->mutable_resource()->CopyFrom(volume);
-      request.mutable_object()->set_value(volume.role());
+      request.mutable_object()->set_value(role);
       authorizations.push_back(authorizer.get()->authorized(request));
     }
   }
@@ -3659,7 +3766,7 @@ Future<bool> Master::authorizeDestroyVolume(
     // NOTE: Since validation of this operation may be performed after
     // authorization, we must check here that this resource is a persistent
     // volume. If it isn't, the error will be caught during validation.
-    if (Resources::isPersistentVolume(volume)) {
+    if (volume.has_disk() && volume.disk().has_persistence()) {
       request.mutable_object()->mutable_resource()->CopyFrom(volume);
       request.mutable_object()->set_value(
           volume.disk().persistence().principal());
@@ -3762,11 +3869,10 @@ void Master::accept(
 {
   CHECK_NOTNULL(framework);
 
-  for (int i = 0; i < accept.operations_size(); ++i) {
-    Offer::Operation* operation = accept.mutable_operations(i);
-
-    if (operation->type() == Offer::Operation::LAUNCH) {
-      if (operation->launch().task_infos().size() > 0) {
+  // Bump metrics.
+  foreach (const Offer::Operation& operation, accept.operations()) {
+    if (operation.type() == Offer::Operation::LAUNCH) {
+      if (operation.launch().task_infos().size() > 0) {
         ++metrics->messages_launch_tasks;
       } else {
         ++metrics->messages_decline_offers;
@@ -3774,23 +3880,9 @@ void Master::accept(
                      << " in ACCEPT call for framework " << framework->id()
                      << " as the launch operation specified no tasks";
       }
-    } else if (operation->type() == Offer::Operation::LAUNCH_GROUP) {
-      const ExecutorInfo& executor = operation->launch_group().executor();
-
-      TaskGroupInfo* taskGroup =
-        operation->mutable_launch_group()->mutable_task_group();
-
-      // Mutate `TaskInfo` to include `ExecutorInfo` to make it easy
-      // for operator API and WebUI to get access to the corresponding
-      // executor for tasks in the task group.
-      for (int j = 0; j < taskGroup->tasks().size(); ++j) {
-        TaskInfo* task = taskGroup->mutable_tasks(j);
-        if (!task->has_executor()) {
-          task->mutable_executor()->CopyFrom(executor);
-        }
-      }
     }
 
+    // TODO(mpark): Add metrics for LAUNCH_GROUP operation.
     // TODO(jieyu): Add metrics for non launch operations.
   }
 
@@ -3846,7 +3938,7 @@ void Master::accept(
   // notifications.
   if (error.isSome()) {
     LOG(WARNING) << "ACCEPT call used invalid offers '" << accept.offer_ids()
-                 << "': " << error.get().message;
+                 << "': " << error->message;
 
     TaskState newTaskState = TASK_DROPPED;
     if (!framework->capabilities.partitionAware) {
@@ -3876,7 +3968,7 @@ void Master::accept(
             newTaskState,
             TaskStatus::SOURCE_MASTER,
             None(),
-            "Task launched with invalid offers: " + error.get().message,
+            "Task launched with invalid offers: " + error->message,
             TaskStatus::REASON_INVALID_OFFERS);
 
         if (framework->capabilities.partitionAware) {
@@ -3897,14 +3989,164 @@ void Master::accept(
     return;
   }
 
-  CHECK_SOME(allocationInfo);
+  // Validate and upgrade all of the resources in `accept.operations`.
+  //
+  // If a RESERVE, UNRESERVE, CREATE, or DESTROY operation
+  // contains invalid resources, we just drop the operation.
+  //
+  // If a LAUNCH or LAUNCH_GROUP operation contains invalid
+  // resources, we send a TASK_ERROR status update per task.
+  {
+    // We move out the `accept.operations`, and re-insert the operations
+    // with the resources validated and upgraded.
+    RepeatedPtrField<Offer::Operation> operations = accept.operations();
+    accept.clear_operations();
 
-  // With the addition of the MULTI_ROLE capability, the resources
-  // within an offer now contain an `AllocationInfo`. We therefore
-  // inject the offer's allocation info into the operation's
-  // resources if the scheduler has not done so already.
+    foreach (Offer::Operation& operation, operations) {
+      Option<Error> error = validateAndNormalizeResources(&operation);
+      if (error.isSome()) {
+        // We send TASK_ERROR status updates for tasks in an invalid LAUNCH
+        // and LAUNCH_GROUP operations. Note that we don't need to recover
+        // the resources here because we always continue onto `_accept`
+        // which recovers the unused resources at the end.
+        // TODO(mpark): Consider pulling this out in a more reusable manner.
+        auto sendStatusUpdates = [&](
+            const RepeatedPtrField<TaskInfo>& tasks,
+            TaskStatus::Reason reason) {
+          foreach (const TaskInfo& task, tasks) {
+            const StatusUpdate& update = protobuf::createStatusUpdate(
+                framework->id(),
+                task.slave_id(),
+                task.task_id(),
+                TASK_ERROR,
+                TaskStatus::SOURCE_MASTER,
+                None(),
+                error->message,
+                reason);
+
+            metrics->tasks_error++;
+
+            metrics->incrementTasksStates(
+                TASK_ERROR, TaskStatus::SOURCE_MASTER, reason);
+
+            forward(update, UPID(), framework);
+          }
+        };
+
+        switch (operation.type()) {
+          case Offer::Operation::RESERVE:
+          case Offer::Operation::UNRESERVE:
+          case Offer::Operation::CREATE:
+          case Offer::Operation::DESTROY: {
+            drop(framework, operation, error->message);
+            break;
+          }
+          case Offer::Operation::LAUNCH: {
+            sendStatusUpdates(
+                operation.launch().task_infos(),
+                TaskStatus::REASON_TASK_INVALID);
+
+            break;
+          }
+          case Offer::Operation::LAUNCH_GROUP: {
+            sendStatusUpdates(
+                operation.launch_group().task_group().tasks(),
+                TaskStatus::REASON_TASK_GROUP_INVALID);
+
+            break;
+          }
+          case Offer::Operation::UNKNOWN: {
+            LOG(WARNING) << "Ignoring unknown offer operation";
+            break;
+          }
+        }
+
+        continue;
+      }
+
+      accept.add_operations()->CopyFrom(operation);
+    }
+  }
+
+  // We make various adjustments to the `Offer::Operation`s,
+  // typically for backward/forward compatibility.
+  // TODO(mpark): Pull this out to a master normalization utility.
   foreach (Offer::Operation& operation, *accept.mutable_operations()) {
+    // With the addition of the MULTI_ROLE capability, the resources
+    // within an offer now contain an `AllocationInfo`. We therefore
+    // inject the offer's allocation info into the operation's
+    // resources if the scheduler has not done so already.
+    CHECK_SOME(allocationInfo);
     protobuf::injectAllocationInfo(&operation, allocationInfo.get());
+
+    switch (operation.type()) {
+      case Offer::Operation::RESERVE:
+      case Offer::Operation::UNRESERVE:
+      case Offer::Operation::CREATE:
+      case Offer::Operation::DESTROY: {
+        // No-op.
+        break;
+      }
+      case Offer::Operation::LAUNCH: {
+        foreach (
+            TaskInfo& task, *operation.mutable_launch()->mutable_task_infos()) {
+          // TODO(haosdent): Once we have internal `TaskInfo` separate from
+          // the v0 `TaskInfo` (see MESOS-6268), consider extracting the
+          // following adaptation code into devolve methods from v0 and v1
+          // `TaskInfo` to internal `TaskInfo`.
+          //
+          // Make a copy of the original task so that we can fill the missing
+          // `framework_id` in `ExecutorInfo` if needed. This field was added
+          // to the API later and thus was made optional.
+          if (task.has_executor() && !task.executor().has_framework_id()) {
+            task.mutable_executor()->mutable_framework_id()->CopyFrom(
+                framework->id());
+          }
+
+          // For backwards compatibility with the v0 and v1 API, when
+          // the type of the health check is not specified, determine
+          // its type from the `http` and `command` fields.
+          //
+          // TODO(haosdent): Remove this after the deprecation cycle which
+          // starts in 2.0.
+          if (task.has_health_check() && !task.health_check().has_type()) {
+            LOG(WARNING) << "The type of health check is not set; use of "
+                         << "'HealthCheck' without specifying 'type' will be "
+                         << "deprecated in Mesos 2.0";
+
+            const HealthCheck& healthCheck = task.health_check();
+            if (healthCheck.has_command() && !healthCheck.has_http()) {
+              task.mutable_health_check()->set_type(HealthCheck::COMMAND);
+            } else if (healthCheck.has_http() && !healthCheck.has_command()) {
+              task.mutable_health_check()->set_type(HealthCheck::HTTP);
+            }
+          }
+        }
+
+        break;
+      }
+      case Offer::Operation::LAUNCH_GROUP: {
+        const ExecutorInfo& executor = operation.launch_group().executor();
+
+        TaskGroupInfo* taskGroup =
+          operation.mutable_launch_group()->mutable_task_group();
+
+        // Mutate `TaskInfo` to include `ExecutorInfo` to make it easy
+        // for operator API and WebUI to get access to the corresponding
+        // executor for tasks in the task group.
+        foreach (TaskInfo& task, *taskGroup->mutable_tasks()) {
+          if (!task.has_executor()) {
+            task.mutable_executor()->CopyFrom(executor);
+          }
+        }
+
+        break;
+      }
+      case Offer::Operation::UNKNOWN: {
+        // No-op.
+        break;
+      }
+    }
   }
 
   CHECK_SOME(slaveId);
@@ -4187,15 +4429,21 @@ void Master::_accept(
         }
 
         Option<Principal> principal = framework->info.has_principal()
-          ? Principal(framework->info.principal())
-          : Option<Principal>::none();
+                                        ? Principal(framework->info.principal())
+                                        : Option<Principal>::none();
 
         // Make sure this reserve operation is valid.
         Option<Error> error = validation::operation::validate(
-            operation.reserve(), principal, framework->info);
+            operation.reserve(),
+            principal,
+            slave->capabilities,
+            framework->info);
 
         if (error.isSome()) {
-          drop(framework, operation, error.get().message);
+          drop(
+              framework,
+              operation,
+              error->message + "; on agent " + stringify(*slave));
           continue;
         }
 
@@ -4246,11 +4494,11 @@ void Master::_accept(
         }
 
         // Make sure this unreserve operation is valid.
-        Option<Error> error = validation::operation::validate(
-            operation.unreserve());
+        Option<Error> error =
+          validation::operation::validate(operation.unreserve());
 
         if (error.isSome()) {
-          drop(framework, operation, error.get().message);
+          drop(framework, operation, error->message);
           continue;
         }
 
@@ -4300,18 +4548,22 @@ void Master::_accept(
         }
 
         Option<Principal> principal = framework->info.has_principal()
-          ? Principal(framework->info.principal())
-          : Option<Principal>::none();
+                                        ? Principal(framework->info.principal())
+                                        : Option<Principal>::none();
 
         // Make sure this create operation is valid.
         Option<Error> error = validation::operation::validate(
             operation.create(),
             slave->checkpointedResources,
             principal,
+            slave->capabilities,
             framework->info);
 
         if (error.isSome()) {
-          drop(framework, operation, error.get().message);
+          drop(
+              framework,
+              operation,
+              error->message + "; on agent " + stringify(*slave));
           continue;
         }
 
@@ -4368,7 +4620,7 @@ void Master::_accept(
             slave->pendingTasks);
 
         if (error.isSome()) {
-          drop(framework, operation, error.get().message);
+          drop(framework, operation, error->message);
           continue;
         }
 
@@ -4484,39 +4736,6 @@ void Master::_accept(
 
           // Validate the task.
 
-          // TODO(haosdent): Once we have internal `TaskInfo` separate from
-          // the v0 `TaskInfo` (see MESOS-6268), consider extracting the
-          // following adaptation code into devolve methods from v0 and v1
-          // `TaskInfo` to internal `TaskInfo`.
-          //
-          // Make a copy of the original task so that we can fill the missing
-          // `framework_id` in `ExecutorInfo` if needed. This field was added
-          // to the API later and thus was made optional.
-          TaskInfo task_(task);
-          if (task.has_executor() && !task.executor().has_framework_id()) {
-            task_.mutable_executor()
-                ->mutable_framework_id()->CopyFrom(framework->id());
-          }
-
-          // For backwards compatibility with the v0 and v1 API, when
-          // the type of the health check is not specified, determine
-          // its type from the `http` and `command` fields.
-          //
-          // TODO(haosdent): Remove this after the deprecation cycle which
-          // starts in 2.0.
-          if (task.has_health_check() && !task.health_check().has_type()) {
-            LOG(WARNING) << "The type of health check is not set; use of "
-                         << "'HealthCheck' without specifying 'type' will be "
-                         << "deprecated in Mesos 2.0";
-
-            const HealthCheck& healthCheck = task.health_check();
-            if (healthCheck.has_command() && !healthCheck.has_http()) {
-              task_.mutable_health_check()->set_type(HealthCheck::COMMAND);
-            } else if (healthCheck.has_http() && !healthCheck.has_command()) {
-              task_.mutable_health_check()->set_type(HealthCheck::HTTP);
-            }
-          }
-
           // We add back offered shared resources for validation even if they
           // are already consumed by other tasks in the same ACCEPT call. This
           // allows these tasks to use more copies of the same shared resource
@@ -4526,21 +4745,18 @@ void Master::_accept(
           Resources available =
             _offeredResources.nonShared() + offeredSharedResources;
 
-          const Option<Error>& validationError = validation::task::validate(
-              task_,
-              framework,
-              slave,
-              available);
+          Option<Error> error =
+            validation::task::validate(task, framework, slave, available);
 
-          if (validationError.isSome()) {
+          if (error.isSome()) {
             const StatusUpdate& update = protobuf::createStatusUpdate(
                 framework->id(),
-                task_.slave_id(),
-                task_.task_id(),
+                task.slave_id(),
+                task.task_id(),
                 TASK_ERROR,
                 TaskStatus::SOURCE_MASTER,
                 None(),
-                validationError.get().message,
+                error->message,
                 TaskStatus::REASON_TASK_INVALID);
 
             metrics->tasks_error++;
@@ -4557,19 +4773,12 @@ void Master::_accept(
 
           // Add task.
           if (pending) {
-            const Resources consumed = addTask(task_, framework, slave);
+            const Resources consumed = addTask(task, framework, slave);
 
             CHECK(available.contains(consumed))
               << available << " does not contain " << consumed;
 
             _offeredResources -= consumed;
-
-            // TODO(bmahler): Consider updating this log message to
-            // indicate when the executor is also being launched.
-            LOG(INFO) << "Launching task " << task_.task_id()
-                      << " of framework " << *framework
-                      << " with resources " << task_.resources()
-                      << " on agent " << *slave;
 
             RunTaskMessage message;
             message.mutable_framework()->MergeFrom(framework->info);
@@ -4578,16 +4787,38 @@ void Master::_accept(
             // as 'pid' was made optional in 0.24.0. In 0.25.0, we
             // no longer have to set pid here for http frameworks.
             message.set_pid(framework->pid.getOrElse(UPID()));
-            message.mutable_task()->MergeFrom(task_);
+            message.mutable_task()->MergeFrom(task);
 
             if (HookManager::hooksAvailable()) {
               // Set labels retrieved from label-decorator hooks.
               message.mutable_task()->mutable_labels()->CopyFrom(
                   HookManager::masterLaunchTaskLabelDecorator(
-                      task_,
+                      task,
                       framework->info,
                       slave->info));
             }
+
+            // If the agent does not support reservation refinement,
+            // downgrade the task and executor resources to the
+            // "pre-reservation-refinement" format. This cannot fail
+            // since the master rejects attempts to create refined
+            // reservations on non-capable agents.
+            if (!slave->capabilities.reservationRefinement) {
+              TaskInfo& task = *message.mutable_task();
+
+              CHECK_SOME(downgradeResources(task.mutable_resources()));
+
+              if (task.has_executor()) {
+                CHECK_SOME(downgradeResources(
+                    task.mutable_executor()->mutable_resources()));
+              }
+            }
+
+            // TODO(bmahler): Consider updating this log message to
+            // indicate when the executor is also being launched.
+            LOG(INFO) << "Launching task " << task.task_id() << " of framework "
+                      << *framework << " with resources " << task.resources()
+                      << " on agent " << *slave;
 
             send(slave->pid, message);
           }
@@ -4637,9 +4868,8 @@ void Master::_accept(
         // TODO(anindya_sinha): If task group uses shared resources, this
         // validation needs to be enhanced to accommodate multiple copies
         // of shared resources across tasks within the task group.
-        Option<Error> error =
-          validation::task::group::validate(
-              taskGroup, executor, framework, slave, _offeredResources);
+        Option<Error> error = validation::task::group::validate(
+            taskGroup, executor, framework, slave, _offeredResources);
 
         Option<TaskStatus::Reason> reason = None();
 
@@ -4724,7 +4954,8 @@ void Master::_accept(
                   TaskStatus::SOURCE_MASTER,
                   None(),
                   "A task within the task group was killed before"
-                  " delivery to the agent");
+                  " delivery to the agent",
+                  TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH);
 
               metrics->tasks_killed++;
 
@@ -4748,13 +4979,12 @@ void Master::_accept(
         set<TaskID> taskIds;
         Resources totalResources;
 
-        for (int i = 0; i < message.task_group().tasks().size(); ++i) {
-          TaskInfo* task = message.mutable_task_group()->mutable_tasks(i);
+        foreach (
+            TaskInfo& task, *message.mutable_task_group()->mutable_tasks()) {
+          taskIds.insert(task.task_id());
+          totalResources += task.resources();
 
-          taskIds.insert(task->task_id());
-          totalResources += task->resources();
-
-          const Resources consumed = addTask(*task, framework, slave);
+          const Resources consumed = addTask(task, framework, slave);
 
           CHECK(_offeredResources.contains(consumed))
             << _offeredResources << " does not contain " << consumed;
@@ -4763,20 +4993,39 @@ void Master::_accept(
 
           if (HookManager::hooksAvailable()) {
             // Set labels retrieved from label-decorator hooks.
-            task->mutable_labels()->CopyFrom(
+            task.mutable_labels()->CopyFrom(
                 HookManager::masterLaunchTaskLabelDecorator(
-                    *task,
+                    task,
                     framework->info,
                     slave->info));
           }
         }
 
+        // If the agent does not support reservation refinement, downgrade
+        // the task and executor resources to the "pre-reservation-refinement"
+        // format. This cannot fail since the master rejects attempts to
+        // create refined reservations on non-capable agents.
+        if (!slave->capabilities.reservationRefinement) {
+          CHECK_SOME(downgradeResources(
+              message.mutable_executor()->mutable_resources()));
+
+          foreach (
+              TaskInfo& task, *message.mutable_task_group()->mutable_tasks()) {
+            CHECK_SOME(downgradeResources(task.mutable_resources()));
+
+            if (task.has_executor()) {
+              CHECK_SOME(downgradeResources(
+                  task.mutable_executor()->mutable_resources()));
+            }
+          }
+        }
+
         LOG(INFO) << "Launching task group " << stringify(taskIds)
-                  << " of framework " << *framework
-                  << " with resources " << totalResources
-                  << " on agent " << *slave;
+                  << " of framework " << *framework << " with resources "
+                  << totalResources << " on agent " << *slave;
 
         send(slave->pid, message);
+
         break;
       }
 
@@ -4860,7 +5109,7 @@ void Master::acceptInverseOffers(
 
   if (error.isSome()) {
     LOG(WARNING) << "ACCEPT_INVERSE_OFFERS call used invalid offers '"
-                 << accept.inverse_offer_ids() << "': " << error.get().message;
+                 << accept.inverse_offer_ids() << "': " << error->message;
   }
 }
 
@@ -5075,7 +5324,8 @@ void Master::kill(Framework* framework, const scheduler::Call::Kill& kill)
         TASK_KILLED,
         TaskStatus::SOURCE_MASTER,
         None(),
-        "Killed pending task");
+        "Killed before delivery to the agent",
+        TaskStatus::REASON_TASK_KILLED_DURING_LAUNCH);
 
     forward(update, UPID(), framework);
 
@@ -5565,6 +5815,20 @@ void Master::_registerSlave(
     return;
   }
 
+  // If the agent is configured with a domain but the master is not,
+  // we can't determine whether the agent is remote. To be safe, we
+  // don't allow the agent to register. We don't shutdown the agent so
+  // that any tasks on the agent can continue to run.
+  //
+  // TODO(neilc): Consider sending a warning to agent (MESOS-7615).
+  if (slaveInfo.has_domain() && !info_.has_domain()) {
+    LOG(WARNING) << "Agent at " << pid << " is configured with "
+                 << "domain " << slaveInfo.domain() << " "
+                 << "but the master has no configured domain. "
+                 << "Ignoring agent registration attempt";
+    return;
+  }
+
   // Check if this slave is already registered (because it retries).
   if (Slave* slave = slaves.registered.get(pid)) {
     if (!slave->connected) {
@@ -5860,6 +6124,20 @@ void Master::_reregisterSlave(
     return;
   }
 
+  // If the agent is configured with a domain but the master is not,
+  // we can't determine whether the agent is remote. To be safe, we
+  // don't allow the agent to re-register. We don't shutdown the agent
+  // so that any tasks on the agent can continue to run.
+  //
+  // TODO(neilc): Consider sending a warning to agent (MESOS-7615).
+  if (slaveInfo.has_domain() && !info_.has_domain()) {
+    LOG(WARNING) << "Agent at " << pid << " is configured with "
+                 << "domain " << slaveInfo.domain() << " "
+                 << "but the master has no configured domain."
+                 << "Ignoring agent re-registration attempt";
+    return;
+  }
+
   if (Slave* slave = slaves.registered.get(slaveInfo.id())) {
     CHECK(!slaves.recovered.contains(slaveInfo.id()));
 
@@ -5935,7 +6213,7 @@ void Master::_reregisterSlave(
 
     // Inform the agent of the master's version of its checkpointed
     // resources and the new framework pids for its tasks.
-    ___reregisterSlave(slave, tasks, frameworks);
+    ___reregisterSlave(slave, frameworks);
 
     slaves.reregistering.erase(slaveInfo.id());
     return;
@@ -5944,25 +6222,45 @@ void Master::_reregisterSlave(
   LOG(INFO) << "Re-registering agent " << slaveInfo.id() << " at " << pid
             << " (" << slaveInfo.hostname() << ")";
 
-  // Consult the registry to determine whether to readmit the
-  // slave. In the common case, the slave has been marked unreachable
-  // by the master, so we move the slave to the reachable list and
-  // readmit it. If the slave isn't in the unreachable list (which
-  // might occur if the slave's entry in the unreachable list is
-  // GC'd), we admit the slave anyway.
-  registrar->apply(Owned<Operation>(new MarkSlaveReachable(slaveInfo)))
-    .onAny(defer(self(),
-                 &Self::__reregisterSlave,
-                 slaveInfo,
-                 pid,
-                 checkpointedResources,
-                 executorInfos,
-                 tasks,
-                 frameworks,
-                 completedFrameworks,
-                 version,
-                 agentCapabilities,
-                 lambda::_1));
+  if (slaves.recovered.contains(slaveInfo.id())) {
+    // The agent likely is re-registering after a master failover as it
+    // is in the list recovered from the registry. No need to consult the
+    // registry in this case and we can directly re-admit it.
+    VLOG(1) << "Re-admitting recovered agent " << slaveInfo.id() << " at "
+            << pid << " (" << slaveInfo.hostname() << ")";
+
+    __reregisterSlave(
+        slaveInfo,
+        pid,
+        checkpointedResources,
+        executorInfos,
+        tasks,
+        frameworks,
+        completedFrameworks,
+        version,
+        agentCapabilities,
+        true);
+  } else {
+    // Consult the registry to determine whether to readmit the
+    // slave. In the common case, the slave has been marked unreachable
+    // by the master, so we move the slave to the reachable list and
+    // readmit it. If the slave isn't in the unreachable list (which
+    // might occur if the slave's entry in the unreachable list is
+    // GC'd), we admit the slave anyway.
+    registrar->apply(Owned<Operation>(new MarkSlaveReachable(slaveInfo)))
+      .onAny(defer(self(),
+                   &Self::__reregisterSlave,
+                   slaveInfo,
+                   pid,
+                   checkpointedResources,
+                   executorInfos,
+                   tasks,
+                   frameworks,
+                   completedFrameworks,
+                   version,
+                   agentCapabilities,
+                   lambda::_1));
+  }
 }
 
 
@@ -5973,7 +6271,7 @@ void Master::__reregisterSlave(
     const vector<ExecutorInfo>& executorInfos_,
     const vector<Task>& tasks_,
     const vector<FrameworkInfo>& frameworks,
-    const vector<Archive::Framework>& completedFrameworks,
+    const vector<Archive::Framework>& completedFrameworks_,
     const string& version,
     const vector<SlaveInfo::Capability>& agentCapabilities,
     const Future<bool>& readmit)
@@ -6019,20 +6317,21 @@ void Master::__reregisterSlave(
     }
   };
 
+  // Adjust the agent's task and executor infos to ensure
+  // compatibility with old agents without certain capabilities.
   protobuf::slave::Capabilities slaveCapabilities(agentCapabilities);
-  vector<Task> adjustedTasks;
-  vector<ExecutorInfo> adjustedExecutorInfos;
+  vector<Task> tasks = tasks_;
+  vector<ExecutorInfo> executorInfos = executorInfos_;
+  vector<Archive::Framework> completedFrameworks = completedFrameworks_;
 
+  // If the agent is not multi-role capable, inject allocation info.
   if (!slaveCapabilities.multiRole) {
     hashmap<FrameworkID, FrameworkInfo> frameworks_;
     foreach (const FrameworkInfo& framework, frameworks) {
       frameworks_[framework.id()] = framework;
     }
 
-    adjustedTasks = tasks_;
-    adjustedExecutorInfos = executorInfos_;
-
-    foreach (Task& task, adjustedTasks) {
+    foreach (Task& task, tasks) {
       CHECK(frameworks_.contains(task.framework_id()));
 
       injectAllocationInfo(
@@ -6040,7 +6339,7 @@ void Master::__reregisterSlave(
           frameworks_.at(task.framework_id()));
     }
 
-    foreach (ExecutorInfo& executor, adjustedExecutorInfos) {
+    foreach (ExecutorInfo& executor, executorInfos) {
       CHECK(frameworks_.contains(executor.framework_id()));
 
       injectAllocationInfo(
@@ -6049,11 +6348,26 @@ void Master::__reregisterSlave(
     }
   }
 
-  const vector<Task>& tasks =
-    slaveCapabilities.multiRole ? tasks_ : adjustedTasks;
+  // Currently, The agent always downgrades the resources such that
+  // a 1.4.0 agent can speak to a pre-1.4.0 master. We therefore
+  // unconditionally upgrade the resources back here.
+  foreach (Task& task, tasks) {
+    convertResourceFormat(
+        task.mutable_resources(), POST_RESERVATION_REFINEMENT);
+  }
 
-  const vector<ExecutorInfo>& executorInfos =
-    slaveCapabilities.multiRole ? executorInfos_ : adjustedExecutorInfos;
+  foreach (ExecutorInfo& executor, executorInfos) {
+    convertResourceFormat(
+        executor.mutable_resources(), POST_RESERVATION_REFINEMENT);
+  }
+
+  foreach (Archive::Framework& completedFramework,
+           completedFrameworks) {
+    foreach (Task& task, *completedFramework.mutable_tasks()) {
+      convertResourceFormat(
+          task.mutable_resources(), POST_RESERVATION_REFINEMENT);
+    }
+  }
 
   MachineID machineId;
   machineId.set_hostname(slaveInfo.hostname());
@@ -6194,7 +6508,7 @@ void Master::__reregisterSlave(
     }
   }
 
-  ___reregisterSlave(slave, tasks, frameworks);
+  ___reregisterSlave(slave, frameworks);
 
   slaves.reregistering.erase(slaveInfo.id());
 }
@@ -6202,7 +6516,6 @@ void Master::__reregisterSlave(
 
 void Master::___reregisterSlave(
     Slave* slave,
-    const vector<Task>& tasks,
     const vector<FrameworkInfo>& frameworks)
 {
   CHECK_NOTNULL(slave);
@@ -6243,12 +6556,33 @@ void Master::___reregisterSlave(
     }
   }
 
+  CheckpointResourcesMessage message;
+
+  message.mutable_resources()->CopyFrom(slave->checkpointedResources);
+
+  if (!slave->capabilities.reservationRefinement) {
+    // If the agent is not refinement-capable, don't send it
+    // checkpointed resources that contain refined reservations. This
+    // might occur if a reservation refinement is created but never
+    // reaches the agent (e.g., due to network partition), and then
+    // the agent is downgraded before the partition heals.
+    //
+    // TODO(neilc): It would probably be better to prevent the agent
+    // from re-registering in this scenario.
+    Try<Nothing> result = downgradeResources(message.mutable_resources());
+    if (result.isError()) {
+      LOG(WARNING) << "Not sending updated checkpointed resouces "
+                   << slave->checkpointedResources
+                   << " with refined reservations, since agent " << *slave
+                   << " is not RESERVATION_REFINEMENT-capable.";
+
+      return;
+    }
+  }
+
   LOG(INFO) << "Sending updated checkpointed resources "
             << slave->checkpointedResources
             << " to agent " << *slave;
-
-  CheckpointResourcesMessage message;
-  message.mutable_resources()->CopyFrom(slave->checkpointedResources);
 
   send(slave->pid, message);
 }
@@ -6309,34 +6643,27 @@ void Master::updateFramework(
 }
 
 
-void Master::updateSlave(
-    const SlaveID& slaveId,
-    const Resources& oversubscribedResources)
+void Master::updateSlave(const UpdateSlaveMessage& message)
 {
   ++metrics->messages_update_slave;
+
+  const SlaveID& slaveId = message.slave_id();
 
   if (slaves.removed.get(slaveId).isSome()) {
     // If the slave has been removed, drop the status update. The
     // master is no longer trying to health check this slave; when the
     // slave realizes it hasn't received any pings from the master, it
     // will eventually try to reregister.
-    LOG(WARNING)
-      << "Ignoring update of agent with total oversubscribed resources "
-      << oversubscribedResources << " on removed agent " << slaveId;
+    LOG(WARNING) << "Ignoring update on removed agent " << slaveId;
     return;
   }
 
   Slave* slave = slaves.registered.get(slaveId);
 
   if (slave == nullptr) {
-    LOG(WARNING)
-      << "Ignoring update of agent with total oversubscribed resources "
-      << oversubscribedResources << " on unknown agent " << slaveId;
+    LOG(WARNING) << "Ignoring update on removed agent " << slaveId;
     return;
   }
-
-  LOG(INFO) << "Received update of agent " << *slave << " with total"
-            << " oversubscribed resources " << oversubscribedResources;
 
   // NOTE: We must *first* update the agent's resources before we
   // recover the resources. If we recovered the resources first,
@@ -6344,11 +6671,44 @@ void Master::updateSlave(
   // updating the agent in the allocator. This would lead us to
   // re-send out the stale oversubscribed resources!
 
-  slave->totalResources =
-    slave->totalResources.nonRevocable() + oversubscribedResources.revocable();
+  // If the caller did not specify a type we assume we should set
+  // `oversubscribedResources` to be backwards-compatibility with
+  // older clients.
+  const UpdateSlaveMessage::Type type =
+    message.has_type() ? message.type() : UpdateSlaveMessage::OVERSUBSCRIBED;
 
-  // First update the agent's resources in the allocator.
-  allocator->updateSlave(slaveId, oversubscribedResources);
+  switch (type) {
+    case UpdateSlaveMessage::OVERSUBSCRIBED: {
+      const Resources oversubscribedResources =
+        message.oversubscribed_resources();
+
+      LOG(INFO) << "Received update of agent " << *slave << " with total"
+                << " oversubscribed resources " << oversubscribedResources;
+
+      slave->totalResources =
+        slave->totalResources.nonRevocable() +
+        oversubscribedResources.revocable();
+      break;
+    }
+    case UpdateSlaveMessage::TOTAL: {
+      const Resources totalResources =
+        message.total_resources();
+
+      LOG(INFO) << "Received update of agent " << *slave << " with total"
+                << " resources " << totalResources;
+
+      slave->totalResources = totalResources;
+      break;
+    }
+    case UpdateSlaveMessage::UNKNOWN: {
+      LOG(WARNING) << "Ignoring update on agent " << slaveId
+                   << " since the update type is not understood";
+      return;
+    }
+  }
+
+  // Now update the agent's resources in the allocator.
+  allocator->updateSlave(slaveId, slave->totalResources);
 
   // Then rescind any outstanding offers with revocable resources.
   // NOTE: Need a copy of offers because the offers are removed inside the loop.
@@ -7239,6 +7599,10 @@ void Master::offer(
       offer->mutable_attributes()->MergeFrom(slave->info.attributes());
       offer->mutable_allocation_info()->set_role(role);
 
+      if (slave->info.has_domain()) {
+        offer->mutable_domain()->MergeFrom(slave->info.domain());
+      }
+
       // Add all framework's executors running on this slave.
       if (slave->executors.contains(framework->id())) {
         const hashmap<ExecutorID, ExecutorInfo>& executors =
@@ -7280,6 +7644,11 @@ void Master::offer(
         if (resource.name() != "ephemeral_ports") {
           offer_.add_resources()->CopyFrom(resource);
         }
+      }
+
+      if (!framework->capabilities.reservationRefinement) {
+        convertResourceFormat(
+            offer_.mutable_resources(), PRE_RESERVATION_REFINEMENT);
       }
 
       // Add the offer *AND* the corresponding slave's PID.
@@ -8141,6 +8510,11 @@ void Master::removeFramework(Framework* framework)
 
   // The framework pointer is now owned by `frameworks.completed`.
   frameworks.completed.set(framework->id(), Owned<Framework>(framework));
+
+  if (!subscribers.subscribed.empty()) {
+    subscribers.send(
+        protobuf::master::event::createFrameworkRemoved(framework->info));
+  }
 }
 
 
@@ -8701,17 +9075,39 @@ Future<Nothing> Master::apply(Slave* slave, const Offer::Operation& operation)
 }
 
 
-void Master::_apply(Slave* slave, const Offer::Operation& operation) {
+void Master::_apply(Slave* slave, const Offer::Operation& operation)
+{
   CHECK_NOTNULL(slave);
 
   slave->apply(operation);
 
-  LOG(INFO) << "Sending checkpointed resources "
+  CheckpointResourcesMessage message;
+
+  message.mutable_resources()->CopyFrom(slave->checkpointedResources);
+
+  if (!slave->capabilities.reservationRefinement) {
+    // If the agent is not refinement-capable, don't send it
+    // checkpointed resources that contain refined reservations. This
+    // might occur if a reservation refinement is created but never
+    // reaches the agent (e.g., due to network partition), and then
+    // the agent is downgraded before the partition heals.
+    //
+    // TODO(neilc): It would probably be better to prevent the agent
+    // from re-registering in this scenario.
+    Try<Nothing> result = downgradeResources(message.mutable_resources());
+    if (result.isError()) {
+      LOG(WARNING) << "Not sending updated checkpointed resouces "
+                   << slave->checkpointedResources
+                   << " with refined reservations, since agent " << *slave
+                   << " is not RESERVATION_REFINEMENT-capable.";
+
+      return;
+    }
+  }
+
+  LOG(INFO) << "Sending updated checkpointed resources "
             << slave->checkpointedResources
             << " to agent " << *slave;
-
-  CheckpointResourcesMessage message;
-  message.mutable_resources()->CopyFrom(slave->checkpointedResources);
 
   send(slave->pid, message);
 }
@@ -8763,6 +9159,7 @@ void Master::removeOffer(Offer* offer, bool rescind)
   }
 
   // Delete it.
+  LOG(INFO) << "Removing offer " << offer->id();
   offers.erase(offer->id());
   delete offer;
 }
@@ -9188,11 +9585,194 @@ static bool isValidFailoverTimeout(const FrameworkInfo& frameworkInfo)
 
 void Master::Subscribers::send(const mesos::master::Event& event)
 {
-  VLOG(1) << "Notifying all active subscribers about " << event.type() << " "
-          << "event";
+  VLOG(1) << "Notifying all active subscribers about " << event.type()
+          << " event";
 
   foreachvalue (const Owned<Subscriber>& subscriber, subscribed) {
-    subscriber->http.send<mesos::master::Event, v1::master::Event>(event);
+    Future<Owned<AuthorizationAcceptor>> authorizeRole =
+      AuthorizationAcceptor::create(
+          subscriber->principal,
+          subscriber->master->authorizer,
+          authorization::VIEW_ROLE);
+
+    Future<Owned<AuthorizationAcceptor>> authorizeFramework =
+      AuthorizationAcceptor::create(
+          subscriber->principal,
+          subscriber->master->authorizer,
+          authorization::VIEW_FRAMEWORK);
+
+    Future<Owned<AuthorizationAcceptor>> authorizeTask =
+      AuthorizationAcceptor::create(
+          subscriber->principal,
+          subscriber->master->authorizer,
+          authorization::VIEW_TASK);
+
+    Future<Owned<AuthorizationAcceptor>> authorizeExecutor =
+      AuthorizationAcceptor::create(
+          subscriber->principal,
+          subscriber->master->authorizer,
+          authorization::VIEW_EXECUTOR);
+
+    collect(authorizeRole, authorizeFramework, authorizeTask, authorizeExecutor)
+      .then(defer(subscriber->master->self(),
+          [=](const tuple<Owned<AuthorizationAcceptor>,
+                          Owned<AuthorizationAcceptor>,
+                          Owned<AuthorizationAcceptor>,
+                          Owned<AuthorizationAcceptor>>& acceptors) {
+        Owned<AuthorizationAcceptor> authorizeRole;
+        Owned<AuthorizationAcceptor> authorizeFramework;
+        Owned<AuthorizationAcceptor> authorizeTask;
+        Owned<AuthorizationAcceptor> authorizeExecutor;
+
+        tie(authorizeRole,
+            authorizeFramework,
+            authorizeTask,
+            authorizeExecutor) = acceptors;
+
+        subscriber->send(event,
+            authorizeRole,
+            authorizeFramework,
+            authorizeTask,
+            authorizeExecutor);
+
+        return Nothing();
+      }));
+  }
+}
+
+
+void Master::Subscribers::Subscriber::send(
+    const mesos::master::Event& event,
+    const Owned<AuthorizationAcceptor>& authorizeRole,
+    const Owned<AuthorizationAcceptor>& authorizeFramework,
+    const Owned<AuthorizationAcceptor>& authorizeTask,
+    const Owned<AuthorizationAcceptor>& authorizeExecutor)
+{
+  switch (event.type()) {
+    case mesos::master::Event::TASK_ADDED: {
+      Framework* framework =
+        master->getFramework(event.task_added().task().framework_id());
+
+      if (framework == nullptr) {
+        break;
+      }
+
+      if (authorizeTask->accept(event.task_added().task(), framework->info) &&
+          authorizeFramework->accept(framework->info)) {
+        http.send<mesos::master::Event, v1::master::Event>(event);
+      }
+      break;
+    }
+    case mesos::master::Event::TASK_UPDATED: {
+      Framework* framework =
+        master->getFramework(event.task_updated().framework_id());
+
+      if (framework == nullptr) {
+        break;
+      }
+
+      Task* task =
+        framework->getTask(event.task_updated().status().task_id());
+
+      if (task == nullptr) {
+        break;
+      }
+
+      if (authorizeTask->accept(*task, framework->info) &&
+          authorizeFramework->accept(framework->info)) {
+        http.send<mesos::master::Event, v1::master::Event>(event);
+      }
+      break;
+    }
+    case mesos::master::Event::FRAMEWORK_ADDED: {
+      if (authorizeFramework->accept(
+              event.framework_added().framework().framework_info())) {
+        mesos::master::Event event_(event);
+        event_.mutable_framework_added()->mutable_framework()->
+          mutable_allocated_resources()->Clear();
+        event_.mutable_framework_added()->mutable_framework()->
+          mutable_offered_resources()->Clear();
+
+        foreach(
+            const Resource& resource,
+            event.framework_added().framework().allocated_resources()) {
+          if (authorizeResource(resource, authorizeRole)) {
+            event_.mutable_framework_added()->mutable_framework()->
+              add_allocated_resources()->CopyFrom(resource);
+          }
+        }
+
+        foreach(
+            const Resource& resource,
+            event.framework_added().framework().offered_resources()) {
+          if (authorizeResource(resource, authorizeRole)) {
+            event_.mutable_framework_added()->mutable_framework()->
+              add_offered_resources()->CopyFrom(resource);
+          }
+        }
+
+        http.send<mesos::master::Event, v1::master::Event>(event_);
+      }
+      break;
+    }
+    case mesos::master::Event::FRAMEWORK_UPDATED: {
+      if (authorizeFramework->accept(
+              event.framework_updated().framework().framework_info())) {
+        mesos::master::Event event_(event);
+        event_.mutable_framework_updated()->mutable_framework()->
+          mutable_allocated_resources()->Clear();
+        event_.mutable_framework_updated()->mutable_framework()->
+          mutable_offered_resources()->Clear();
+
+        foreach(
+            const Resource& resource,
+            event.framework_updated().framework().allocated_resources()) {
+          if (authorizeResource(resource, authorizeRole)) {
+            event_.mutable_framework_updated()->mutable_framework()->
+              add_allocated_resources()->CopyFrom(resource);
+          }
+        }
+
+        foreach(
+            const Resource& resource,
+            event.framework_updated().framework().offered_resources()) {
+          if (authorizeResource(resource, authorizeRole)) {
+            event_.mutable_framework_updated()->mutable_framework()->
+              add_offered_resources()->CopyFrom(resource);
+          }
+        }
+
+        http.send<mesos::master::Event, v1::master::Event>(event_);
+      }
+      break;
+    }
+    case mesos::master::Event::FRAMEWORK_REMOVED: {
+      if (authorizeFramework->accept(
+              event.framework_removed().framework_info())) {
+        http.send<mesos::master::Event, v1::master::Event>(event);
+      }
+      break;
+    }
+    case mesos::master::Event::AGENT_ADDED: {
+      mesos::master::Event event_(event);
+      event_.mutable_agent_added()->mutable_agent()->
+        mutable_total_resources()->Clear();
+
+      foreach(
+          const Resource& resource,
+          event.agent_added().agent().total_resources()) {
+        if (authorizeResource(resource, authorizeRole)) {
+          event_.mutable_agent_added()->mutable_agent()->add_total_resources()
+            ->CopyFrom(resource);
+        }
+      }
+
+      http.send<mesos::master::Event, v1::master::Event>(event_);
+      break;
+    }
+    default:
+      http.send<mesos::master::Event, v1::master::Event>(event);
+      break;
   }
 }
 
@@ -9200,18 +9780,23 @@ void Master::Subscribers::send(const mesos::master::Event& event)
 void Master::exited(const UUID& id)
 {
   if (!subscribers.subscribed.contains(id)) {
-    LOG(WARNING) << "Unknown subscriber" << id << " disconnected";
+    LOG(WARNING) << "Unknown subscriber " << id << " disconnected";
     return;
   }
+
+  LOG(INFO) << "Removed subscriber " << id
+            << " from the list of active subscribers";
 
   subscribers.subscribed.erase(id);
 }
 
 
-void Master::subscribe(const HttpConnection& http)
+void Master::subscribe(
+    const HttpConnection& http,
+    const Option<Principal>& principal)
 {
-  LOG(INFO) << "Added subscriber: " << http.streamId << " to the "
-            << "list of active subscribers";
+  LOG(INFO) << "Added subscriber " << http.streamId
+            << " to the list of active subscribers";
 
   http.closed()
     .onAny(defer(self(),
@@ -9221,24 +9806,29 @@ void Master::subscribe(const HttpConnection& http)
 
   subscribers.subscribed.put(
       http.streamId,
-      Owned<Subscribers::Subscriber>(new Subscribers::Subscriber{http}));
+      Owned<Subscribers::Subscriber>(
+          new Subscribers::Subscriber{this, http, principal}));
 }
 
 
 Slave::Slave(
     Master* const _master,
-    const SlaveInfo& _info,
+    SlaveInfo _info,
     const UPID& _pid,
     const MachineID& _machineId,
     const string& _version,
     const vector<SlaveInfo::Capability>& _capabilites,
     const Time& _registeredTime,
-    const Resources& _checkpointedResources,
+    vector<Resource> _checkpointedResources,
     const vector<ExecutorInfo>& executorInfos,
     const vector<Task>& tasks)
   : master(_master),
     id(_info.id()),
-    info(_info),
+    info([&_info]() {
+      convertResourceFormat(
+          _info.mutable_resources(), POST_RESERVATION_REFINEMENT);
+      return _info;
+    }()),
     machineId(_machineId),
     pid(_pid),
     version(_version),
@@ -9246,14 +9836,18 @@ Slave::Slave(
     registeredTime(_registeredTime),
     connected(true),
     active(true),
-    checkpointedResources(_checkpointedResources),
+    checkpointedResources([&_checkpointedResources]() {
+      convertResourceFormat(
+          &_checkpointedResources, POST_RESERVATION_REFINEMENT);
+      return _checkpointedResources;
+    }()),
     observer(nullptr)
 {
   CHECK(_info.has_id());
 
   Try<Resources> resources = applyCheckpointedResources(
       info.resources(),
-      _checkpointedResources);
+      checkpointedResources);
 
   // NOTE: This should be validated during slave recovery.
   CHECK_SOME(resources);
@@ -9417,6 +10011,7 @@ void Slave::addExecutor(const FrameworkID& frameworkId,
   executors[frameworkId][executorInfo.executor_id()] = executorInfo;
   usedResources[frameworkId] += executorInfo.resources();
 }
+
 
 void Slave::removeExecutor(const FrameworkID& frameworkId,
                            const ExecutorID& executorId)

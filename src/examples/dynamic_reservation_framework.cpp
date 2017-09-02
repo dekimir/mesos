@@ -42,6 +42,9 @@ using std::vector;
 const int32_t CPUS_PER_TASK = 1;
 const int32_t MEM_PER_TASK = 128;
 
+constexpr char FRAMEWORK_NAME[] = "Dynamic Reservation Framework (C++)";
+
+
 // The framework reserves resources to run at most one task at a time
 // on each agent; the resources are reserved when they are offered to
 // the framework for the first time, and are unreserved when all tasks
@@ -60,18 +63,18 @@ public:
       totalTasks(5),
       principal(_principal)
   {
-    reservationInfo.set_principal(principal);
-
     taskResources = Resources::parse(
         "cpus:" + stringify(CPUS_PER_TASK) +
         ";mem:" + stringify(MEM_PER_TASK)).get();
 
     taskResources.allocate(role);
 
+    reservationInfo.set_type(Resource::ReservationInfo::DYNAMIC);
+    reservationInfo.set_role(role);
+    reservationInfo.set_principal(principal);
+
     // The task will run on reserved resources.
-    Try<Resources> flattened = taskResources.flatten(role, reservationInfo);
-    CHECK_SOME(flattened);
-    taskResources = flattened.get();
+    taskResources = taskResources.pushReservation(reservationInfo);
   }
 
   virtual ~DynamicReservationScheduler() {}
@@ -378,9 +381,11 @@ int main(int argc, char** argv)
 
   FrameworkInfo framework;
   framework.set_user(""); // Mesos'll fill in the current user.
-  framework.set_name("Dynamic Reservation Framework (C++)");
+  framework.set_name(FRAMEWORK_NAME);
   framework.set_role(flags.role.get());
   framework.set_principal(flags.principal);
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
   DynamicReservationScheduler scheduler(
       flags.command,

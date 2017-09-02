@@ -39,6 +39,7 @@
 #include <stout/jsonify.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/uuid.hpp>
 
 #include <stout/os/killtree.hpp>
@@ -258,6 +259,11 @@ DockerContainerizer::~DockerContainerizer()
     dockerFlags.task_environment = string(jsonify(taskEnvironment.get()));
   }
 
+  if (flags.default_container_dns.isSome()) {
+    dockerFlags.default_container_dns =
+      string(jsonify(JSON::Protobuf(flags.default_container_dns.get())));
+  }
+
 #ifdef __linux__
   dockerFlags.cgroups_enable_cfs = flags.cgroups_enable_cfs,
 #endif
@@ -420,7 +426,8 @@ Future<Nothing> DockerContainerizerProcess::fetch(
       containerId,
       container->command,
       container->containerWorkDir,
-      None());
+      container->containerConfig.has_user() ? container->containerConfig.user()
+                                            : Option<string>::none());
 }
 
 
@@ -1323,6 +1330,13 @@ Future<Docker::Container> DockerContainerizerProcess::launchExecutorContainer(
         self(),
         [=](const ContainerIO& containerIO)
           -> Future<Docker::Container> {
+    // We need to pass `flags.default_container_dns` only when the agent is not
+    // running in a Docker container. This is to handle the case of launching a
+    // custom executor in a Docker container. If the agent is running in a
+    // Docker container (i.e., flags.docker_mesos_image.isSome() == true), that
+    // is the case of launching `mesos-docker-executor` in a Docker container
+    // with the Docker image `flags.docker_mesos_image`. In that case we already
+    // set `flags.default_container_dns` in the method `dockerFlags()`.
     Try<Docker::RunOptions> runOptions = Docker::RunOptions::create(
         container->container,
         container->command,
@@ -1336,7 +1350,8 @@ Future<Docker::Container> DockerContainerizerProcess::launchExecutorContainer(
         false,
 #endif
         container->environment,
-        None() // No extra devices.
+        None(), // No extra devices.
+        flags.docker_mesos_image.isNone() ? flags.default_container_dns : None()
     );
 
     if (runOptions.isError()) {
@@ -1407,7 +1422,18 @@ Future<pid_t> DockerContainerizerProcess::launchExecutorProcess(
   foreach (const Environment::Variable& variable,
            container->containerConfig.executor_info()
              .command().environment().variables()) {
-    environment[variable.name()] = variable.value();
+    const string& name = variable.name();
+    const string& value = variable.value();
+
+    if (environment.count(name)) {
+      VLOG(1) << "Overwriting environment variable '"
+              << name << "', original: '"
+              << environment[name] << "', new: '"
+              << value << "', for container "
+              << container->id;
+    }
+
+    environment[name] = value;
   }
 
   // Pass GLOG flag to the executor.
@@ -1426,7 +1452,7 @@ Future<pid_t> DockerContainerizerProcess::launchExecutorProcess(
   // applications to not work, but upon overriding system defaults, it becomes
   // the overidder's problem.
   Option<map<std::wstring, std::wstring>> systemEnvironment =
-    process::internal::getSystemEnvironment();
+    ::internal::windows::get_system_env();
   foreachpair(const std::wstring& key,
               const std::wstring& value,
               systemEnvironment.get()) {
@@ -1817,9 +1843,6 @@ Future<ResourceStatistics> DockerContainerizerProcess::usage(
 {
   CHECK(!containerId.has_parent());
 
-#ifndef __linux__
-  return Failure("Does not support usage() on non-linux platform");
-#else
   if (!containers_.contains(containerId)) {
     return Failure("Unknown container: " + stringify(containerId));
   }
@@ -1843,12 +1866,16 @@ Future<ResourceStatistics> DockerContainerizerProcess::usage(
       return Failure("Container is being removed: " + stringify(containerId));
     }
 
+    ResourceStatistics result;
+
+#ifdef __linux__
     const Try<ResourceStatistics> cgroupStats = cgroupsStatistics(pid);
     if (cgroupStats.isError()) {
       return Failure("Failed to collect cgroup stats: " + cgroupStats.error());
     }
 
-    ResourceStatistics result = cgroupStats.get();
+    result = cgroupStats.get();
+#endif // __linux__
 
     // Set the resource allocations.
     const Resources& resource = container->resources;
@@ -1893,7 +1920,6 @@ Future<ResourceStatistics> DockerContainerizerProcess::usage(
 
         return collectUsage(pid.get());
       }));
-#endif // __linux__
 }
 
 
@@ -2081,8 +2107,6 @@ Future<bool> DockerContainerizerProcess::destroy(
       .then([]() { return true; });
   }
 
-  LOG(INFO) << "Destroying container " << containerId;
-
   // It's possible that destroy is getting called before
   // DockerContainerizer::launch has completed (i.e., after we've
   // returned a future but before we've completed the fetching of the
@@ -2159,6 +2183,7 @@ Future<bool> DockerContainerizerProcess::destroy(
   }
 
   CHECK(container->state == Container::RUNNING);
+  LOG(INFO) << "Destroying container " << containerId << " in RUNNING state";
 
   container->state = Container::DESTROYING;
 

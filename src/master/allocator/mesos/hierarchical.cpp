@@ -150,13 +150,15 @@ void HierarchicalAllocatorProcess::initialize(
              const hashmap<SlaveID, UnavailableResources>&)>&
       _inverseOfferCallback,
     const Option<set<string>>& _fairnessExcludeResourceNames,
-    bool _filterGpuResources)
+    bool _filterGpuResources,
+    const Option<DomainInfo>& _domain)
 {
   allocationInterval = _allocationInterval;
   offerCallback = _offerCallback;
   inverseOfferCallback = _inverseOfferCallback;
   fairnessExcludeResourceNames = _fairnessExcludeResourceNames;
   filterGpuResources = _filterGpuResources;
+  domain = _domain;
   initialized = true;
   paused = false;
 
@@ -204,8 +206,8 @@ void HierarchicalAllocatorProcess::recover(
   // exacerbate the issue.
 
   if (quotas.empty()) {
-    VLOG(1) << "Skipping recovery of hierarchical allocator: "
-            << "nothing to recover";
+    VLOG(1) << "Skipping recovery of hierarchical allocator:"
+            << " nothing to recover";
 
     return;
   }
@@ -228,8 +230,8 @@ void HierarchicalAllocatorProcess::recover(
   // to expected behavior by the user: the allocator is not paused until
   // a new agent is added.
   if (expectedAgentCount.get() == 0) {
-    VLOG(1) << "Skipping recovery of hierarchical allocator: "
-            << "no reconnecting agents to wait for";
+    VLOG(1) << "Skipping recovery of hierarchical allocator:"
+            << " no reconnecting agents to wait for";
 
     return;
   }
@@ -560,6 +562,10 @@ void HierarchicalAllocatorProcess::addSlave(
   slave.hostname = slaveInfo.hostname();
   slave.capabilities = protobuf::slave::Capabilities(capabilities);
 
+  if (slaveInfo.has_domain()) {
+    slave.domain = slaveInfo.domain();
+  }
+
   // NOTE: We currently implement maintenance in the allocator to be able to
   // leverage state and features such as the FrameworkSorter and OfferFilter.
   if (unavailability.isSome()) {
@@ -623,7 +629,7 @@ void HierarchicalAllocatorProcess::removeSlave(
 
 void HierarchicalAllocatorProcess::updateSlave(
     const SlaveID& slaveId,
-    const Option<Resources>& oversubscribed,
+    const Option<Resources>& total,
     const Option<vector<SlaveInfo::Capability>>& capabilities)
 {
   CHECK(initialized);
@@ -648,42 +654,11 @@ void HierarchicalAllocatorProcess::updateSlave(
     }
   }
 
-  if (oversubscribed.isSome()) {
-    // Check that all the oversubscribed resources are revocable.
-    CHECK_EQ(oversubscribed.get(), oversubscribed->revocable());
+  if (total.isSome()) {
+    updated = updateSlaveTotal(slaveId, total.get());
 
-    const Resources oldRevocable = slave.total.revocable();
-
-    if (oldRevocable != oversubscribed.get()) {
-      // Update the total resources.
-      //
-      // Reset the total resources to include the non-revocable resources,
-      // plus the new estimate of oversubscribed resources.
-      //
-      // NOTE: All modifications to revocable resources in the allocator for
-      // `slaveId` are lost.
-      //
-      // TODO(alexr): Update this math once the source of revocable resources
-      // is extended beyond oversubscription.
-      slave.total = slave.total.nonRevocable() + oversubscribed.get();
-
-      // Update the total resources in the `roleSorter` by removing the
-      // previous oversubscribed resources and adding the new
-      // oversubscription estimate.
-      roleSorter->remove(slaveId, oldRevocable);
-      roleSorter->add(slaveId, oversubscribed.get());
-
-      updated = true;
-
-      // NOTE: We do not need to update `quotaRoleSorter` because this
-      // function only changes the revocable resources on the slave, but
-      // the quota role sorter only manages non-revocable resources.
-
-      LOG(INFO) << "Agent " << slaveId << " (" << slave.hostname << ")"
-                << " updated with oversubscribed resources "
-                << oversubscribed.get() << " (total: " << slave.total
-                << ", allocated: " << slave.allocated << ")";
-    }
+    LOG(INFO) << "Agent " << slaveId << " (" << slave.hostname << ")"
+              << " updated with total resources " << total.get();
   }
 
   if (updated) {
@@ -900,14 +875,14 @@ void HierarchicalAllocatorProcess::updateAllocation(
   frameworkSorter->remove(slaveId, offeredResources);
   frameworkSorter->add(slaveId, updatedOfferedResources);
 
-  // Check that the `flattened` quantities for framework allocations
+  // Check that the unreserved quantities for framework allocations
   // have not changed by the above operations.
   const Resources updatedFrameworkAllocation =
     frameworkSorter->allocation(frameworkId.value(), slaveId);
 
   CHECK_EQ(
-      frameworkAllocation.flatten().createStrippedScalarQuantity(),
-      updatedFrameworkAllocation.flatten().createStrippedScalarQuantity());
+      frameworkAllocation.toUnreserved().createStrippedScalarQuantity(),
+      updatedFrameworkAllocation.toUnreserved().createStrippedScalarQuantity());
 
   LOG(INFO) << "Updated allocation of framework " << frameworkId
             << " on agent " << slaveId
@@ -1040,33 +1015,42 @@ void HierarchicalAllocatorProcess::updateInverseOffer(
     return;
   }
 
-  // Create a refused resource filter.
-  Try<Duration> seconds = Duration::create(filters.get().refuse_seconds());
+  // Create a refused inverse offer filter.
+  Try<Duration> timeout = Duration::create(Filters().refuse_seconds());
 
-  if (seconds.isError()) {
-    LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
-                 << "the refused inverse offer filter because the input value "
-                 << "is invalid: " << seconds.error();
+  if (filters->refuse_seconds() > Days(365).secs()) {
+    LOG(WARNING) << "Using 365 days to create the refused inverse offer"
+                 << " filter because the input value is too big";
 
-    seconds = Duration::create(Filters().refuse_seconds());
-  } else if (seconds.get() < Duration::zero()) {
-    LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
-                 << "the refused inverse offer filter because the input value "
-                 << "is negative";
+    timeout = Days(365);
+  } else if (filters->refuse_seconds() < 0) {
+    LOG(WARNING) << "Using the default value of 'refuse_seconds' to create"
+                 << " the refused inverse offer filter because the input"
+                 << " value is negative";
 
-    seconds = Duration::create(Filters().refuse_seconds());
+    timeout = Duration::create(Filters().refuse_seconds());
+  } else {
+    timeout = Duration::create(filters->refuse_seconds());
+
+    if (timeout.isError()) {
+      LOG(WARNING) << "Using the default value of 'refuse_seconds' to create"
+                   << " the refused inverse offer filter because the input"
+                   << " value is invalid: " + timeout.error();
+
+      timeout = Duration::create(Filters().refuse_seconds());
+    }
   }
 
-  CHECK_SOME(seconds);
+  CHECK_SOME(timeout);
 
-  if (seconds.get() != Duration::zero()) {
+  if (timeout.get() != Duration::zero()) {
     VLOG(1) << "Framework " << frameworkId
             << " filtered inverse offers from agent " << slaveId
-            << " for " << seconds.get();
+            << " for " << timeout.get();
 
     // Create a new inverse offer filter and delay its expiration.
     InverseOfferFilter* inverseOfferFilter =
-      new RefusedInverseOfferFilter(Timeout::in(seconds.get()));
+      new RefusedInverseOfferFilter(Timeout::in(timeout.get()));
 
     framework.inverseOfferFilters[slaveId].insert(inverseOfferFilter);
 
@@ -1078,7 +1062,7 @@ void HierarchicalAllocatorProcess::updateInverseOffer(
              InverseOfferFilter*) = &Self::expire;
 
     delay(
-        seconds.get(),
+        timeout.get(),
         self(),
         expireInverseOffer,
         frameworkId,
@@ -1192,20 +1176,29 @@ void HierarchicalAllocatorProcess::recoverResources(
   }
 
   // Create a refused resources filter.
-  Try<Duration> timeout = Duration::create(filters.get().refuse_seconds());
+  Try<Duration> timeout = Duration::create(Filters().refuse_seconds());
 
-  if (timeout.isError()) {
-    LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
-                 << "the refused resources filter because the input value "
-                 << "is invalid: " << timeout.error();
+  if (filters->refuse_seconds() > Days(365).secs()) {
+    LOG(WARNING) << "Using 365 days to create the refused resources offer"
+                 << " filter because the input value is too big";
+
+    timeout = Days(365);
+  } else if (filters->refuse_seconds() < 0) {
+    LOG(WARNING) << "Using the default value of 'refuse_seconds' to create"
+                 << " the refused resources offer filter because the input"
+                 << " value is negative";
 
     timeout = Duration::create(Filters().refuse_seconds());
-  } else if (timeout.get() < Duration::zero()) {
-    LOG(WARNING) << "Using the default value of 'refuse_seconds' to create "
-                 << "the refused resources filter because the input value "
-                 << "is negative";
+  } else {
+    timeout = Duration::create(filters->refuse_seconds());
 
-    timeout = Duration::create(Filters().refuse_seconds());
+    if (timeout.isError()) {
+      LOG(WARNING) << "Using the default value of 'refuse_seconds' to create"
+                   << " the refused resources offer filter because the input"
+                   << " value is invalid: " + timeout.error();
+
+      timeout = Duration::create(Filters().refuse_seconds());
+    }
   }
 
   CHECK_SOME(timeout);
@@ -1545,8 +1538,8 @@ void HierarchicalAllocatorProcess::__allocate()
 
     // NOTE: `allocationScalarQuantities` omits dynamic reservation,
     // persistent volume info, and allocation info. We additionally
-    // strip the `Resource.role` here via `flatten()`.
-    return quotaRoleSorter->allocationScalarQuantities(role).flatten();
+    // remove the resource's `role` here via `toUnreserved()`.
+    return quotaRoleSorter->allocationScalarQuantities(role).toUnreserved();
   };
 
   // Due to the two stages in the allocation algorithm and the nature of
@@ -1630,6 +1623,12 @@ void HierarchicalAllocatorProcess::__allocate()
           continue;
         }
 
+        // If this framework is not region-aware, don't offer it
+        // resources on agents in remote regions.
+        if (!framework.capabilities.regionAware && isRemoteSlave(slave)) {
+          continue;
+        }
+
         // Calculate the currently available resources on the slave, which
         // is the difference in non-shared resources between total and
         // allocated, plus all shared resources on the agent (if applicable).
@@ -1648,9 +1647,8 @@ void HierarchicalAllocatorProcess::__allocate()
         }
 
         // The resources we offer are the unreserved resources as well as the
-        // reserved resources for this particular role. This is necessary to
-        // ensure that we don't offer resources that are reserved for another
-        // role.
+        // reserved resources for this particular role and all its ancestors
+        // in the role hierarchy.
         //
         // NOTE: Currently, frameworks are allowed to have '*' role.
         // Calling reserved('*') returns an empty Resources object.
@@ -1660,8 +1658,7 @@ void HierarchicalAllocatorProcess::__allocate()
         // reserved resources are accounted towards the quota guarantee. If we
         // were to rely on stage 2 to offer them out, they would not be checked
         // against the quota guarantee.
-        Resources resources =
-          (available.unreserved() + available.reserved(role)).nonRevocable();
+        Resources resources = available.allocatableTo(role).nonRevocable();
 
         // It is safe to break here, because all frameworks under a role would
         // consider the same resources, so in case we don't have allocatable
@@ -1674,6 +1671,21 @@ void HierarchicalAllocatorProcess::__allocate()
         // stage.
         if (!allocatable(resources)) {
           break;
+        }
+
+        // When reservation refinements are present, old frameworks without the
+        // RESERVATION_REFINEMENT capability won't be able to understand the
+        // new format. While it's possible to translate the refined reservations
+        // into the old format by "hiding" the intermediate reservations in the
+        // "stack", this leads to ambiguity when processing RESERVE / UNRESERVE
+        // operations. This is due to the loss of information when we drop the
+        // intermediatereservations. Therefore, for now we simply filter out
+        // resources with refined reservations if the framework does not have
+        // the capability.
+        if (!framework.capabilities.reservationRefinement) {
+          resources = resources.filter([](const Resource& resource) {
+            return !Resources::hasRefinedReservations(resource);
+          });
         }
 
         // If the framework filters these resources, ignore. The unallocated
@@ -1796,6 +1808,12 @@ void HierarchicalAllocatorProcess::__allocate()
           continue;
         }
 
+        // If this framework is not region-aware, don't offer it
+        // resources on agents in remote regions.
+        if (!framework.capabilities.regionAware && isRemoteSlave(slave)) {
+          continue;
+        }
+
         // Calculate the currently available resources on the slave, which
         // is the difference in non-shared resources between total and
         // allocated, plus all shared resources on the agent (if applicable).
@@ -1814,9 +1832,8 @@ void HierarchicalAllocatorProcess::__allocate()
         }
 
         // The resources we offer are the unreserved resources as well as the
-        // reserved resources for this particular role. This is necessary to
-        // ensure that we don't offer resources that are reserved for another
-        // role.
+        // reserved resources for this particular role and all its ancestors
+        // in the role hierarchy.
         //
         // NOTE: Currently, frameworks are allowed to have '*' role.
         // Calling reserved('*') returns an empty Resources object.
@@ -1827,9 +1844,9 @@ void HierarchicalAllocatorProcess::__allocate()
         // allocation algorithm in stage 1.
         //
         // TODO(mpark): Offer unreserved resources as revocable beyond quota.
-        Resources resources = available.reserved(role);
-        if (!quotas.contains(role)) {
-          resources += available.unreserved();
+        Resources resources = available.allocatableTo(role);
+        if (quotas.contains(role)) {
+          resources -= available.unreserved();
         }
 
         // It is safe to break here, because all frameworks under a role would
@@ -1849,6 +1866,21 @@ void HierarchicalAllocatorProcess::__allocate()
         // Remove revocable resources if the framework has not opted for them.
         if (!framework.capabilities.revocableResources) {
           resources = resources.nonRevocable();
+        }
+
+        // When reservation refinements are present, old frameworks without the
+        // RESERVATION_REFINEMENT capability won't be able to understand the
+        // new format. While it's possible to translate the refined reservations
+        // into the old format by "hiding" the intermediate reservations in the
+        // "stack", this leads to ambiguity when processing RESERVE / UNRESERVE
+        // operations. This is due to the loss of information when we drop the
+        // intermediatereservations. Therefore, for now we simply filter out
+        // resources with refined reservations if the framework does not have
+        // the capability.
+        if (!framework.capabilities.reservationRefinement) {
+          resources = resources.filter([](const Resource& resource) {
+            return !Resources::hasRefinedReservations(resource);
+          });
         }
 
         // If the resources are not allocatable, ignore. We cannot break
@@ -2116,14 +2148,29 @@ bool HierarchicalAllocatorProcess::isFiltered(
   const Framework& framework = frameworks.at(frameworkId);
   const Slave& slave = slaves.at(slaveId);
 
+  // TODO(mpark): Consider moving these filter logic out and into the master,
+  // since they are not specific to the hierarchical allocator but rather are
+  // global allocation constraints.
+
   // Prevent offers from non-MULTI_ROLE agents to be allocated
   // to MULTI_ROLE frameworks.
   if (framework.capabilities.multiRole &&
       !slave.capabilities.multiRole) {
-    LOG(WARNING)
-      << "Implicitly filtering agent " << slaveId << " from framework"
-      << frameworkId << " because the framework is MULTI_ROLE capable"
-      << " but the agent is not";
+    LOG(WARNING) << "Implicitly filtering agent " << slaveId
+                 << " from framework " << frameworkId
+                 << " because the framework is MULTI_ROLE capable"
+                 << " but the agent is not";
+
+    return true;
+  }
+
+  // Prevent offers from non-HIERARCHICAL_ROLE agents to be allocated
+  // to hierarchical roles.
+  if (!slave.capabilities.hierarchicalRole && strings::contains(role, "/")) {
+    LOG(WARNING) << "Implicitly filtering agent " << slaveId
+                 << " from role " << role
+                 << " because the role is hierarchical but the agent is not"
+                 << " HIERARCHICAL_ROLE capable";
 
     return true;
   }
@@ -2324,7 +2371,7 @@ void HierarchicalAllocatorProcess::untrackFrameworkUnderRole(
 }
 
 
-void HierarchicalAllocatorProcess::updateSlaveTotal(
+bool HierarchicalAllocatorProcess::updateSlaveTotal(
     const SlaveID& slaveId,
     const Resources& total)
 {
@@ -2333,6 +2380,11 @@ void HierarchicalAllocatorProcess::updateSlaveTotal(
   Slave& slave = slaves.at(slaveId);
 
   const Resources oldTotal = slave.total;
+
+  if (oldTotal == total) {
+    return false;
+  }
+
   slave.total = total;
 
   // Currently `roleSorter` and `quotaRoleSorter`, being the root-level
@@ -2346,6 +2398,42 @@ void HierarchicalAllocatorProcess::updateSlaveTotal(
   // See comment at `quotaRoleSorter` declaration regarding non-revocable.
   quotaRoleSorter->remove(slaveId, oldTotal.nonRevocable());
   quotaRoleSorter->add(slaveId, total.nonRevocable());
+
+  return true;
+}
+
+
+bool HierarchicalAllocatorProcess::isRemoteSlave(const Slave& slave) const
+{
+  // If the slave does not have a configured domain, assume it is not remote.
+  if (slave.domain.isNone()) {
+    return false;
+  }
+
+  // The current version of the Mesos agent refuses to startup if a
+  // domain is specified without also including a fault domain. That
+  // might change in the future, if more types of domains are added.
+  // For forward compatibility, we treat agents with a configured
+  // domain but no fault domain as having no configured domain.
+  if (!slave.domain->has_fault_domain()) {
+    return false;
+  }
+
+  // If the slave has a configured domain (and it has been allowed to
+  // register with the master), the master must also have a configured
+  // domain.
+  CHECK(domain.isSome());
+
+  // The master will not startup if configured with a domain but no
+  // fault domain.
+  CHECK(domain->has_fault_domain());
+
+  const DomainInfo::FaultDomain::RegionInfo& masterRegion =
+    domain->fault_domain().region();
+  const DomainInfo::FaultDomain::RegionInfo& slaveRegion =
+    slave.domain->fault_domain().region();
+
+  return masterRegion != slaveRegion;
 }
 
 } // namespace internal {

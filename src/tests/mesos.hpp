@@ -28,6 +28,7 @@
 
 #include <mesos/v1/executor.hpp>
 #include <mesos/v1/resources.hpp>
+#include <mesos/v1/resource_provider.hpp>
 #include <mesos/v1/scheduler.hpp>
 
 #include <mesos/v1/executor/executor.hpp>
@@ -60,6 +61,7 @@
 #include <stout/option.hpp>
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
+#include <stout/unreachable.hpp>
 #include <stout/uuid.hpp>
 
 #include "common/http.hpp"
@@ -70,11 +72,12 @@
 
 #include "sched/constants.hpp"
 
+#include "resource_provider/detector.hpp"
+
 #include "slave/constants.hpp"
 #include "slave/slave.hpp"
 
 #include "slave/containerizer/containerizer.hpp"
-#include "slave/containerizer/fetcher.hpp"
 
 #include "slave/containerizer/mesos/containerizer.hpp"
 
@@ -439,6 +442,8 @@ struct DefaultFrameworkInfo
     framework.set_user(os::user().get());
     framework.set_principal(
         DefaultCredential<TCredential>::create().principal());
+    framework.add_capabilities()->set_type(
+        TFrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
     return framework;
   }
@@ -548,15 +553,36 @@ inline TImage createDockerImage(const std::string& imageName)
 
 
 template <typename TVolume>
-inline TVolume createVolumeFromHostPath(
+inline TVolume createVolumeSandboxPath(
+    const std::string& containerPath,
+    const std::string& sandboxPath,
+    const typename TVolume::Mode& mode)
+{
+  TVolume volume;
+  volume.set_container_path(containerPath);
+  volume.set_mode(mode);
+
+  // TODO(jieyu): Use TVolume::Source::SANDBOX_PATH.
+  volume.set_host_path(sandboxPath);
+
+  return volume;
+}
+
+
+template <typename TVolume>
+inline TVolume createVolumeHostPath(
     const std::string& containerPath,
     const std::string& hostPath,
     const typename TVolume::Mode& mode)
 {
   TVolume volume;
   volume.set_container_path(containerPath);
-  volume.set_host_path(hostPath);
   volume.set_mode(mode);
+
+  typename TVolume::Source* source = volume.mutable_source();
+  source->set_type(TVolume::Source::HOST_PATH);
+  source->mutable_host_path()->set_path(hostPath);
+
   return volume;
 }
 
@@ -572,6 +598,16 @@ inline TVolume createVolumeFromDockerImage(
   volume.set_mode(mode);
   volume.mutable_image()->CopyFrom(createDockerImage<TImage>(imageName));
   return volume;
+}
+
+
+template <typename TNetworkInfo>
+inline TNetworkInfo createNetworkInfo(
+    const std::string& networkName)
+{
+  TNetworkInfo info;
+  info.set_name(networkName);
+  return info;
 }
 
 
@@ -720,12 +756,27 @@ inline TTaskGroupInfo createTaskGroupInfo(const std::vector<TTaskInfo>& tasks)
 }
 
 
+template <typename TResource>
+inline typename TResource::ReservationInfo createStaticReservationInfo(
+    const std::string& role)
+{
+  typename TResource::ReservationInfo info;
+  info.set_type(TResource::ReservationInfo::STATIC);
+  info.set_role(role);
+  return info;
+}
+
+
 template <typename TResource, typename TLabels>
-inline typename TResource::ReservationInfo createReservationInfo(
+inline typename TResource::ReservationInfo createDynamicReservationInfo(
+    const std::string& role,
     const Option<std::string>& principal = None(),
     const Option<TLabels>& labels = None())
 {
   typename TResource::ReservationInfo info;
+
+  info.set_type(TResource::ReservationInfo::DYNAMIC);
+  info.set_role(role);
 
   if (principal.isSome()) {
     info.set_principal(principal.get());
@@ -739,18 +790,23 @@ inline typename TResource::ReservationInfo createReservationInfo(
 }
 
 
-template <typename TResource, typename TResources>
+template <
+    typename TResource,
+    typename TResources,
+    typename... TReservationInfos>
 inline TResource createReservedResource(
     const std::string& name,
     const std::string& value,
-    const std::string& role,
-    const Option<typename TResource::ReservationInfo>& reservation)
+    const TReservationInfos&... reservations)
 {
-  TResource resource = TResources::parse(name, value, role).get();
+  std::initializer_list<typename TResource::ReservationInfo> reservations_ = {
+    reservations...
+  };
 
-  if (reservation.isSome()) {
-    resource.mutable_reservation()->CopyFrom(reservation.get());
-  }
+  TResource resource = TResources::parse(name, value, "*").get();
+  resource.mutable_reservations()->CopyFrom(
+      google::protobuf::RepeatedPtrField<typename TResource::ReservationInfo>{
+        reservations_.begin(), reservations_.end()});
 
   return resource;
 }
@@ -869,10 +925,8 @@ inline TResource createPersistentVolume(
     const Option<std::string>& creatorPrincipal = None(),
     bool isShared = false)
 {
-  TResource volume = TResources::parse(
-      "disk",
-      stringify(size.megabytes()),
-      role).get();
+  TResource volume =
+    TResources::parse("disk", stringify(size.megabytes()), role).get();
 
   volume.mutable_disk()->CopyFrom(
       createDiskInfo<TResource, TVolume>(
@@ -884,7 +938,11 @@ inline TResource createPersistentVolume(
           creatorPrincipal));
 
   if (reservationPrincipal.isSome()) {
-    volume.mutable_reservation()->set_principal(reservationPrincipal.get());
+    typename TResource::ReservationInfo& reservation =
+      *volume.mutable_reservations()->rbegin();
+
+    reservation.set_type(TResource::ReservationInfo::DYNAMIC);
+    reservation.set_principal(reservationPrincipal.get());
   }
 
   if (isShared) {
@@ -921,7 +979,11 @@ inline TResource createPersistentVolume(
           creatorPrincipal));
 
   if (reservationPrincipal.isSome()) {
-    volume.mutable_reservation()->set_principal(reservationPrincipal.get());
+    typename TResource::ReservationInfo& reservation =
+      *volume.mutable_reservations()->rbegin();
+
+    reservation.set_type(TResource::ReservationInfo::DYNAMIC);
+    reservation.set_principal(reservationPrincipal.get());
   }
 
   if (isShared) {
@@ -977,6 +1039,21 @@ inline hashmap<std::string, double> convertToHashmap(
   }
 
   return weights;
+}
+
+
+// Helper to create DomainInfo.
+template <typename TDomainInfo>
+inline TDomainInfo createDomainInfo(
+    const std::string& regionName,
+    const std::string& zoneName)
+{
+  TDomainInfo domain;
+
+  domain.mutable_fault_domain()->mutable_region()->set_name(regionName);
+  domain.mutable_fault_domain()->mutable_zone()->set_name(zoneName);
+
+  return domain;
 }
 
 
@@ -1152,9 +1229,16 @@ inline Image createDockerImage(Args&&... args)
 
 
 template <typename... Args>
-inline Volume createVolumeFromHostPath(Args&&... args)
+inline Volume createVolumeSandboxPath(Args&&... args)
 {
-  return common::createVolumeFromHostPath<Volume>(std::forward<Args>(args)...);
+  return common::createVolumeSandboxPath<Volume>(std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
+inline Volume createVolumeHostPath(Args&&... args)
+{
+  return common::createVolumeHostPath<Volume>(std::forward<Args>(args)...);
 }
 
 
@@ -1163,6 +1247,13 @@ inline Volume createVolumeFromDockerImage(Args&&... args)
 {
   return common::createVolumeFromDockerImage<Volume, Image>(
       std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
+inline NetworkInfo createNetworkInfo(Args&&... args)
+{
+  return common::createNetworkInfo<NetworkInfo>(std::forward<Args>(args)...);
 }
 
 
@@ -1198,11 +1289,20 @@ inline TaskGroupInfo createTaskGroupInfo(const std::vector<TaskInfo>& tasks)
 }
 
 
-template <typename... Args>
-inline Resource::ReservationInfo createReservationInfo(Args&&... args)
+inline Resource::ReservationInfo createStaticReservationInfo(
+    const std::string& role)
 {
-  return common::createReservationInfo<Resource, Labels>(
-      std::forward<Args>(args)...);
+  return common::createStaticReservationInfo<Resource>(role);
+}
+
+
+inline Resource::ReservationInfo createDynamicReservationInfo(
+    const std::string& role,
+    const Option<std::string>& principal = None(),
+    const Option<Labels>& labels = None())
+{
+  return common::createDynamicReservationInfo<Resource, Labels>(
+      role, principal, labels);
 }
 
 
@@ -1271,6 +1371,13 @@ template <typename... Args>
 inline hashmap<std::string, double> convertToHashmap(Args&&... args)
 {
   return common::convertToHashmap<WeightInfo>(std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
+inline DomainInfo createDomainInfo(Args&&... args)
+{
+  return common::createDomainInfo<DomainInfo>(std::forward<Args>(args)...);
 }
 
 
@@ -1355,9 +1462,17 @@ inline mesos::v1::Image createDockerImage(Args&&... args)
 
 
 template <typename... Args>
-inline mesos::v1::Volume createVolumeFromHostPath(Args&&... args)
+inline mesos::v1::Volume createVolumeSandboxPath(Args&&... args)
 {
-  return common::createVolumeFromHostPath<mesos::v1::Volume>(
+  return common::createVolumeSandboxPath<mesos::v1::Volume>(
+      std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
+inline mesos::v1::Volume createVolumeHostPath(Args&&... args)
+{
+  return common::createVolumeHostPath<mesos::v1::Volume>(
       std::forward<Args>(args)...);
 }
 
@@ -1367,6 +1482,14 @@ inline mesos::v1::Volume createVolumeFromDockerImage(Args&&... args)
 {
   return common::createVolumeFromDockerImage<
       mesos::v1::Volume, mesos::v1::Image>(std::forward<Args>(args)...);
+}
+
+
+template <typename... Args>
+inline mesos::v1::NetworkInfo createNetworkInfo(Args&&... args)
+{
+  return common::createNetworkInfo<mesos::v1::NetworkInfo>(
+      std::forward<Args>(args)...);
 }
 
 
@@ -1405,12 +1528,20 @@ inline mesos::v1::TaskGroupInfo createTaskGroupInfo(
 }
 
 
-template <typename... Args>
-inline mesos::v1::Resource::ReservationInfo createReservationInfo(
-    Args&&... args)
+inline mesos::v1::Resource::ReservationInfo createStaticReservationInfo(
+    const std::string& role)
 {
-  return common::createReservationInfo<mesos::v1::Resource, mesos::v1::Labels>(
-      std::forward<Args>(args)...);
+  return common::createStaticReservationInfo<mesos::v1::Resource>(role);
+}
+
+
+inline mesos::v1::Resource::ReservationInfo createDynamicReservationInfo(
+    const std::string& role,
+    const Option<std::string>& principal = None(),
+    const Option<mesos::v1::Labels>& labels = None())
+{
+  return common::createDynamicReservationInfo<
+             mesos::v1::Resource, mesos::v1::Labels>(role, principal, labels);
 }
 
 
@@ -1651,7 +1782,7 @@ ACTION_P5(LaunchTasks, executor, tasks, cpus, mem, role)
     std::vector<TaskInfo> tasks;
     Resources remaining = offer.resources();
 
-    while (remaining.flatten().contains(taskResources) &&
+    while (remaining.toUnreserved().contains(taskResources) &&
            launched < numTasks) {
       TaskInfo task;
       task.set_name("TestTask");
@@ -1659,8 +1790,10 @@ ACTION_P5(LaunchTasks, executor, tasks, cpus, mem, role)
       task.mutable_slave_id()->MergeFrom(offer.slave_id());
       task.mutable_executor()->MergeFrom(executor);
 
-      Option<Resources> resources =
-        remaining.find(taskResources.flatten(role).get());
+      Option<Resources> resources = remaining.find(
+          role == std::string("*")
+            ? taskResources
+            : taskResources.pushReservation(createStaticReservationInfo(role)));
 
       CHECK_SOME(resources);
 
@@ -2155,45 +2288,82 @@ using MockHTTPExecutor = tests::executor::MockHTTPExecutor<
 } // namespace v1 {
 
 
-// Definition of a mock FetcherProcess to be used in tests with gmock.
-class MockFetcherProcess : public slave::FetcherProcess
+namespace resource_provider {
+
+template <typename Event, typename Driver>
+class MockResourceProvider
 {
 public:
-  MockFetcherProcess(const slave::Flags& flags);
-  virtual ~MockFetcherProcess();
+  MOCK_METHOD0_T(connected, void());
+  MOCK_METHOD0_T(disconnected, void());
+  MOCK_METHOD1_T(subscribed, void(const typename Event::Subscribed&));
+  MOCK_METHOD1_T(operation, void(const typename Event::Operation&));
 
-  MOCK_METHOD5(_fetch, process::Future<Nothing>(
-      const hashmap<
-          CommandInfo::URI,
-          Option<process::Future<std::shared_ptr<Cache::Entry>>>>&
-        entries,
-      const ContainerID& containerId,
-      const std::string& sandboxDirectory,
-      const std::string& cacheDirectory,
-      const Option<std::string>& user));
+  void events(std::queue<Event> events)
+  {
+    while (!events.empty()) {
+      Event event = events.front();
+      events.pop();
 
-  process::Future<Nothing> unmocked__fetch(
-      const hashmap<
-          CommandInfo::URI,
-          Option<process::Future<std::shared_ptr<Cache::Entry>>>>&
-        entries,
-      const ContainerID& containerId,
-      const std::string& sandboxDirectory,
-      const std::string& cacheDirectory,
-      const Option<std::string>& user);
+      switch (event.type()) {
+        case Event::SUBSCRIBED:
+          subscribed(event.subscribed());
+          break;
+        case Event::OPERATION:
+          operation(event.operation());
+          break;
+        case Event::UNKNOWN:
+          LOG(FATAL) << "Received unexpected UNKNOWN event";
+          break;
+      }
+    }
+  }
 
-  MOCK_METHOD4(run, process::Future<Nothing>(
-      const ContainerID& containerId,
-      const std::string& sandboxDirectory,
-      const Option<std::string>& user,
-      const mesos::fetcher::FetcherInfo& info));
+  template <typename Call>
+  process::Future<Nothing> send(const Call& call)
+  {
+    return driver->send(call);
+  }
 
-  process::Future<Nothing> unmocked_run(
-      const ContainerID& containerId,
-      const std::string& sandboxDirectory,
-      const Option<std::string>& user,
-      const mesos::fetcher::FetcherInfo& info);
+  template <typename Credential>
+  void start(
+      process::Owned<mesos::internal::EndpointDetector> detector,
+      ContentType contentType,
+      const Credential& credential)
+  {
+    driver.reset(new Driver(
+            std::move(detector),
+            contentType,
+            lambda::bind(&MockResourceProvider<Event, Driver>::connected, this),
+            lambda::bind(
+                &MockResourceProvider<Event, Driver>::disconnected, this),
+            lambda::bind(
+                &MockResourceProvider<Event, Driver>::events, this, lambda::_1),
+            credential));
+  }
+
+private:
+  std::unique_ptr<Driver> driver;
 };
+
+} // namespace resource_provider {
+
+
+namespace v1 {
+namespace resource_provider {
+
+// Alias existing `mesos::v1::resource_provider` classes so that we can easily
+// write `v1::resource_provider::` in tests.
+using Call = mesos::v1::resource_provider::Call;
+using Event = mesos::v1::resource_provider::Event;
+
+} // namespace resource_provider {
+
+using MockResourceProvider = tests::resource_provider::MockResourceProvider<
+    mesos::v1::resource_provider::Event,
+    mesos::v1::resource_provider::Driver>;
+
+} // namespace v1 {
 
 
 // Definition of a MockAuthorizer that can be used in tests with gmock.
@@ -2526,6 +2696,51 @@ void ExpectNoFutureUnionHttpProtobufs(
 // We use this matcher to only satisfy the StatusUpdate future if the
 // StatusUpdate came from the corresponding task.
 MATCHER_P(TaskStatusEq, task, "") { return arg.task_id() == task.task_id(); }
+
+
+struct ParamExecutorType
+{
+public:
+  struct Printer
+  {
+    std::string operator()(
+        const ::testing::TestParamInfo<ParamExecutorType>& info) const
+    {
+      switch (info.param.type) {
+        case COMMAND:
+          return "CommandExecutor";
+        case DEFAULT:
+          return "DefaultExecutor";
+        default:
+          UNREACHABLE();
+      }
+    }
+  };
+
+  static ParamExecutorType commandExecutor()
+  {
+    return ParamExecutorType(COMMAND);
+  }
+
+  static ParamExecutorType defaultExecutor()
+  {
+    return ParamExecutorType(DEFAULT);
+  }
+
+  bool isCommandExecutor() const { return type == COMMAND; }
+  bool isDefaultExecutor() const { return type == DEFAULT; }
+
+private:
+  enum Type
+  {
+    COMMAND,
+    DEFAULT
+  };
+
+  ParamExecutorType(Type _type) : type(_type) {}
+
+  Type type;
+};
 
 } // namespace tests {
 } // namespace internal {

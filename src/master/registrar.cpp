@@ -83,6 +83,8 @@ using process::http::Request;
 class RegistrarProcess : public Process<RegistrarProcess>
 {
 public:
+  using State = mesos::state::State; // `ProcessBase::State` conflicts here.
+
   RegistrarProcess(
       const Flags& _flags,
       State* _state,
@@ -604,6 +606,7 @@ Future<bool> Registrar::apply(Owned<Operation> operation)
 {
   return dispatch(process, &RegistrarProcess::apply, operation);
 }
+
 
 PID<RegistrarProcess> Registrar::pid() const
 {

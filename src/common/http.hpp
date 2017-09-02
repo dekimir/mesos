@@ -133,6 +133,7 @@ void json(JSON::ArrayWriter* writer, const Labels& labels);
 void json(JSON::ObjectWriter* writer, const Resources& resources);
 void json(JSON::ObjectWriter* writer, const Task& task);
 void json(JSON::ObjectWriter* writer, const TaskStatus& status);
+void json(JSON::ObjectWriter* writer, const DomainInfo& domainInfo);
 
 namespace authorization {
 
@@ -157,6 +158,71 @@ public:
   {
     return true;
   }
+};
+
+
+// Determines which objects will be accepted based on authorization.
+class AuthorizationAcceptor
+{
+public:
+  static process::Future<process::Owned<AuthorizationAcceptor>> create(
+      const Option<process::http::authentication::Principal>& principal,
+      const Option<Authorizer*>& authorizer,
+      const authorization::Action& action);
+
+  template <typename... Args>
+  bool accept(Args&... args)
+  {
+    Try<bool> approved =
+      objectApprover->approved(ObjectApprover::Object(args...));
+    if (approved.isError()) {
+      LOG(WARNING) << "Error during authorization: " << approved.error();
+      return false;
+    }
+
+    return approved.get();
+  }
+
+protected:
+  // TODO(qleng): Currently, `Owned` is implemented with `shared_ptr` and allows
+  // copying. In the future, if `Owned` is implemented with `unique_ptr`, we
+  // will need to pass by rvalue reference here instead (see MESOS-5122).
+  AuthorizationAcceptor(const process::Owned<ObjectApprover>& approver)
+    : objectApprover(approver) {}
+
+  const process::Owned<ObjectApprover> objectApprover;
+};
+
+
+/**
+ * Used to filter results for API handlers. Provides the 'accept()' method to
+ * test whether the supplied ID is equal to a stored target ID. If no target
+ * ID is provided when the acceptor is constructed, it will accept all inputs.
+ */
+template <typename T>
+class IDAcceptor
+{
+public:
+  IDAcceptor(const Option<std::string>& id = None())
+  {
+    if (id.isSome()) {
+      T targetId_;
+      targetId_.set_value(id.get());
+      targetId = targetId_;
+    }
+  }
+
+  bool accept(const T& candidateId) const
+  {
+    if (targetId.isNone()) {
+      return true;
+    }
+
+    return candidateId.value() == targetId->value();
+  }
+
+protected:
+  Option<T> targetId;
 };
 
 
@@ -203,6 +269,14 @@ process::Future<bool> authorizeEndpoint(
 bool approveViewRole(
     const process::Owned<ObjectApprover>& rolesApprover,
     const std::string& role);
+
+// Authorizes resources in either the pre- or the post-reservation-refinement
+// formats.
+// TODO(arojas): Update this helper to only accept the
+// post-reservation-refinement format once MESOS-7851 is resolved.
+bool authorizeResource(
+    const Resource& resource,
+    const Option<process::Owned<AuthorizationAcceptor>>& acceptor);
 
 
 /**

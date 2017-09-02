@@ -42,6 +42,8 @@
 #include <stout/os/rm.hpp>
 #include <stout/os/write.hpp>
 
+#include "common/resources_utils.hpp"
+
 #include "messages/messages.hpp"
 
 namespace mesos {
@@ -96,15 +98,6 @@ Try<Nothing> checkpoint(
     const google::protobuf::RepeatedPtrField<T>& messages)
 {
   return ::protobuf::write(path, messages);
-}
-
-
-inline Try<Nothing> checkpoint(
-    const std::string& path,
-    const Resources& resources)
-{
-  const google::protobuf::RepeatedPtrField<Resource>& messages = resources;
-  return checkpoint(path, messages);
 }
 
 }  // namespace internal {
@@ -307,6 +300,7 @@ struct State
 
   Option<ResourcesState> resources;
   Option<SlaveState> slave;
+  bool rebooted = false;
 
   // TODO(jieyu): Consider using a vector of Option<Error> here so
   // that we can print all the errors. This also applies to all the

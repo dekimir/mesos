@@ -59,6 +59,8 @@ using std::map;
 using std::string;
 using std::vector;
 
+using mesos::internal::ContainerDNSInfo;
+
 
 template <typename T>
 static Future<T> failure(
@@ -317,11 +319,14 @@ Try<Docker::Container> Docker::Container::create(const string& output)
   bool started = startedAtValue.get().value != "0001-01-01T00:00:00Z";
 
   Option<string> ipAddress;
+  Option<string> ip6Address;
   bool findDeprecatedIP = false;
+
   Result<JSON::String> networkMode =
     json.find<JSON::String>("HostConfig.NetworkMode");
+
   if (!networkMode.isSome()) {
-    // We need to fail back to the old field as Docker added NetworkMode
+    // We need to fallback to the old field as Docker added NetworkMode
     // since Docker remote API 1.15.
     VLOG(1) << "Unable to detect HostConfig.NetworkMode, "
             << "attempting deprecated IP field";
@@ -339,13 +344,29 @@ Try<Docker::Container> Docker::Container::create(const string& output)
       json.find<JSON::String>(addressLocation);
 
     if (!ipAddressValue.isSome()) {
-      // We also need to failback to the old field as the IP Address
+      // We also need to fallback to the old field as the IP Address
       // field location also changed since Docker remote API 1.20.
       VLOG(1) << "Unable to detect IP Address at '" << addressLocation << "',"
               << " attempting deprecated field";
       findDeprecatedIP = true;
     } else if (!ipAddressValue->value.empty()) {
       ipAddress = ipAddressValue->value;
+    }
+
+    // Check if the container has an IPv6 address.
+    //
+    // NOTE: For IPv6 we don't need to worry about the old method of
+    // looking at the deprecated "NetworkSettings.IPAddress" since we
+    // want to support IPv6 addresses for docker versions that support
+    // USER mode networking, which is a relatively recent feature.
+    string address6Location = "NetworkSettings.Networks." +
+                              networkMode->value + ".GlobalIPv6Address";
+
+    Result<JSON::String> ip6AddressValue =
+      json.find<JSON::String>(address6Location);
+
+    if (ip6AddressValue.isSome() && !ip6AddressValue->value.empty()) {
+      ip6Address = ip6AddressValue->value;
     }
   }
 
@@ -407,7 +428,80 @@ Try<Docker::Container> Docker::Container::create(const string& output)
     }
   }
 
-  return Container(output, id, name, optionalPid, started, ipAddress, devices);
+  vector<string> dns;
+
+  Result<JSON::Array> dnsArray =
+    json.find<JSON::Array>("HostConfig.Dns");
+
+  if (dnsArray.isError()) {
+    return Error("Failed to parse HostConfig.Dns: " + dnsArray.error());
+  }
+
+  if (dnsArray.isSome()) {
+    foreach (const JSON::Value& entry, dnsArray->values) {
+      if (!entry.is<JSON::String>()) {
+        return Error("Malformed HostConfig.Dns"
+                     " entry '" + stringify(entry) + "'");
+      }
+
+      dns.push_back(entry.as<JSON::String>().value);
+    }
+  }
+
+  vector<string> dnsOptions;
+
+  Result<JSON::Array> dnsOptionArray =
+    json.find<JSON::Array>("HostConfig.DnsOptions");
+
+  if (dnsOptionArray.isError()) {
+    return Error("Failed to parse HostConfig.DnsOptions: " +
+                 dnsOptionArray.error());
+  }
+
+  if (dnsOptionArray.isSome()) {
+    foreach (const JSON::Value& entry, dnsOptionArray->values) {
+      if (!entry.is<JSON::String>()) {
+        return Error("Malformed HostConfig.DnsOptions"
+                     " entry '" + stringify(entry) + "'");
+      }
+
+      dnsOptions.push_back(entry.as<JSON::String>().value);
+    }
+  }
+
+  vector<string> dnsSearch;
+
+  Result<JSON::Array> dnsSearchArray =
+    json.find<JSON::Array>("HostConfig.DnsSearch");
+
+  if (dnsSearchArray.isError()) {
+    return Error("Failed to parse HostConfig.DnsSearch: " +
+                 dnsSearchArray.error());
+  }
+
+  if (dnsSearchArray.isSome()) {
+    foreach (const JSON::Value& entry, dnsSearchArray->values) {
+      if (!entry.is<JSON::String>()) {
+        return Error("Malformed HostConfig.DnsSearch"
+                     " entry '" + stringify(entry) + "'");
+      }
+
+      dnsSearch.push_back(entry.as<JSON::String>().value);
+    }
+  }
+
+  return Container(
+      output,
+      id,
+      name,
+      optionalPid,
+      started,
+      ipAddress,
+      ip6Address,
+      devices,
+      dns,
+      dnsOptions,
+      dnsSearch);
 }
 
 
@@ -505,7 +599,8 @@ Try<Docker::RunOptions> Docker::RunOptions::create(
     const Option<Resources>& resources,
     bool enableCfsQuota,
     const Option<map<string, string>>& env,
-    const Option<vector<Device>>& devices)
+    const Option<vector<Device>>& devices,
+    const Option<ContainerDNSInfo>& defaultContainerDNS)
 {
   if (!containerInfo.has_docker()) {
     return Error("No docker info found in container info");
@@ -727,9 +822,71 @@ Try<Docker::RunOptions> Docker::RunOptions::create(
 
   options.name = name;
 
+  bool dnsSpecified = false;
   foreach (const Parameter& parameter, dockerInfo.parameters()) {
     options.additionalOptions.push_back(
         "--" + parameter.key() + "=" + parameter.value());
+
+    // In Docker 1.13.0, `--dns-option` was added and `--dns-opt` was hidden
+    // (but it can still be used), so here we need to check both of them.
+    if (!dnsSpecified &&
+        (parameter.key() == "dns" ||
+         parameter.key() == "dns-search" ||
+         parameter.key() == "dns-opt" ||
+         parameter.key() == "dns-option")) {
+      dnsSpecified = true;
+    }
+  }
+
+  if (!dnsSpecified && defaultContainerDNS.isSome()) {
+    Option<ContainerDNSInfo::DockerInfo> bridgeDNS;
+    Option<ContainerDNSInfo::DockerInfo> defaultUserDNS;
+    hashmap<string, ContainerDNSInfo::DockerInfo> userDNSMap;
+
+    foreach (const ContainerDNSInfo::DockerInfo& dnsInfo,
+             defaultContainerDNS->docker()) {
+      // Currently we only support setting DNS for containers which join
+      // Docker bridge network or user-defined network.
+      if (dnsInfo.network_mode() == ContainerDNSInfo::DockerInfo::BRIDGE) {
+        bridgeDNS = dnsInfo;
+      } else if (dnsInfo.network_mode() == ContainerDNSInfo::DockerInfo::USER) {
+        if (!dnsInfo.has_network_name()) {
+          // The DNS info which has network node set as `USER` and has no
+          // network name set is considered as the default DNS for all
+          // user-defined networks. It applies to the Docker container which
+          // joins a user-defined network but that network can not be found in
+          // `defaultContainerDNS`.
+          defaultUserDNS = dnsInfo;
+        } else {
+          userDNSMap[dnsInfo.network_name()] = dnsInfo;
+        }
+      }
+    }
+
+    auto setDNSInfo = [&](const ContainerDNSInfo::DockerInfo& dnsInfo) {
+      options.dns.assign(
+          dnsInfo.dns().nameservers().begin(),
+          dnsInfo.dns().nameservers().end());
+
+      options.dnsSearch.assign(
+          dnsInfo.dns().search().begin(),
+          dnsInfo.dns().search().end());
+
+      options.dnsOpt.assign(
+          dnsInfo.dns().options().begin(),
+          dnsInfo.dns().options().end());
+    };
+
+    if (dockerInfo.network() == ContainerInfo::DockerInfo::BRIDGE &&
+        bridgeDNS.isSome()) {
+      setDNSInfo(bridgeDNS.get());
+    } else if (dockerInfo.network() == ContainerInfo::DockerInfo::USER) {
+      if (userDNSMap.contains(options.network.get())) {
+        setDNSInfo(userDNSMap.at(options.network.get()));
+      } else if (defaultUserDNS.isSome()) {
+        setDNSInfo(defaultUserDNS.get());
+      }
+    }
   }
 
   options.image = dockerInfo.image();
@@ -827,14 +984,48 @@ Future<Option<int>> Docker::run(
     if (network != "host" &&
         network != "bridge" &&
         network != "none") {
-      // User defined networks require docker version >= 1.9.0.
+      // User defined networks require Docker version >= 1.9.0.
       Try<Nothing> validateVer = validateVersion(Version(1, 9, 0));
-
       if (validateVer.isError()) {
         return Failure("User defined networks require Docker "
                        "version 1.9.0 or higher");
       }
     }
+
+    if (network == "host" && !options.dns.empty()) {
+      // `--dns` option with host network requires Docker version >= 1.12.0,
+      // see https://github.com/moby/moby/pull/22408 for details.
+      Try<Nothing> validateVer = validateVersion(Version(1, 12, 0));
+      if (validateVer.isError()) {
+        return Failure("--dns option with host network requires Docker "
+                       "version 1.12.0 or higher");
+      }
+    }
+  }
+
+  foreach (const string& dns, options.dns) {
+    argv.push_back("--dns");
+    argv.push_back(dns);
+  }
+
+  foreach (const string& search, options.dnsSearch) {
+    argv.push_back("--dns-search");
+    argv.push_back(search);
+  }
+
+  if (!options.dnsOpt.empty()) {
+    // `--dns-opt` option requires Docker version >= 1.9.0,
+    // see https://github.com/moby/moby/pull/16031 for details.
+    Try<Nothing> validateVer = validateVersion(Version(1, 9, 0));
+    if (validateVer.isError()) {
+      return Failure("--dns-opt option requires Docker "
+                     "version 1.9.0 or higher");
+    }
+  }
+
+  foreach (const string& opt, options.dnsOpt) {
+    argv.push_back("--dns-opt");
+    argv.push_back(opt);
   }
 
   if (options.hostname.isSome()) {
@@ -933,7 +1124,10 @@ Future<Option<int>> Docker::run(
   return s->status();
 }
 
-
+// NOTE: A known issue in Docker 1.12/1.13 sometimes leaks its mount
+// namespace, causing `docker rm` to fail. As a workaround, we do a
+// best-effort `docker rm` and log the error insteaf of return a
+// failure when `remove` is set to true (MESOS-7777).
 Future<Nothing> Docker::stop(
     const string& containerName,
     const Duration& timeout,
@@ -970,6 +1164,7 @@ Future<Nothing> Docker::stop(
         remove));
 }
 
+
 Future<Nothing> Docker::_stop(
     const Docker& docker,
     const string& containerName,
@@ -981,7 +1176,12 @@ Future<Nothing> Docker::_stop(
 
   if (remove) {
     bool force = !status.isSome() || status.get() != 0;
-    return docker.rm(containerName, force);
+    return docker.rm(containerName, force)
+      .repair([=](const Future<Nothing>& future) {
+        LOG(ERROR) << "Unable to remove Docker container '"
+                   << containerName + "': " << future.failure();
+        return Nothing();
+      });
   }
 
   return checkError(cmd, s);
@@ -1043,7 +1243,7 @@ Future<Docker::Container> Docker::inspect(
 {
   Owned<Promise<Docker::Container>> promise(new Promise<Docker::Container>());
 
-  const string cmd =  path + " -H " + socket + " inspect " + containerName;
+  const string cmd = path + " -H " + socket + " inspect " + containerName;
   _inspect(cmd, promise, retryInterval);
 
   return promise->future();
@@ -1252,6 +1452,7 @@ Future<list<Docker::Container>> Docker::__ps(
 
   return promise->future();
 }
+
 
 // TODO(chenlily): Generalize functionality into a concurrency limiter
 // within libprocess.

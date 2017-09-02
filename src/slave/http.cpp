@@ -61,6 +61,7 @@
 #include "common/build.hpp"
 #include "common/http.hpp"
 #include "common/recordio.hpp"
+#include "common/resources_utils.hpp"
 
 #include "internal/devolve.hpp"
 
@@ -184,7 +185,7 @@ struct ExecutorWriter
     writer->field("source", executor_->info.source());
     writer->field("container", executor_->containerId.value());
     writer->field("directory", executor_->directory);
-    writer->field("resources", executor_->resources);
+    writer->field("resources", executor_->allocatedResources());
 
     // Resources may be empty for command executors.
     if (!executor_->info.resources().empty()) {
@@ -808,6 +809,24 @@ Future<Response> Http::executor(
 }
 
 
+string Http::RESOURCE_PROVIDER_HELP() {
+  return HELP(
+    TLDR(
+        "Endpoint for the local resource provider HTTP API."),
+    DESCRIPTION(
+        "This endpoint is used by the local resource providers to interact",
+        "with the agent via Call/Event messages.",
+        "",
+        "Returns 200 OK iff the initial SUBSCRIBE Call is successful. This",
+        "will result in a streaming response via chunked transfer encoding.",
+        "The local resource providers can process the response incrementally.",
+        "",
+        "Returns 202 Accepted for all other Call messages iff the request is",
+        "accepted."),
+    AUTHENTICATION(true));
+}
+
+
 string Http::FLAGS_HELP()
 {
   return HELP(
@@ -1283,6 +1302,10 @@ Future<Response> Http::state(
         writer->field("hostname", slave->info.hostname());
         writer->field("capabilities", AGENT_CAPABILITIES());
 
+        if (slave->info.has_domain()) {
+          writer->field("domain", slave->info.domain());
+        }
+
         const Resources& totalResources = slave->totalResources;
 
         writer->field("resources", totalResources);
@@ -1296,7 +1319,8 @@ Future<Response> Http::state(
                            const Resources& resources,
                            totalResources.reservations()) {
                 writer->field(role, [&resources](JSON::ArrayWriter* writer) {
-                  foreach (const Resource& resource, resources) {
+                  foreach (Resource resource, resources) {
+                    convertResourceFormat(&resource, ENDPOINT);
                     writer->element(JSON::Protobuf(resource));
                   }
                 });
@@ -1306,10 +1330,25 @@ Future<Response> Http::state(
         writer->field(
             "unreserved_resources_full",
             [&totalResources](JSON::ArrayWriter* writer) {
-              foreach (const Resource& resource, totalResources.unreserved()) {
+              foreach (Resource resource, totalResources.unreserved()) {
+                convertResourceFormat(&resource, ENDPOINT);
                 writer->element(JSON::Protobuf(resource));
               }
             });
+
+        // TODO(abudnik): Consider storing the allocatedResources in the Slave
+        // struct rather than computing it here each time.
+        Resources allocatedResources;
+
+        foreachvalue (const Framework* framework, slave->frameworks) {
+          allocatedResources += framework->allocatedResources();
+        }
+
+        writer->field(
+            "reserved_resources_allocated", allocatedResources.reservations());
+
+        writer->field(
+            "unreserved_resources_allocated", allocatedResources.unreserved());
 
         writer->field("attributes", Attributes(slave->info.attributes()));
 
@@ -1664,7 +1703,7 @@ mesos::agent::Response::GetTasks Http::_getTasks(
   foreach (const Framework* framework, frameworks) {
     // Pending tasks.
     typedef hashmap<TaskID, TaskInfo> TaskMap;
-    foreachvalue (const TaskMap& taskInfos, framework->pending) {
+    foreachvalue (const TaskMap& taskInfos, framework->pendingTasks) {
       foreachvalue (const TaskInfo& taskInfo, taskInfos) {
         // Skip unauthorized tasks.
         if (!approveViewTaskInfo(tasksApprover, taskInfo, framework->info)) {
@@ -2011,20 +2050,14 @@ Future<Response> Http::getContainers(
 {
   CHECK_EQ(mesos::agent::Call::GET_CONTAINERS, call.type());
 
-  Future<Owned<ObjectApprover>> approver;
+  Future<Owned<AuthorizationAcceptor>> authorizeContainer =
+    AuthorizationAcceptor::create(
+        principal, slave->authorizer, authorization::VIEW_CONTAINER);
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_CONTAINER);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver.then(defer(slave->self(), [this](
-    const Owned<ObjectApprover>& approver) {
-        return __containers(approver);
+  return authorizeContainer.then(defer(slave->self(),
+      [this](const Owned<AuthorizationAcceptor>& authorizeContainer) {
+        // Use an empty container ID filter.
+        return __containers(authorizeContainer, None());
     })).then([acceptType](const Future<JSON::Array>& result)
         -> Future<Response> {
       if (!result.isReady()) {
@@ -2050,22 +2083,23 @@ Future<Response> Http::_containers(
     const Request& request,
     const Option<Principal>& principal) const
 {
-  Future<Owned<ObjectApprover>> approver;
+  Future<Owned<AuthorizationAcceptor>> authorizeContainer =
+    AuthorizationAcceptor::create(
+        principal, slave->authorizer, authorization::VIEW_CONTAINER);
+  Future<IDAcceptor<ContainerID>> selectContainerId =
+      IDAcceptor<ContainerID>(request.url.query.get("container_id"));
 
-  if (slave->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+  return collect(authorizeContainer, selectContainerId)
+    .then(defer(
+        slave->self(),
+        [this](const tuple<Owned<AuthorizationAcceptor>,
+                           IDAcceptor<ContainerID>>& acceptors) {
+          Owned<AuthorizationAcceptor> authorizeContainer;
+          Option<IDAcceptor<ContainerID>> selectContainerId;
+          tie(authorizeContainer, selectContainerId) = acceptors;
 
-    approver = slave->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_CONTAINER);
-  } else {
-    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return approver.then(defer(slave->self(), [this](
-    const Owned<ObjectApprover>& approver) {
-      return __containers(approver);
-     }))
-     .then([request](const Future<JSON::Array>& result) -> Future<Response> {
+          return __containers(authorizeContainer, selectContainerId);
+    })).then([request](const Future<JSON::Array>& result) -> Future<Response> {
        if (!result.isReady()) {
          LOG(WARNING) << "Could not collect container status and statistics: "
                       << (result.isFailed()
@@ -2079,12 +2113,13 @@ Future<Response> Http::_containers(
 
        return process::http::OK(
            result.get(), request.url.query.get("jsonp"));
-     });
+    });
 }
 
 
 Future<JSON::Array> Http::__containers(
-    Option<Owned<ObjectApprover>> approver) const
+    Owned<AuthorizationAcceptor> authorizeContainer,
+    Option<IDAcceptor<ContainerID>> selectContainerId) const
 {
   Owned<list<JSON::Object>> metadata(new list<JSON::Object>());
   list<Future<ContainerStatus>> statusFutures;
@@ -2101,34 +2136,22 @@ Future<JSON::Array> Http::__containers(
       const ExecutorInfo& info = executor->info;
       const ContainerID& containerId = executor->containerId;
 
-      Try<bool> authorized = true;
-
-      if (approver.isSome()) {
-        ObjectApprover::Object object;
-        object.executor_info = &info;
-        object.framework_info = &(framework->info);
-
-        authorized = approver.get()->approved(object);
-
-        if (authorized.isError()) {
-          LOG(WARNING) << "Error during ViewContainer authorization: "
-                       << authorized.error();
-          authorized = false;
-        }
+      if ((selectContainerId.isSome() &&
+           !selectContainerId->accept(containerId)) ||
+          !authorizeContainer->accept(info, framework->info)) {
+        continue;
       }
 
-      if (authorized.get()) {
-        JSON::Object entry;
-        entry.values["framework_id"] = info.framework_id().value();
-        entry.values["executor_id"] = info.executor_id().value();
-        entry.values["executor_name"] = info.name();
-        entry.values["source"] = info.source();
-        entry.values["container_id"] = containerId.value();
+      JSON::Object entry;
+      entry.values["framework_id"] = info.framework_id().value();
+      entry.values["executor_id"] = info.executor_id().value();
+      entry.values["executor_name"] = info.name();
+      entry.values["source"] = info.source();
+      entry.values["container_id"] = containerId.value();
 
-        metadata->push_back(entry);
-        statusFutures.push_back(slave->containerizer->status(containerId));
-        statsFutures.push_back(slave->containerizer->usage(containerId));
-      }
+      metadata->push_back(entry);
+      statusFutures.push_back(slave->containerizer->status(containerId));
+      statsFutures.push_back(slave->containerizer->usage(containerId));
     }
   }
 
@@ -2307,13 +2330,12 @@ Future<Response> Http::_launchNestedContainer(
   Framework* framework = slave->getFramework(executor->frameworkId);
   CHECK_NOTNULL(framework);
 
-  ObjectApprover::Object object;
-  object.executor_info = &(executor->info);
-  object.framework_info = &(framework->info);
-  object.command_info = &(commandInfo);
-  object.container_id = &(containerId);
-
-  Try<bool> approved = approver.get()->approved(object);
+  Try<bool> approved = approver.get()->approved(
+      ObjectApprover::Object(
+          executor->info,
+          framework->info,
+          commandInfo,
+          containerId));
 
   if (approved.isError()) {
     return Failure(approved.error());
@@ -2410,12 +2432,11 @@ Future<Response> Http::waitNestedContainer(
       Framework* framework = slave->getFramework(executor->frameworkId);
       CHECK_NOTNULL(framework);
 
-      ObjectApprover::Object object;
-      object.executor_info = &(executor->info);
-      object.framework_info = &(framework->info);
-      object.container_id = &(containerId);
-
-      Try<bool> approved = waitApprover.get()->approved(object);
+      Try<bool> approved = waitApprover.get()->approved(
+          ObjectApprover::Object(
+              executor->info,
+              framework->info,
+              containerId));
 
       if (approved.isError()) {
         return Failure(approved.error());
@@ -2476,6 +2497,12 @@ Future<Response> Http::killNestedContainer(
       const ContainerID& containerId =
         call.kill_nested_container().container_id();
 
+      // SIGKILL is used by default if a signal is not specified.
+      int signal = SIGKILL;
+      if (call.kill_nested_container().has_signal()) {
+        signal = call.kill_nested_container().signal();
+      }
+
       Executor* executor = slave->getExecutor(containerId);
       if (executor == nullptr) {
         return NotFound(
@@ -2485,12 +2512,11 @@ Future<Response> Http::killNestedContainer(
       Framework* framework = slave->getFramework(executor->frameworkId);
       CHECK_NOTNULL(framework);
 
-      ObjectApprover::Object object;
-      object.executor_info = &(executor->info);
-      object.framework_info = &(framework->info);
-      object.container_id = &(containerId);
-
-      Try<bool> approved = killApprover.get()->approved(object);
+      Try<bool> approved = killApprover.get()->approved(
+          ObjectApprover::Object(
+              executor->info,
+              framework->info,
+              containerId));
 
       if (approved.isError()) {
         return Failure(approved.error());
@@ -2498,9 +2524,9 @@ Future<Response> Http::killNestedContainer(
         return Forbidden();
       }
 
-      Future<bool> destroy = slave->containerizer->destroy(containerId);
+      Future<bool> kill = slave->containerizer->kill(containerId, signal);
 
-      return destroy
+      return kill
         .then([containerId](bool found) -> Response {
           if (!found) {
             return NotFound("Container '" + stringify(containerId) + "'"
@@ -2545,12 +2571,11 @@ Future<Response> Http::removeNestedContainer(
       Framework* framework = slave->getFramework(executor->frameworkId);
       CHECK_NOTNULL(framework);
 
-      ObjectApprover::Object object;
-      object.executor_info = &(executor->info);
-      object.framework_info = &(framework->info);
-      object.container_id = &(containerId);
-
-      Try<bool> approved = removeApprover.get()->approved(object);
+      Try<bool> approved = removeApprover.get()->approved(
+          ObjectApprover::Object(
+              executor->info,
+              framework->info,
+              containerId));
 
       if (approved.isError()) {
         return Failure(approved.error());
@@ -2686,11 +2711,8 @@ Future<Response> Http::attachContainerInput(
       Framework* framework = slave->getFramework(executor->frameworkId);
       CHECK_NOTNULL(framework);
 
-      ObjectApprover::Object object;
-      object.executor_info = &(executor->info);
-      object.framework_info = &(framework->info);
-
-      Try<bool> approved = attachInputApprover.get()->approved(object);
+      Try<bool> approved = attachInputApprover.get()->approved(
+          ObjectApprover::Object(executor->info, framework->info));
 
       if (approved.isError()) {
         return Failure(approved.error());
@@ -3001,12 +3023,11 @@ Future<Response> Http::attachContainerOutput(
       Framework* framework = slave->getFramework(executor->frameworkId);
       CHECK_NOTNULL(framework);
 
-      ObjectApprover::Object object;
-      object.executor_info = &(executor->info);
-      object.framework_info = &(framework->info);
-      object.container_id = &(containerId);
-
-      Try<bool> approved = attachOutputApprover.get()->approved(object);
+      Try<bool> approved = attachOutputApprover.get()->approved(
+          ObjectApprover::Object(
+              executor->info,
+              framework->info,
+              containerId));
 
       if (approved.isError()) {
         return Failure(approved.error());

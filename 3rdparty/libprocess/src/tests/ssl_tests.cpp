@@ -528,6 +528,49 @@ TEST_F(SSLTest, ProtocolMismatch)
 }
 
 
+// Ensure that key exchange using ECDHE algorithm works.
+TEST_F(SSLTest, ECDHESupport)
+{
+  // Set up the default server environment variables.
+  map<string, string> server_environment = {
+    {"LIBPROCESS_SSL_ENABLED", "true"},
+    {"LIBPROCESS_SSL_KEY_FILE", key_path().string()},
+    {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()},
+    {"LIBPROCESS_SSL_CIPHERS",
+     "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:"
+     "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA"}
+  };
+
+  // Set up the default client environment variables.
+  map<string, string> client_environment = {
+    {"LIBPROCESS_SSL_ENABLED", "true"},
+    {"LIBPROCESS_SSL_KEY_FILE", key_path().string()},
+    {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()},
+    {"LIBPROCESS_SSL_CIPHERS",
+     "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:"
+     "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA"}
+  };
+
+  // Set up the server.
+  Try<Socket> server = setup_server(server_environment);
+  ASSERT_SOME(server);
+
+  // Launch the client.
+  Try<Subprocess> client =
+      launch_client(client_environment, server.get(), true);
+  ASSERT_SOME(client);
+
+  Future<Socket> socket = server.get().accept();
+  AWAIT_ASSERT_READY(socket);
+
+  // TODO(jmlvanre): Remove const copy.
+  AWAIT_ASSERT_EQ(data, Socket(socket.get()).recv());
+  AWAIT_ASSERT_READY(Socket(socket.get()).send(data));
+
+  AWAIT_ASSERT_READY(await_subprocess(client.get(), 0));
+}
+
+
 // Ensure we can communicate between a POLL based socket and an SSL
 // socket if 'SSL_SUPPORT_DOWNGRADE' is enabled.
 TEST_F(SSLTest, ValidDowngrade)
@@ -845,6 +888,38 @@ TEST_F(SSLTest, SilentSocket)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
   EXPECT_EQ(data, response->body);
+}
+
+
+// This test was added due to an OOM issue: MESOS-7934.
+TEST_F(SSLTest, ShutdownThenSend)
+{
+  Clock::pause();
+
+  Try<Socket> server = setup_server({
+      {"LIBPROCESS_SSL_ENABLED", "true"},
+      {"LIBPROCESS_SSL_KEY_FILE", key_path().string()},
+      {"LIBPROCESS_SSL_CERT_FILE", certificate_path().string()}});
+
+  ASSERT_SOME(server);
+  ASSERT_SOME(server.get().address());
+  ASSERT_SOME(server.get().address().get().hostname());
+
+  Future<Socket> socket = server.get().accept();
+
+  Clock::settle();
+  EXPECT_TRUE(socket.isPending());
+
+  Try<Socket> client = Socket::create(SocketImpl::Kind::SSL);
+  ASSERT_SOME(client);
+  AWAIT_ASSERT_READY(client->connect(server->address().get()));
+
+  AWAIT_ASSERT_READY(socket);
+
+  EXPECT_SOME(Socket(socket.get()).shutdown());
+
+  // This send should fail now that the socket is shut down.
+  AWAIT_FAILED(Socket(socket.get()).send("Hello World"));
 }
 
 #endif // USE_SSL_SOCKET

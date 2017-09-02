@@ -74,6 +74,7 @@ using mesos::v1::Image;
 using mesos::v1::Label;
 using mesos::v1::Labels;
 using mesos::v1::Offer;
+using mesos::v1::Resource;
 using mesos::v1::Resources;
 using mesos::v1::RLimitInfo;
 using mesos::v1::TaskGroupInfo;
@@ -104,7 +105,7 @@ public:
         "task",
         "The value could be a JSON-formatted string of `TaskInfo` or a\n"
         "file path containing the JSON-formatted `TaskInfo`. Path must\n"
-        "be of the form `file:///path/to/file` or `/path/to/file`."
+        "be of the form `file:///path/to/file` or `/path/to/file`.\n"
         "\n"
         "See the `TaskInfo` message in `mesos.proto` for the expected\n"
         "format. NOTE: `agent_id` need not to be set.\n"
@@ -120,16 +121,14 @@ public:
         "      \"type\": \"SCALAR\",\n"
         "      \"scalar\": {\n"
         "        \"value\": 0.1\n"
-        "      },\n"
-        "      \"role\": \"*\"\n"
+        "      }\n"
         "    },\n"
         "    {\n"
         "      \"name\": \"mem\",\n"
         "      \"type\": \"SCALAR\",\n"
         "      \"scalar\": {\n"
         "        \"value\": 32\n"
-        "      },\n"
-        "      \"role\": \"*\"\n"
+        "      }\n"
         "    }\n"
         "  ],\n"
         "  \"command\": {\n"
@@ -141,7 +140,7 @@ public:
         "task_group",
         "The value could be a JSON-formatted string of `TaskGroupInfo` or a\n"
         "file path containing the JSON-formatted `TaskGroupInfo`. Path must\n"
-        "be of the form `file:///path/to/file` or `/path/to/file`."
+        "be of the form `file:///path/to/file` or `/path/to/file`.\n"
         "\n"
         "See the `TaskGroupInfo` message in `mesos.proto` for the expected\n"
         "format. NOTE: `agent_id` need not to be set.\n"
@@ -159,16 +158,14 @@ public:
         "            \"type\": \"SCALAR\",\n"
         "            \"scalar\": {\n"
         "                \"value\": 0.1\n"
-        "             },\n"
-        "            \"role\": \"*\"\n"
+        "             }\n"
         "           },\n"
         "           {\n"
         "            \"name\": \"mem\",\n"
         "            \"type\": \"SCALAR\",\n"
         "            \"scalar\": {\n"
         "                \"value\": 32\n"
-        "             },\n"
-        "            \"role\": \"*\"\n"
+        "             }\n"
         "          }],\n"
         "         \"command\": {\n"
         "            \"value\": \"sleep 1000\"\n"
@@ -244,18 +241,32 @@ public:
     add(&Flags::framework_capabilities,
         "framework_capabilities",
         "Comma-separated list of optional framework capabilities to enable.\n"
-        "TASK_KILLING_STATE is always enabled. PARTITION_AWARE is enabled\n"
-        "unless --no-partition-aware is specified.");
+        "RESERVATION_REFINEMENT and TASK_KILLING_STATE are always enabled.\n"
+        "PARTITION_AWARE is enabled unless --no-partition-aware is specified.");
 
     add(&Flags::containerizer,
         "containerizer",
         "Containerizer to be used (i.e., docker, mesos).",
         "mesos");
 
-    add(&Flags::capabilities,
-        "capabilities",
-        "JSON representation of system capabilities needed to execute \n"
-        "the command.\n"
+    add(&Flags::effective_capabilities,
+        "effective_capabilities",
+        "JSON representation of effective system capabilities that should be\n"
+        "granted to the command.\n"
+        "\n"
+        "Example:\n"
+        "{\n"
+        "   \"capabilities\": [\n"
+        "       \"NET_RAW\",\n"
+        "       \"SYS_ADMIN\"\n"
+        "     ]\n"
+        "}");
+
+    add(&Flags::bounding_capabilities,
+        "bounding_capabilities",
+        "JSON representation of system capabilities bounding set that should\n"
+        "be applied to the command.\n"
+        "\n"
         "Example:\n"
         "{\n"
         "   \"capabilities\": [\n"
@@ -367,7 +378,8 @@ public:
   Option<std::set<string>> framework_capabilities;
   Option<JSON::Array> volumes;
   string containerizer;
-  Option<CapabilityInfo> capabilities;
+  Option<CapabilityInfo> effective_capabilities;
+  Option<CapabilityInfo> bounding_capabilities;
   Option<RLimitInfo> rlimits;
   string role;
   Option<Duration> kill_after;
@@ -492,7 +504,7 @@ protected:
         }
       }
 
-      if (!launched && offered.flatten().contains(requiredResources)) {
+      if (!launched && offered.toUnreserved().contains(requiredResources)) {
         TaskInfo _task;
         TaskGroupInfo _taskGroup;
 
@@ -501,12 +513,18 @@ protected:
           _task.mutable_agent_id()->MergeFrom(offer.agent_id());
 
           // Takes resources first from the specified role, then from '*'.
-          Try<Resources> flattened =
-            Resources(_task.resources()).flatten(frameworkInfo.role());
+          Option<Resources> resources = [&]() {
+            if (frameworkInfo.role() == "*") {
+              return offered.find(Resources(_task.resources()));
+            } else {
+              Resource::ReservationInfo reservation;
+              reservation.set_type(Resource::ReservationInfo::STATIC);
+              reservation.set_role(frameworkInfo.role());
 
-          // `frameworkInfo.role()` must be valid as it's allowed to register.
-          CHECK_SOME(flattened);
-          Option<Resources> resources = offered.find(flattened.get());
+              return offered.find(
+                  Resources(_task.resources()).pushReservation(reservation));
+            }
+          }();
 
           CHECK_SOME(resources);
 
@@ -516,13 +534,18 @@ protected:
             _task.mutable_agent_id()->MergeFrom(offer.agent_id());
 
             // Takes resources first from the specified role, then from '*'.
-            Try<Resources> flattened =
-              Resources(_task.resources()).flatten(frameworkInfo.role());
+            Option<Resources> resources = [&]() {
+              if (frameworkInfo.role() == "*") {
+                return offered.find(Resources(_task.resources()));
+              } else {
+                Resource::ReservationInfo reservation;
+                reservation.set_type(Resource::ReservationInfo::STATIC);
+                reservation.set_role(frameworkInfo.role());
 
-            // `frameworkInfo.role()` must be valid as it's allowed to
-            // register.
-            CHECK_SOME(flattened);
-            Option<Resources> resources = offered.find(flattened.get());
+                return offered.find(
+                    Resources(_task.resources()).pushReservation(reservation));
+              }
+            }();
 
             CHECK_SOME(resources);
 
@@ -755,7 +778,8 @@ static Result<ContainerInfo> getContainerInfo(
     const Option<string>& networks,
     const Option<string>& appcImage,
     const Option<string>& dockerImage,
-    const Option<CapabilityInfo>& capabilities,
+    const Option<CapabilityInfo>& effective_capabilities,
+    const Option<CapabilityInfo>& bounding_capabilities,
     const Option<RLimitInfo>& rlimits)
 {
   if (containerizer.empty()) {
@@ -774,7 +798,8 @@ static Result<ContainerInfo> getContainerInfo(
   if (containerizer == "mesos") {
     if (appcImage.isNone() &&
         dockerImage.isNone() &&
-        capabilities.isNone() &&
+        effective_capabilities.isNone() &&
+        bounding_capabilities.isNone() &&
         rlimits.isNone() &&
         (networks.isNone() || networks->empty()) &&
         (volumes.isNone() || volumes->empty())) {
@@ -820,11 +845,18 @@ static Result<ContainerInfo> getContainerInfo(
       }
     }
 
-    if (capabilities.isSome()) {
+    if (effective_capabilities.isSome()) {
       containerInfo
         .mutable_linux_info()
-        ->mutable_capability_info()
-        ->CopyFrom(capabilities.get());
+        ->mutable_effective_capabilities()
+        ->CopyFrom(effective_capabilities.get());
+    }
+
+    if (bounding_capabilities.isSome()) {
+      containerInfo
+        .mutable_linux_info()
+        ->mutable_bounding_capabilities()
+        ->CopyFrom(bounding_capabilities.get());
     }
 
     if (rlimits.isSome()) {
@@ -1023,9 +1055,12 @@ int main(int argc, char** argv)
     return EXIT_FAILURE;
   }
 
-  // Always enable the TASK_KILLING_STATE capability.
-  vector<FrameworkInfo::Capability::Type> frameworkCapabilities =
-    { FrameworkInfo::Capability::TASK_KILLING_STATE };
+  // Always enable the RESERVATION_REFINEMENT and TASK_KILLING_STATE
+  // capabilities.
+  vector<FrameworkInfo::Capability::Type> frameworkCapabilities = {
+    FrameworkInfo::Capability::RESERVATION_REFINEMENT,
+    FrameworkInfo::Capability::TASK_KILLING_STATE,
+  };
 
   // Enable PARTITION_AWARE unless disabled by the user.
   if (flags.partition_aware) {
@@ -1151,7 +1186,8 @@ int main(int argc, char** argv)
         flags.networks,
         appcImage,
         dockerImage,
-        flags.capabilities,
+        flags.effective_capabilities,
+        flags.bounding_capabilities,
         flags.rlimits);
 
     if (containerInfo.isError()){

@@ -81,6 +81,9 @@ using std::vector;
 namespace mesos {
 namespace internal {
 
+constexpr char MESOS_CONTAINER_IP[] = "MESOS_CONTAINER_IP";
+
+
 class DefaultExecutor : public ProtobufProcess<DefaultExecutor>
 {
 private:
@@ -227,7 +230,11 @@ public:
       }
 
       case Event::KILL: {
-        killTask(event.kill().task_id());
+        Option<KillPolicy> killPolicy = event.kill().has_kill_policy()
+          ? Option<KillPolicy>(event.kill().kill_policy())
+          : None();
+
+        killTask(event.kill().task_id(), killPolicy);
         break;
       }
 
@@ -366,6 +373,26 @@ protected:
     CHECK_EQ(SUBSCRIBED, state);
     CHECK_SOME(executorContainerId);
 
+    // Determine the container IP in order to set `MESOS_CONTAINER_IP`
+    // environment variable for each of the tasks being launched.
+    // Libprocess has already determined the IP address associated
+    // with this container network namespace in `process::initialize`
+    // and hence we can just use the IP assigned to the PID of this
+    // process as the IP address of the container.
+    //
+    // TODO(asridharan): This won't work when the framework sets the
+    // `LIBPROCESS_ADVERTISE_IP` which will end up overriding the IP
+    // address learnt during `process::initialize`, either through
+    // `LIBPROCESS_IP` or through hostname resolution. The correct
+    // approach would be to learn the allocated IP address directly
+    // from the agent and not rely on the resolution logic implemented
+    // in `process::initialize`.
+    Environment::Variable containerIP;
+    containerIP.set_name(MESOS_CONTAINER_IP);
+    containerIP.set_value(stringify(self().address.ip));
+
+    LOG(INFO) << "Setting 'MESOS_CONTAINER_IP' to: " << containerIP.value();
+
     list<ContainerID> containerIds;
     list<Future<Response>> responses;
 
@@ -426,6 +453,13 @@ protected:
         sandboxPath->set_type(Volume::Source::SandboxPath::PARENT);
         sandboxPath->set_path(executorVolume.container_path());
       }
+
+      // Set the `MESOS_CONTAINER_IP` for the task.
+      //
+      // TODO(asridharan): Document this API for consumption by tasks
+      // in the Mesos CNI and default-executor documentation.
+      CommandInfo *command = launch->mutable_command();
+      command->mutable_environment()->add_variables()->CopyFrom(containerIP);
 
       responses.push_back(post(connection.get(), call));
     }
@@ -936,7 +970,9 @@ protected:
     terminate(self());
   }
 
-  Future<Nothing> kill(Owned<Container> container)
+  Future<Nothing> kill(
+      Owned<Container> container,
+      const Option<KillPolicy>& killPolicy = None())
   {
     CHECK_EQ(SUBSCRIBED, state);
 
@@ -963,7 +999,59 @@ protected:
       container->healthChecker = None();
     }
 
-    LOG(INFO) << "Killing child container " << container->containerId;
+    const TaskID& taskId = container->taskInfo.task_id();
+
+    LOG(INFO)
+      << "Killing task " << taskId << " running in child container"
+      << " " << container->containerId << " with SIGTERM signal";
+
+    // Default grace period is set to 3s.
+    Duration gracePeriod = Seconds(3);
+
+    Option<KillPolicy> taskInfoKillPolicy;
+    if (container->taskInfo.has_kill_policy()) {
+      taskInfoKillPolicy = container->taskInfo.kill_policy();
+    }
+
+    // Kill policy provided in the `Kill` event takes precedence
+    // over kill policy specified when the task was launched.
+    if (killPolicy.isSome() && killPolicy->has_grace_period()) {
+      gracePeriod = Nanoseconds(killPolicy->grace_period().nanoseconds());
+    } else if (taskInfoKillPolicy.isSome() &&
+               taskInfoKillPolicy->has_grace_period()) {
+      gracePeriod =
+        Nanoseconds(taskInfoKillPolicy->grace_period().nanoseconds());
+    }
+
+    LOG(INFO) << "Scheduling escalation to SIGKILL in " << gracePeriod
+              << " from now";
+
+    const ContainerID& containerId = container->containerId;
+
+    delay(gracePeriod,
+          self(),
+          &Self::escalated,
+          connectionId.get(),
+          containerId,
+          container->taskInfo.task_id(),
+          gracePeriod);
+
+    // Send a 'TASK_KILLING' update if the framework can handle it.
+    CHECK_SOME(frameworkInfo);
+
+    if (protobuf::frameworkHasCapability(
+            frameworkInfo.get(),
+            FrameworkInfo::Capability::TASK_KILLING_STATE)) {
+      TaskStatus status = createTaskStatus(taskId, TASK_KILLING);
+      forward(status);
+    }
+
+    return kill(containerId, SIGTERM);
+  }
+
+  Future<Nothing> kill(const ContainerID& containerId, int signal)
+  {
+    CHECK_EQ(SUBSCRIBED, state);
 
     agent::Call call;
     call.set_type(agent::Call::KILL_NESTED_CONTAINER);
@@ -971,7 +1059,8 @@ protected:
     agent::Call::KillNestedContainer* kill =
       call.mutable_kill_nested_container();
 
-    kill->mutable_container_id()->CopyFrom(container->containerId);
+    kill->mutable_container_id()->CopyFrom(containerId);
+    kill->set_signal(signal);
 
     return post(None(), call)
       .then([](const Response& /* response */) {
@@ -979,7 +1068,40 @@ protected:
       });
   }
 
-  void killTask(const TaskID& taskId)
+  void escalated(
+      const UUID& _connectionId,
+      const ContainerID& containerId,
+      const TaskID& taskId,
+      const Duration& timeout)
+  {
+    if (connectionId != _connectionId) {
+      VLOG(1) << "Ignoring signal escalation timeout from a stale connection";
+      return;
+    }
+
+    CHECK_EQ(SUBSCRIBED, state);
+
+    // It might be possible that the container is already terminated.
+    // If that happens, don't bother escalating to SIGKILL.
+    if (!containers.contains(taskId)) {
+      LOG(WARNING)
+        << "Ignoring escalation to SIGKILL since the task '" << taskId
+        << "' running in child container " << containerId << " has"
+        << " already terminated";
+      return;
+    }
+
+    LOG(INFO)
+      << "Task '" << taskId << "' running in child container " << containerId
+      << " did not terminate after " << timeout << ", sending SIGKILL"
+      << " to the container";
+
+    kill(containerId, SIGKILL);
+  }
+
+  void killTask(
+      const TaskID& taskId,
+      const Option<KillPolicy>& killPolicy = None())
   {
     if (shuttingDown) {
       LOG(WARNING) << "Ignoring kill for task '" << taskId
@@ -989,7 +1111,10 @@ protected:
 
     CHECK_EQ(SUBSCRIBED, state);
 
-    // TODO(anand): Add support for handling kill policies.
+    // TODO(anand): Add support for adjusting the remaining grace period if
+    // we receive another kill request while a task is being killed but has
+    // not terminated yet. See similar comments in the command executor
+    // for more context.
 
     LOG(INFO) << "Received kill for task '" << taskId << "'";
 
@@ -1006,7 +1131,7 @@ protected:
       return;
     }
 
-    kill(container);
+    kill(container, killPolicy);
   }
 
   void taskCheckUpdated(

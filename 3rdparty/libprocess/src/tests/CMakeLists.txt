@@ -21,6 +21,7 @@ set(PROCESS_TESTS_SRC
   main.cpp
   after_tests.cpp
   collect_tests.cpp
+  count_down_latch_tests.cpp
   decoder_tests.cpp
   encoder_tests.cpp
   future_tests.cpp
@@ -48,7 +49,7 @@ if (NOT WIN32)
     io_tests.cpp
     reap_tests.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 if (ENABLE_SSL)
   set(PROCESS_TESTS_SRC
@@ -56,7 +57,7 @@ if (ENABLE_SSL)
     jwt_tests.cpp
     ssl_tests.cpp
     )
-endif (ENABLE_SSL)
+endif ()
 
 
 # ADDITIONAL CPP FLAGS FOR PROCESS TEST BINARY (e.g., -DBUILD_DIR=...).
@@ -104,7 +105,7 @@ if (ENABLE_SSL)
   add_executable(ssl-client EXCLUDE_FROM_ALL ssl_client.cpp)
   target_link_libraries(ssl-client ${PROCESS_TEST_LIBS})
   add_dependencies(${PROCESS_TESTS_TARGET} ssl-client)
-endif (ENABLE_SSL)
+endif ()
 
 # ADD TEST TARGET (runs when you do, e.g., `make check`).
 #########################################################

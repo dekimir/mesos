@@ -67,6 +67,7 @@
 
 namespace http = process::http;
 namespace inject = process::inject;
+namespace inet4 = process::network::inet4;
 
 using process::async;
 using process::Clock;
@@ -109,7 +110,7 @@ using testing::ReturnArg;
 
 TEST(ProcessTest, Event)
 {
-  Owned<Event> event(new TerminateEvent(UPID()));
+  Owned<Event> event(new TerminateEvent(UPID(), false));
   EXPECT_FALSE(event->is<MessageEvent>());
   EXPECT_FALSE(event->is<ExitedEvent>());
   EXPECT_TRUE(event->is<TerminateEvent>());
@@ -740,7 +741,7 @@ protected:
     AWAIT_ASSERT_READY(event);
 
     // Save the PID of the linkee.
-    pid = event->message->from;
+    pid = event->message.from;
 
     terminate(coordinator);
     wait(coordinator);
@@ -1271,7 +1272,7 @@ TEST(ProcessTest, THREADSAFE_Remote)
   message.from = UPID("sender", sender.get());
   message.to = process.self();
 
-  const string data = MessageEncoder::encode(&message);
+  const string data = MessageEncoder::encode(message);
 
   AWAIT_READY(socket.send(data));
 
@@ -1314,11 +1315,9 @@ TEST(ProcessTest, THREADSAFE_Http1)
   request.method = "POST";
   request.url = url;
   request.headers["User-Agent"] = "libprocess/" + stringify(from);
+  request.keepAlive = true;
   request.body = "hello world";
 
-  // Send the libprocess request. Note that we will not
-  // receive a 202 due to the use of the `User-Agent`
-  // header, therefore we need to explicitly disconnect!
   Future<http::Response> response = connection.send(request);
 
   AWAIT_READY(body);
@@ -1327,7 +1326,7 @@ TEST(ProcessTest, THREADSAFE_Http1)
   AWAIT_READY(pid);
   ASSERT_EQ(from, pid.get());
 
-  EXPECT_TRUE(response.isPending());
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Accepted().status, response);
 
   AWAIT_READY(connection.disconnect());
 
@@ -1351,7 +1350,7 @@ TEST_TEMP_DISABLED_ON_WINDOWS(ProcessTest, THREADSAFE_Http2)
 
   Socket socket = create.get();
 
-  ASSERT_SOME(socket.bind(Address::ANY_ANY()));
+  ASSERT_SOME(socket.bind(inet4::Address::ANY_ANY()));
 
   // Create a UPID for 'Libprocess-From' based on the IP and port we
   // got assigned.
@@ -1712,14 +1711,13 @@ TEST(ProcessTest, PercentEncodedURLs)
   request.method = "POST";
   request.url = url;
   request.headers["User-Agent"] = "libprocess/" + stringify(from);
+  request.keepAlive = true;
 
-  // Send the libprocess request. Note that we will not
-  // receive a 202 due to the use of the `User-Agent`
-  // header, therefore we need to explicitly disconnect!
   Future<http::Response> response = connection.send(request);
 
   AWAIT_READY(handler1);
-  EXPECT_TRUE(response.isPending());
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Accepted().status, response);
 
   AWAIT_READY(connection.disconnect());
 
@@ -1732,9 +1730,7 @@ TEST(ProcessTest, PercentEncodedURLs)
 
   response = http::get(pid, "handler2");
 
-  AWAIT_READY(response);
-  EXPECT_EQ(http::Status::OK, response->code);
-  EXPECT_EQ(http::Status::string(http::Status::OK), response->status);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
 
   terminate(process);
   wait(process);

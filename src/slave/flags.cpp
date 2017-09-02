@@ -94,6 +94,22 @@ mesos::internal::slave::Flags::Flags()
       "  }\n"
       "]");
 
+  add(&Flags::resource_provider_config_dir,
+      "resource_provider_config_dir",
+      "Path to a directory that contains local resource provider configs.\n"
+      "Each file in the config dir should contain a JSON object representing\n"
+      "a `ResourceProviderInfo` object. Each local resource provider provides\n"
+      "resources that are local to the agent. It is also responsible for\n"
+      "handling operations on the resources it provides. Please note that\n"
+      "`resources` field might not need to be specified if the resource\n"
+      "provider determines the resources automatically.\n"
+      "\n"
+      "Example config file in this directory:\n"
+      "{\n"
+      "  \"type\": \"org.mesos.apache.rp.local.storage\",\n"
+      "  \"name\": \"lvm\"\n"
+      "}");
+
   add(&Flags::isolation,
       "isolation",
       "Isolation mechanisms to use, e.g., `posix/cpu,posix/mem` (or \n"
@@ -587,25 +603,20 @@ mesos::internal::slave::Flags::Flags()
       "The path to the systemd system run time directory\n",
       "/run/systemd/system");
 
-  add(&Flags::allowed_capabilities,
-      "allowed_capabilities",
-      "JSON representation of system capabilities that the operator\n"
-      "allows tasks run in containers launched by the containerizer\n"
-      "(currently only supported by the Mesos Containerizer). This set\n"
-      "overrides the default capabilities for the user and the\n"
-      "capabilities requested by the framework.\n"
-      "\n"
-      "The net capability for a task running in the container will be:\n"
-      "   ((F & A) & U)\n"
-      "   where F = capabilities requested by the framework.\n"
-      "         A = allowed capabilities specified by this flag.\n"
-      "         U = permitted capabilities for the agent process.\n"
+  add(&Flags::effective_capabilities,
+      "effective_capabilities",
+      flags::DeprecatedName("allowed_capabilities"),
+      "JSON representation of the Linux capabilities that the agent will\n"
+      "grant to a task that will be run in containers launched by the\n"
+      "containerizer (currently only supported by the Mesos Containerizer).\n"
+      "This set overrides the default capabilities for the user but not\n"
+      "the capabilities requested by the framework.\n"
       "\n"
       "To set capabilities the agent should have the `SETPCAP` capability.\n"
       "\n"
-      "This flag is effective iff `capabilities` isolation is enabled.\n"
-      "When `capabilities` isolation is enabled, the absence of this flag\n"
-      "implies that the operator intends to allow ALL capabilities.\n"
+      "This flag is effective iff `linux/capabilities` isolation is enabled.\n"
+      "When `linux/capabilities` isolation is enabled, the absence of this\n"
+      "flag implies that the operator intends to allow ALL capabilities.\n"
       "\n"
       "Example:\n"
       "{\n"
@@ -614,6 +625,30 @@ mesos::internal::slave::Flags::Flags()
       "       \"SYS_ADMIN\"\n"
       "     ]\n"
       "}");
+
+  add(&Flags::bounding_capabilities,
+      "bounding_capabilities",
+      "JSON representation of the Linux capabilities that the operator\n"
+      "will allow as the maximum level of privilege that a task launched\n"
+      "by the containerizer may acquire (currently only supported by the\n"
+      "Mesos Containerizer).\n"
+      "\n"
+      "This flag is effective iff `linux/capabilities` isolation is enabled.\n"
+      "When `linux/capabilities` isolation is enabled, the absence of this\n"
+      "flag implies that the operator allows ALL capabilities.\n"
+      "\n"
+      "This flag has the same syntax as `--effective_capabilities`."
+     );
+
+  add(&Flags::disallow_sharing_agent_pid_namespace,
+      "disallow_sharing_agent_pid_namespace",
+      "If set to `true`, each top-level container will have its own pid\n"
+      "namespace, and if the framework requests to share the agent pid\n"
+      "namespace for the top level container, the container launch will be\n"
+      "rejected. If set to `false`, the top-level containers will share the\n"
+      "pid namespace with agent if the framework requests it. This flag will\n"
+      "be ignored if the `namespaces/pid` isolator is not enabled.\n",
+      false);
 #endif
 
   add(&Flags::firewall_rules,
@@ -744,6 +779,134 @@ mesos::internal::slave::Flags::Flags()
       "C:\\mesos\\sandbox"
 #endif // __WINDOWS__
       );
+
+  add(&Flags::default_container_dns,
+      "default_container_dns",
+      "JSON-formatted DNS information for CNI networks (Mesos containerizer)\n"
+      "and CNM networks (Docker containerizer). For CNI networks, this flag\n"
+      "can be used to configure `nameservers`, `domain`, `search` and\n"
+      "`options`, and its priority is lower than the DNS information returned\n"
+      "by a CNI plugin, but higher than the DNS information in agent host's\n"
+      "/etc/resolv.conf. For CNM networks, this flag can be used to configure\n"
+      "`nameservers`, `search` and `options`, it will only be used if there\n"
+      "is no DNS information provided in the ContainerInfo.docker.parameters\n"
+      "message.\n"
+      "\n"
+      "See the ContainerDNS message in `flags.proto` for the expected format.\n"
+      "\n"
+      "Example:\n"
+      "{\n"
+      "  \"mesos\": [\n"
+      "    {\n"
+      "      \"network_mode\": \"CNI\",\n"
+      "      \"network_name\": \"net1\",\n"
+      "      \"dns\": {\n"
+      "        \"nameservers\": [ \"8.8.8.8\", \"8.8.4.4\" ]\n"
+      "      }\n"
+      "    }\n"
+      "  ],\n"
+      "  \"docker\": [\n"
+      "    {\n"
+      "      \"network_mode\": \"BRIDGE\",\n"
+      "      \"dns\": {\n"
+      "        \"nameservers\": [ \"8.8.8.8\", \"8.8.4.4\" ]\n"
+      "      }\n"
+      "    },\n"
+      "    {\n"
+      "      \"network_mode\": \"USER\",\n"
+      "      \"network_name\": \"net2\",\n"
+      "      \"dns\": {\n"
+      "        \"nameservers\": [ \"8.8.8.8\", \"8.8.4.4\" ]\n"
+      "      }\n"
+      "    }\n"
+      "  ]\n"
+      "}",
+      [](const Option<ContainerDNSInfo>& defaultContainerDNS) -> Option<Error> {
+        if (defaultContainerDNS.isSome()) {
+          Option<ContainerDNSInfo::MesosInfo> defaultCniDNS;
+          hashmap<string, ContainerDNSInfo::MesosInfo> cniNetworkDNS;
+          Option<ContainerDNSInfo::DockerInfo> dockerBridgeDNS;
+          Option<ContainerDNSInfo::DockerInfo> defaultDockerUserDNS;
+          hashmap<string, ContainerDNSInfo::DockerInfo> dockerUserDNS;
+
+          foreach (const ContainerDNSInfo::MesosInfo& dnsInfo,
+                   defaultContainerDNS->mesos()) {
+            if (dnsInfo.network_mode() ==
+                ContainerDNSInfo::MesosInfo::UNKNOWN) {
+              return Error("UNKNOWN network mode configured "
+                           "in `--default_container_dns`");
+            } else if (dnsInfo.network_mode() ==
+                       ContainerDNSInfo::MesosInfo::HOST) {
+              return Error("Configuring DNS for HOST network with "
+                           "`--default_container_dns` is not yet supported");
+            } else if (dnsInfo.network_mode() ==
+                       ContainerDNSInfo::MesosInfo::CNI) {
+              if (!dnsInfo.has_network_name()) {
+                if (defaultCniDNS.isSome()) {
+                  return Error("Multiple DNS configuration without network "
+                               "name for CNI network in "
+                               "`--default_container_dns` is not allowed");
+                }
+
+                defaultCniDNS = dnsInfo;
+              } else {
+                if (cniNetworkDNS.contains(dnsInfo.network_name())) {
+                  return Error("Multiple DNS configuration with the same "
+                               "network name '" + dnsInfo.network_name() + "' "
+                               "for CNI network in `--default_container_dns` "
+                               "is not allowed");
+                }
+
+                cniNetworkDNS[dnsInfo.network_name()] = dnsInfo;
+              }
+            }
+          }
+
+          foreach (const ContainerDNSInfo::DockerInfo& dnsInfo,
+                   defaultContainerDNS->docker()) {
+            if (dnsInfo.network_mode() ==
+                ContainerDNSInfo::DockerInfo::UNKNOWN) {
+              return Error("UNKNOWN network mode configured "
+                           "in `--default_container_dns`");
+            } else if (dnsInfo.network_mode() ==
+                       ContainerDNSInfo::DockerInfo::HOST) {
+              return Error("Configuring DNS for HOST network with "
+                           "`--default_container_dns` is not yet supported");
+            } else if (dnsInfo.network_mode() ==
+                       ContainerDNSInfo::DockerInfo::BRIDGE) {
+              if (dockerBridgeDNS.isSome()) {
+                return Error("Multiple DNS configuration for Docker default "
+                             "bridge network in `--default_container_dns` is "
+                             "not allowed");
+              }
+
+              dockerBridgeDNS = dnsInfo;
+            } else if (dnsInfo.network_mode() ==
+                       ContainerDNSInfo::DockerInfo::USER) {
+              if (!dnsInfo.has_network_name()) {
+                if (defaultDockerUserDNS.isSome()) {
+                  return Error("Multiple DNS configuration without network "
+                               "name for user-defined CNM network in "
+                               "`--default_container_dns` is not allowed");
+                }
+
+                defaultDockerUserDNS = dnsInfo;
+              } else {
+                if (dockerUserDNS.contains(dnsInfo.network_name())) {
+                  return Error("Multiple DNS configuration with the same "
+                               "network name '" + dnsInfo.network_name() +
+                               "' for user-defined CNM network in "
+                               "`--default_container_dns` is not allowed");
+                }
+
+                dockerUserDNS[dnsInfo.network_name()] = dnsInfo;
+              }
+            }
+          }
+        }
+
+        return None();
+      });
 
   add(&Flags::default_container_info,
       "default_container_info",
@@ -1052,6 +1215,25 @@ mesos::internal::slave::Flags::Flags()
       "IP address to listen on. This cannot be used in conjunction\n"
       "with `--ip_discovery_command`.");
 
+  add(&Flags::ip6,
+      "ip6",
+      "IPv6 address to listen on. This cannot be used in conjunction\n"
+      "with '--ip6_discovery_command'.\n"
+      "\n"
+      "NOTE: Currently Mesos doesn't listen on IPv6 sockets and hence\n"
+      "this IPv6 address is only used to advertise IPv6 addresses for\n"
+      "containers running on the host network.\n",
+      [](const Option<string>& ip6) -> Option<Error> {
+        if (ip6.isSome()) {
+          LOG(WARNING) << "Currently Mesos doesn't listen on IPv6 sockets"
+                       << "and hence the IPv6 address " << ip6.get() << " "
+                       << "will only be used to advertise IPv6 addresses"
+                       << "for containers running on the host network";
+        }
+
+        return None();
+      });
+
   add(&Flags::port, "port", "Port to listen on.", SlaveInfo().port());
 
   add(&Flags::advertise_ip,
@@ -1075,9 +1257,63 @@ mesos::internal::slave::Flags::Flags()
       "  `zk://username:password@host1:port1,host2:port2,.../path`\n"
       "  `file:///path/to/file` (where file contains one of the above)");
 
+  // TODO(xujyan): Pull master constant ZOOKEEPER_SESSION_TIMEOUT into
+  // a common constants header.
+  add(&Flags::zk_session_timeout,
+      "zk_session_timeout",
+      "ZooKeeper session timeout.",
+      Seconds(10));
+
   add(&Flags::ip_discovery_command,
       "ip_discovery_command",
       "Optional IP discovery binary: if set, it is expected to emit\n"
       "the IP address which the slave will try to bind to.\n"
       "Cannot be used in conjunction with `--ip`.");
+
+  add(&Flags::ip6_discovery_command,
+      "ip6_discovery_command",
+      "Optional IPv6 discovery binary: if set, it is expected to emit\n"
+      "the IPv6 address on which Mesos will try to bind when IPv6 socket\n"
+      "support is enabled in Mesos.\n"
+      "\n"
+      "NOTE: Currently Mesos doesn't listen on IPv6 sockets and hence\n"
+      "this IPv6 address is only used to advertise IPv6 addresses for\n"
+      "containers running on the host network.\n");
+
+  add(&Flags::domain,
+      "domain",
+      "Domain that the agent belongs to. Mesos currently only supports\n"
+      "fault domains, which identify groups of hosts with similar failure\n"
+      "characteristics. A fault domain consists of a region and a zone.\n"
+      "If this agent is placed in a different region than the master, it\n"
+      "will not appear in resource offers to frameworks that have not\n"
+      "enabled the REGION_AWARE capability. This value can be specified\n"
+      "as either a JSON-formatted string or a file path containing JSON.\n"
+      "\n"
+      "Example:\n"
+      "{\n"
+      "  \"fault_domain\":\n"
+      "    {\n"
+      "      \"region\":\n"
+      "        {\n"
+      "          \"name\": \"aws-us-east-1\"\n"
+      "        },\n"
+      "      \"zone\":\n"
+      "        {\n"
+      "          \"name\": \"aws-us-east-1a\"\n"
+      "        }\n"
+      "    }\n"
+      "}",
+      [](const Option<DomainInfo>& domain) -> Option<Error> {
+        if (domain.isSome()) {
+          // Don't let the user specify a domain without a fault
+          // domain. This is allowed by the protobuf spec (for forward
+          // compatibility with possible future changes), but is not a
+          // useful configuration right now.
+          if (!domain->has_fault_domain()) {
+            return Error("`domain` must define `fault_domain`");
+          }
+        }
+        return None();
+      });
 }

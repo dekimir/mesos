@@ -60,6 +60,7 @@
 
 #include "slave/constants.hpp"
 #include "slave/gc.hpp"
+#include "slave/gc_process.hpp"
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
 
@@ -72,6 +73,8 @@
 #include "tests/mesos.hpp"
 #include "tests/resources_utils.hpp"
 #include "tests/utils.hpp"
+
+using google::protobuf::RepeatedPtrField;
 
 using mesos::internal::master::Master;
 
@@ -100,6 +103,7 @@ using process::Owned;
 using process::PID;
 using process::Promise;
 
+using process::http::Accepted;
 using process::http::OK;
 using process::http::Response;
 using process::http::Unauthorized;
@@ -115,6 +119,7 @@ using testing::Eq;
 using testing::Not;
 using testing::Return;
 using testing::SaveArg;
+using testing::WithParamInterface;
 
 namespace mesos {
 namespace internal {
@@ -153,7 +158,7 @@ TEST_F(MasterTest, TaskRunning)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   // Ensure the hostname and url are set correctly.
   EXPECT_EQ(
@@ -243,7 +248,7 @@ TEST_F(MasterTest, ShutdownFrameworkWhileTaskRunning)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   TaskInfo task;
@@ -350,7 +355,7 @@ TEST_F(MasterTest, KillTask)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskID taskId;
   taskId.set_value("1");
@@ -423,7 +428,7 @@ TEST_F(MasterTest, KillUnknownTask)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskID taskId;
   taskId.set_value("1");
@@ -511,7 +516,7 @@ TEST_F(MasterTest, KillUnknownTaskSlaveInTransition)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   // Start a task.
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
@@ -542,17 +547,10 @@ TEST_F(MasterTest, KillUnknownTaskSlaveInTransition)
   EXPECT_CALL(sched, disconnected(&driver))
     .WillOnce(FutureSatisfy(&disconnected));
 
-  // Restart master.
-  master = StartMaster(masterFlags);
+  // Restart master with a mock authorizer to block agent state transitioning.
+  MockAuthorizer authorizer;
+  master = StartMaster(&authorizer, masterFlags);
   ASSERT_SOME(master);
-
-  // Intercept the first registrar operation that is attempted; this
-  // should be the registry operation that reregisters the slave.
-  Future<Owned<master::Operation>> reregister;
-  Promise<bool> promise; // Never satisfied.
-  EXPECT_CALL(*master.get()->registrar.get(), apply(_))
-    .WillOnce(DoAll(FutureArg<0>(&reregister),
-                    Return(promise.future())));
 
   frameworkId = Future<FrameworkID>();
   EXPECT_CALL(sched, registered(&driver, _, _))
@@ -565,15 +563,19 @@ TEST_F(MasterTest, KillUnknownTaskSlaveInTransition)
   AWAIT_READY(disconnected);
   AWAIT_READY(frameworkId);
 
+  // Intercept agent authorization.
+  Future<Nothing> authorize;
+  Promise<bool> promise; // Never satisfied.
+  EXPECT_CALL(authorizer, authorized(_))
+    .WillOnce(DoAll(FutureSatisfy(&authorize),
+                    Return(promise.future())));
+
   // Restart slave.
   slave = StartSlave(&detector, &containerizer, slaveFlags);
   ASSERT_SOME(slave);
 
   // Wait for the slave to start reregistration.
-  AWAIT_READY(reregister);
-  EXPECT_NE(
-      nullptr,
-      dynamic_cast<master::MarkSlaveReachable*>(reregister->get()));
+  AWAIT_READY(authorize);
 
   // As Master::killTask isn't doing anything, we shouldn't get a status update.
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -724,7 +726,7 @@ TEST_F(MasterTest, EndpointsForHalfRemovedSlave)
   Try<JSON::Object> parse2 = JSON::parse<JSON::Object>(response2->body);
   Result<JSON::Array> array2 = parse2->find<JSON::Array>("slaves");
   ASSERT_SOME(array2);
-  EXPECT_EQ(0u, array2->values.size());
+  EXPECT_TRUE(array2->values.empty());
 
   Clock::resume();
 }
@@ -756,7 +758,7 @@ TEST_F(MasterTest, StatusUpdateAck)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -796,6 +798,144 @@ TEST_F(MasterTest, StatusUpdateAck)
 }
 
 
+// This test checks that domain information is correctly returned by
+// the master's HTTP endpoints.
+TEST_F(MasterTest, DomainEndpoints)
+{
+  const string MASTER_REGION = "region-abc";
+  const string MASTER_ZONE = "zone-123";
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.domain = createDomainInfo(MASTER_REGION, MASTER_ZONE);
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  const string AGENT_REGION = "region-xyz";
+  const string AGENT_ZONE = "zone-456";
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.domain = createDomainInfo(AGENT_REGION, AGENT_ZONE);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Query the "/state" master endpoint.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(parse);
+
+    Result<JSON::String> masterRegion = parse->find<JSON::String>(
+        "domain.fault_domain.region.name");
+    Result<JSON::String> masterZone = parse->find<JSON::String>(
+        "domain.fault_domain.zone.name");
+
+    EXPECT_SOME_EQ(JSON::String(MASTER_REGION), masterRegion);
+    EXPECT_SOME_EQ(JSON::String(MASTER_ZONE), masterZone);
+
+    Result<JSON::String> leaderRegion = parse->find<JSON::String>(
+        "leader_info.domain.fault_domain.region.name");
+    Result<JSON::String> leaderZone = parse->find<JSON::String>(
+        "leader_info.domain.fault_domain.zone.name");
+
+    EXPECT_SOME_EQ(JSON::String(MASTER_REGION), leaderRegion);
+    EXPECT_SOME_EQ(JSON::String(MASTER_ZONE), leaderZone);
+
+    Result<JSON::String> agentRegion = parse->find<JSON::String>(
+        "slaves[0].domain.fault_domain.region.name");
+    Result<JSON::String> agentZone = parse->find<JSON::String>(
+        "slaves[0].domain.fault_domain.zone.name");
+
+    EXPECT_SOME_EQ(JSON::String(AGENT_REGION), agentRegion);
+    EXPECT_SOME_EQ(JSON::String(AGENT_ZONE), agentZone);
+  }
+
+  // Query the "/state-summary" master endpoint.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "state-summary",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(parse);
+
+    Result<JSON::String> agentRegion = parse->find<JSON::String>(
+        "slaves[0].domain.fault_domain.region.name");
+    Result<JSON::String> agentZone = parse->find<JSON::String>(
+        "slaves[0].domain.fault_domain.zone.name");
+
+    EXPECT_SOME_EQ(JSON::String(AGENT_REGION), agentRegion);
+    EXPECT_SOME_EQ(JSON::String(AGENT_ZONE), agentZone);
+  }
+
+  // Query the "/slaves" master endpoint.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "slaves",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(parse);
+
+    Result<JSON::String> agentRegion = parse->find<JSON::String>(
+        "slaves[0].domain.fault_domain.region.name");
+    Result<JSON::String> agentZone = parse->find<JSON::String>(
+        "slaves[0].domain.fault_domain.zone.name");
+
+    EXPECT_SOME_EQ(JSON::String(AGENT_REGION), agentRegion);
+    EXPECT_SOME_EQ(JSON::String(AGENT_ZONE), agentZone);
+  }
+
+  // Query the "/state" agent endpoint.
+  {
+    Future<Response> response = process::http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(parse);
+
+    Result<JSON::String> agentRegion = parse->find<JSON::String>(
+        "domain.fault_domain.region.name");
+    Result<JSON::String> agentZone = parse->find<JSON::String>(
+        "domain.fault_domain.zone.name");
+
+    EXPECT_SOME_EQ(JSON::String(AGENT_REGION), agentRegion);
+    EXPECT_SOME_EQ(JSON::String(AGENT_ZONE), agentZone);
+  }
+}
+
+
 TEST_F(MasterTest, RecoverResources)
 {
   master::Flags masterFlags = CreateMasterFlags();
@@ -828,7 +968,7 @@ TEST_F(MasterTest, RecoverResources)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   ExecutorInfo executorInfo;
   executorInfo.MergeFrom(DEFAULT_EXECUTOR_INFO);
@@ -882,7 +1022,7 @@ TEST_F(MasterTest, RecoverResources)
   driver.reviveOffers(); // Don't wait till the next allocation.
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   Offer offer = offers.get()[0];
   EXPECT_EQ(taskResources, offer.resources());
@@ -914,7 +1054,7 @@ TEST_F(MasterTest, RecoverResources)
   // the allocator tests for inspiration.
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   Resources slaveResources = Resources::parse(flags.resources.get()).get();
   EXPECT_EQ(allocatedResources(slaveResources, DEFAULT_FRAMEWORK_INFO.role()),
@@ -951,7 +1091,7 @@ TEST_F(MasterTest, FrameworkMessage)
   schedDriver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -1038,7 +1178,7 @@ TEST_F(MasterTest, MultipleExecutors)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task1;
   task1.set_name("");
@@ -1106,7 +1246,10 @@ TEST_F(MasterTest, MultipleExecutors)
 
 TEST_F(MasterTest, MasterInfo)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.domain = createDomainInfo("region-abc", "zone-xyz");
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -1127,6 +1270,7 @@ TEST_F(MasterTest, MasterInfo)
   driver.start();
 
   AWAIT_READY(masterInfo);
+  EXPECT_EQ(masterFlags.domain, masterInfo->domain());
   EXPECT_EQ(master.get()->pid.address.port, masterInfo->port());
   EXPECT_EQ(
       master.get()->pid.address.ip,
@@ -1377,7 +1521,7 @@ TEST_F(MasterTest, LaunchCombinedOfferTest)
   driver.start();
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
   Resources resources1(offers1.get()[0].resources());
   EXPECT_EQ(2, resources1.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources1.mem().get());
@@ -1418,7 +1562,7 @@ TEST_F(MasterTest, LaunchCombinedOfferTest)
 
   // Await 2nd offer.
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
 
   Resources resources2(offers2.get()[0].resources());
   EXPECT_EQ(1, resources2.cpus().get());
@@ -1450,7 +1594,7 @@ TEST_F(MasterTest, LaunchCombinedOfferTest)
 
   // Await 3rd offer - 2nd and 3rd offer to same slave are now ready.
   AWAIT_READY(offers3);
-  ASSERT_NE(0u, offers3->size());
+  ASSERT_FALSE(offers3->empty());
   Resources resources3(offers3.get()[0].resources());
   EXPECT_EQ(1, resources3.cpus().get());
   EXPECT_EQ(Megabytes(512), resources3.mem().get());
@@ -1523,7 +1667,7 @@ TEST_F(MasterTest, LaunchAcrossSlavesLost)
   driver.start();
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
   Resources resources1(offers1.get()[0].resources());
   EXPECT_EQ(2, resources1.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources1.mem().get());
@@ -1543,7 +1687,7 @@ TEST_F(MasterTest, LaunchAcrossSlavesLost)
   ASSERT_SOME(slave2);
 
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
   Resources resources2(offers1.get()[0].resources());
   EXPECT_EQ(2, resources2.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources2.mem().get());
@@ -1632,7 +1776,7 @@ TEST_F(MasterTest, LaunchAcrossSlavesDropped)
   driver.start();
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
   Resources resources1(offers1.get()[0].resources());
   EXPECT_EQ(2, resources1.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources1.mem().get());
@@ -1652,7 +1796,7 @@ TEST_F(MasterTest, LaunchAcrossSlavesDropped)
   ASSERT_SOME(slave2);
 
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
   Resources resources2(offers1.get()[0].resources());
   EXPECT_EQ(2, resources2.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources2.mem().get());
@@ -1743,7 +1887,7 @@ TEST_F(MasterTest, LaunchDuplicateOfferLost)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
   Resources resources(offers.get()[0].resources());
   EXPECT_EQ(2, resources.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources.mem().get());
@@ -1835,7 +1979,7 @@ TEST_F(MasterTest, LaunchDuplicateOfferDropped)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
   Resources resources(offers.get()[0].resources());
   EXPECT_EQ(2, resources.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources.mem().get());
@@ -1950,7 +2094,7 @@ TEST_F(MasterTest, LaunchDifferentRoleLost)
   Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
   Resources resources1(offers1.get()[0].resources());
   EXPECT_EQ(2, resources1.cpus().get());
   EXPECT_EQ(Megabytes(1024), resources1.mem().get());
@@ -1990,7 +2134,7 @@ TEST_F(MasterTest, LaunchDifferentRoleLost)
 
   // Await 2nd offer.
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
   ASSERT_TRUE(offers2.get()[0].has_allocation_info());
 
   Resources resources2(offers2.get()[0].resources());
@@ -2022,7 +2166,7 @@ TEST_F(MasterTest, LaunchDifferentRoleLost)
 
   // Await 3rd offer - 2nd and 3rd offer to same slave are now ready.
   AWAIT_READY(offers3);
-  ASSERT_NE(0u, offers3->size());
+  ASSERT_FALSE(offers3->empty());
   ASSERT_TRUE(offers3.get()[0].has_allocation_info());
   Resources resources3(offers3.get()[0].resources());
   EXPECT_EQ(1, resources3.cpus().get());
@@ -2088,6 +2232,7 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("master/slaves_disconnected"));
   EXPECT_EQ(1u, snapshot.values.count("master/slaves_active"));
   EXPECT_EQ(1u, snapshot.values.count("master/slaves_inactive"));
+  EXPECT_EQ(1u, snapshot.values.count("master/slaves_unreachable"));
 
   EXPECT_EQ(1u, snapshot.values.count("master/frameworks_connected"));
   EXPECT_EQ(1u, snapshot.values.count("master/frameworks_disconnected"));
@@ -2099,10 +2244,16 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_staging"));
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_starting"));
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_running"));
+  EXPECT_EQ(1u, snapshot.values.count("master/tasks_unreachable"));
+  EXPECT_EQ(1u, snapshot.values.count("master/tasks_killing"));
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_finished"));
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_failed"));
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_killed"));
   EXPECT_EQ(1u, snapshot.values.count("master/tasks_lost"));
+  EXPECT_EQ(1u, snapshot.values.count("master/tasks_error"));
+  EXPECT_EQ(1u, snapshot.values.count("master/tasks_dropped"));
+  EXPECT_EQ(1u, snapshot.values.count("master/tasks_gone"));
+  EXPECT_EQ(1u, snapshot.values.count("master/tasks_gone_by_operator"));
 
   EXPECT_EQ(1u, snapshot.values.count("master/dropped_messages"));
 
@@ -2131,6 +2282,7 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("master/messages_unregister_slave"));
   EXPECT_EQ(1u, snapshot.values.count("master/messages_status_update"));
   EXPECT_EQ(1u, snapshot.values.count("master/messages_exited_executor"));
+  EXPECT_EQ(1u, snapshot.values.count("master/messages_update_slave"));
 
   // Messages from both schedulers and slaves.
   EXPECT_EQ(1u, snapshot.values.count("master/messages_authenticate"));
@@ -2139,6 +2291,10 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
       "master/valid_framework_to_executor_messages"));
   EXPECT_EQ(1u, snapshot.values.count(
       "master/invalid_framework_to_executor_messages"));
+  EXPECT_EQ(1u, snapshot.values.count(
+      "master/valid_executor_to_framework_messages"));
+  EXPECT_EQ(1u, snapshot.values.count(
+      "master/invalid_executor_to_framework_messages"));
 
   EXPECT_EQ(1u, snapshot.values.count("master/valid_status_updates"));
   EXPECT_EQ(1u, snapshot.values.count("master/invalid_status_updates"));
@@ -2148,27 +2304,50 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count(
       "master/invalid_status_update_acknowledgements"));
 
+  // Recovery counters.
   EXPECT_EQ(1u, snapshot.values.count("master/recovery_slave_removals"));
 
+  // Process metrics.
   EXPECT_EQ(1u, snapshot.values.count("master/event_queue_messages"));
   EXPECT_EQ(1u, snapshot.values.count("master/event_queue_dispatches"));
   EXPECT_EQ(1u, snapshot.values.count("master/event_queue_http_requests"));
+
+  // Slave observer metrics.
+  EXPECT_EQ(1u, snapshot.values.count("master/slave_unreachable_scheduled"));
+  EXPECT_EQ(1u, snapshot.values.count("master/slave_unreachable_completed"));
+  EXPECT_EQ(1u, snapshot.values.count("master/slave_unreachable_canceled"));
 
   EXPECT_EQ(1u, snapshot.values.count("master/cpus_total"));
   EXPECT_EQ(1u, snapshot.values.count("master/cpus_used"));
   EXPECT_EQ(1u, snapshot.values.count("master/cpus_percent"));
 
+  EXPECT_EQ(1u, snapshot.values.count("master/cpus_revocable_total"));
+  EXPECT_EQ(1u, snapshot.values.count("master/cpus_revocable_used"));
+  EXPECT_EQ(1u, snapshot.values.count("master/cpus_revocable_percent"));
+
   EXPECT_EQ(1u, snapshot.values.count("master/gpus_total"));
   EXPECT_EQ(1u, snapshot.values.count("master/gpus_used"));
   EXPECT_EQ(1u, snapshot.values.count("master/gpus_percent"));
+
+  EXPECT_EQ(1u, snapshot.values.count("master/gpus_revocable_total"));
+  EXPECT_EQ(1u, snapshot.values.count("master/gpus_revocable_used"));
+  EXPECT_EQ(1u, snapshot.values.count("master/gpus_revocable_percent"));
 
   EXPECT_EQ(1u, snapshot.values.count("master/mem_total"));
   EXPECT_EQ(1u, snapshot.values.count("master/mem_used"));
   EXPECT_EQ(1u, snapshot.values.count("master/mem_percent"));
 
+  EXPECT_EQ(1u, snapshot.values.count("master/mem_revocable_total"));
+  EXPECT_EQ(1u, snapshot.values.count("master/mem_revocable_used"));
+  EXPECT_EQ(1u, snapshot.values.count("master/mem_revocable_percent"));
+
   EXPECT_EQ(1u, snapshot.values.count("master/disk_total"));
   EXPECT_EQ(1u, snapshot.values.count("master/disk_used"));
   EXPECT_EQ(1u, snapshot.values.count("master/disk_percent"));
+
+  EXPECT_EQ(1u, snapshot.values.count("master/disk_revocable_total"));
+  EXPECT_EQ(1u, snapshot.values.count("master/disk_revocable_used"));
+  EXPECT_EQ(1u, snapshot.values.count("master/disk_revocable_percent"));
 
   // Registrar Metrics.
   EXPECT_EQ(1u, snapshot.values.count("registrar/queued_operations"));
@@ -2215,6 +2394,95 @@ TEST_F(MasterTest, SlavesEndpointWithoutSlaves)
 
   ASSERT_SOME(expected);
   EXPECT_SOME_EQ(expected.get(), parse);
+}
+
+
+// Tests that reservations can only be seen by authorized users.
+TEST_F(MasterTest, SlavesEndpointFiltering)
+{
+  // Start up the master.
+  master::Flags flags = CreateMasterFlags();
+
+  {
+    mesos::ACL::ViewRole* acl = flags.acls.get().add_view_roles();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<SlaveRegisteredMessage> agentRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  AWAIT_READY(agentRegisteredMessage);
+  const SlaveID& agentId = agentRegisteredMessage->slave_id();
+
+  // Create reservation.
+  {
+    RepeatedPtrField<Resource> reservation =
+      Resources::parse("cpus:1;mem:12")->pushReservation(
+          createDynamicReservationInfo(
+              "superhero",
+              DEFAULT_CREDENTIAL.principal()));
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "reserve",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        strings::format(
+            "slaveId=%s&resources=%s",
+            agentId,
+            JSON::protobuf(reservation)).get());
+
+    AWAIT_READY(response);
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, response);
+  }
+
+  // Query master with invalid user.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "slaves",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    const Try<JSON::Object> json = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(json);
+
+    Result<JSON::Object> reservations =
+      json->find<JSON::Object>("slaves[0].reserved_resources");
+    ASSERT_SOME(reservations);
+    EXPECT_TRUE(reservations->values.empty());
+  }
+
+  // Query master with valid user.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "slaves",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    const Try<JSON::Object> json = JSON::parse<JSON::Object>(response->body);
+    ASSERT_SOME(json);
+
+    Result<JSON::Object> reservations =
+      json->find<JSON::Object>("slaves[0].reserved_resources");
+    ASSERT_SOME(reservations);
+    EXPECT_FALSE(reservations->values.empty());
+  }
 }
 
 
@@ -2267,6 +2535,125 @@ TEST_F(MasterTest, SlavesEndpointTwoSlaves)
   Result<JSON::Array> array = parse->find<JSON::Array>("slaves");
   ASSERT_SOME(array);
   EXPECT_EQ(2u, array->values.size());
+}
+
+
+// Ensures that the '/slaves' endpoint returns the correct slave and it's in
+// the correct field of the response when provided with a slave ID query
+// parameter.
+TEST_F(MasterTest, SlavesEndpointQuerySlave)
+{
+  master::Flags masterFlags = CreateMasterFlags();
+
+  // Ensure that master can recover from the same work_dir.
+  masterFlags.registry = "replicated_log";
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // Start two agents.
+
+  Future<SlaveRegisteredMessage> slave1RegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(slave1RegisteredMessage);
+
+  Future<SlaveRegisteredMessage> slave2RegisteredMessage =
+    FUTURE_PROTOBUF(
+        SlaveRegisteredMessage(),
+        master.get()->pid,
+        Not(slave1.get()->pid));
+
+  Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
+  ASSERT_SOME(slave2);
+
+  AWAIT_READY(slave2RegisteredMessage);
+
+  // Query the information about the first agent.
+  {
+    string slaveId = slave1RegisteredMessage->slave_id().value();
+
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "slaves?slave_id=" + slaveId,
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    const Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+
+    ASSERT_SOME(value);
+
+    Try<JSON::Object> object = value->as<JSON::Object>();
+
+    Result<JSON::Array> array = object->find<JSON::Array>("slaves");
+    ASSERT_SOME(array);
+    EXPECT_EQ(1u, array->values.size());
+
+    Try<JSON::Value> expected = JSON::parse(
+        "{"
+          "\"slaves\":"
+            "[{"
+                "\"id\":\"" + slaveId + "\""
+            "}]"
+        "}");
+
+    ASSERT_SOME(expected);
+
+    EXPECT_TRUE(value->contains(expected.get()));
+  }
+
+  // Stop agents while the master is down.
+  master->reset();
+  slave1.get()->terminate();
+  slave1->reset();
+  slave2.get()->terminate();
+  slave2->reset();
+
+  // Restart the master, now two agents should be in the 'recovered' state.
+  master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Check if the second agent is in the 'recovered_slaves' field.
+  {
+    string slaveId = slave2RegisteredMessage->slave_id().value();
+
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "slaves?slave_id=" + slaveId,
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    const Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+
+    ASSERT_SOME(value);
+    Try<JSON::Object> object = value->as<JSON::Object>();
+
+    Result<JSON::Array> array = object->find<JSON::Array>("recovered_slaves");
+    ASSERT_SOME(array);
+    EXPECT_EQ(1u, array->values.size());
+
+    Try<JSON::Value> expected = JSON::parse(
+        "{"
+          "\"recovered_slaves\":"
+            "[{"
+                "\"id\":\"" + slaveId + "\""
+            "}]"
+        "}");
+
+    ASSERT_SOME(expected);
+
+    EXPECT_TRUE(value->contains(expected.get()));
+  }
 }
 
 
@@ -2395,7 +2782,7 @@ TEST_F(MasterTest, UnreachableTaskAfterFailover)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 100");
 
@@ -3202,7 +3589,7 @@ TEST_F(MasterTest, OrphanTasksMultipleAgents)
   driver.start();
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task1 =
     createTask(offers1.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
@@ -3237,7 +3624,7 @@ TEST_F(MasterTest, OrphanTasksMultipleAgents)
   ASSERT_SOME(slave2);
 
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
 
   TaskInfo task2 =
     createTask(offers2.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
@@ -3297,8 +3684,8 @@ TEST_F(MasterTest, OrphanTasksMultipleAgents)
       parse->values["unregistered_frameworks"].as<JSON::Array>();
 
     ASSERT_EQ(1u, frameworks.values.size());
-    EXPECT_EQ(0u, orphanTasks.values.size());
-    EXPECT_EQ(0u, unregisteredFrameworks.values.size());
+    EXPECT_TRUE(orphanTasks.values.empty());
+    EXPECT_TRUE(unregisteredFrameworks.values.empty());
 
     JSON::Object framework = frameworks.values.front().as<JSON::Object>();
 
@@ -3325,7 +3712,7 @@ TEST_F(MasterTest, OrphanTasksMultipleAgents)
       parse->values["unregistered_frameworks"].as<JSON::Array>();
 
     ASSERT_EQ(1u, frameworks.values.size());
-    EXPECT_EQ(0u, unregisteredFrameworks.values.size());
+    EXPECT_TRUE(unregisteredFrameworks.values.empty());
 
     JSON::Object framework = frameworks.values.front().as<JSON::Object>();
 
@@ -3417,7 +3804,8 @@ TEST_F(MasterTest, UnregisteredFrameworksAfterTearDown)
 // This tests /tasks endpoint to return correct task information.
 TEST_F(MasterTest, TasksEndpoint)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -3431,67 +3819,158 @@ TEST_F(MasterTest, TasksEndpoint)
   MesosSchedulerDriver driver(
       &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(sched, registered(&driver, _, _));
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
 
-  Future<vector<Offer>> offers;
+  process::Queue<Offer> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return()); // Ignore subsequent offers.
+    .WillRepeatedly(EnqueueOffers(&offers));
 
   driver.start();
 
-  AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  Future<Offer> offer = offers.get();
+  AWAIT_READY(offer);
 
-  TaskInfo task;
-  task.set_name("test");
-  task.mutable_task_id()->set_value("1");
-  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
-  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+  // Launch two tasks.
+  TaskInfo task1;
+  task1.set_name("test1");
+  task1.mutable_task_id()->set_value("1");
+  task1.mutable_slave_id()->MergeFrom(offer->slave_id());
+  task1.mutable_resources()->MergeFrom(
+      Resources::parse("cpus:0.1;mem:12").get());
+  task1.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  TaskInfo task2;
+  task2.set_name("test2");
+  task2.mutable_task_id()->set_value("2");
+  task2.mutable_slave_id()->MergeFrom(offer->slave_id());
+  task2.mutable_resources()->MergeFrom(
+      Resources::parse("cpus:0.1;mem:12").get());
+  task2.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task1);
+  tasks.push_back(task2);
 
   EXPECT_CALL(exec, registered(_, _, _, _));
 
   EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> status1, status2;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status1))
+    .WillOnce(FutureArg<1>(&status2));
 
-  driver.launchTasks(offers.get()[0].id(), {task});
+  driver.launchTasks(offer->id(), tasks);
 
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
-  EXPECT_TRUE(status->has_executor_id());
-  EXPECT_EQ(exec.id, status->executor_id());
+  AWAIT_READY(status1);
+  EXPECT_EQ(TASK_RUNNING, status1->state());
+  EXPECT_TRUE(status1->has_executor_id());
+  EXPECT_EQ(exec.id, status1->executor_id());
 
-  Future<Response> response = process::http::get(
-      master.get()->pid,
-      "tasks",
-      None(),
-      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+  AWAIT_READY(status2);
+  EXPECT_EQ(TASK_RUNNING, status2->state());
+  EXPECT_TRUE(status2->has_executor_id());
+  EXPECT_EQ(exec.id, status2->executor_id());
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+  // Testing the '/master/tasks' endpoint without parameters,
+  // which returns information about all tasks.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "tasks",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-  Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
-  ASSERT_SOME(value);
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
 
-  Try<JSON::Value> expected = JSON::parse(
-      "{"
-        "\"tasks\":"
-          "[{"
-              "\"executor_id\":\"default\","
-              "\"id\":\"1\","
-              "\"name\":\"test\","
-              "\"state\":\"TASK_RUNNING\""
-          "}]"
-      "}");
+    Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+    ASSERT_SOME(value);
 
-  ASSERT_SOME(expected);
+    // Two possible orderings of the result.
+    Try<JSON::Value> expected1 = JSON::parse(
+        "{"
+          "\"tasks\":"
+            "[{"
+                "\"executor_id\":\"default\","
+                "\"framework_id\":\"" + frameworkId->value() + "\","
+                "\"id\":\"1\","
+                "\"name\":\"test1\","
+                "\"state\":\"TASK_RUNNING\""
+              "},{"
+                "\"executor_id\":\"default\","
+                "\"framework_id\":\"" + frameworkId->value() + "\","
+                "\"id\":\"2\","
+                "\"name\":\"test2\","
+                "\"state\":\"TASK_RUNNING\""
+            "}]"
+        "}");
 
-  EXPECT_TRUE(value->contains(expected.get()));
+    Try<JSON::Value> expected2 = JSON::parse(
+        "{"
+          "\"tasks\":"
+            "[{"
+                "\"executor_id\":\"default\","
+                "\"framework_id\":\"" + frameworkId->value() + "\","
+                "\"id\":\"2\","
+                "\"name\":\"test2\","
+                "\"state\":\"TASK_RUNNING\""
+              "},{"
+                "\"executor_id\":\"default\","
+                "\"framework_id\":\"" + frameworkId->value() + "\","
+                "\"id\":\"1\","
+                "\"name\":\"test1\","
+                "\"state\":\"TASK_RUNNING\""
+            "}]"
+        "}");
+
+    ASSERT_SOME(expected1);
+    ASSERT_SOME(expected2);
+
+    EXPECT_TRUE(
+        value->contains(expected1.get()) ||
+        value->contains(expected2.get()));
+  }
+
+  // Testing the query for a specific task.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "tasks?task_id=1;framework_id=" + frameworkId->value(),
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+    ASSERT_SOME(value);
+
+    JSON::Object object = value->as<JSON::Object>();
+    Result<JSON::Array> taskArray = object.find<JSON::Array>("tasks");
+    ASSERT_SOME(taskArray);
+
+    EXPECT_TRUE(taskArray->values.size() == 1);
+
+    Try<JSON::Value> expected = JSON::parse(
+        "{"
+          "\"tasks\":"
+            "[{"
+                "\"executor_id\":\"default\","
+                "\"framework_id\":\"" + frameworkId->value() + "\","
+                "\"id\":\"1\","
+                "\"name\":\"test1\","
+                "\"state\":\"TASK_RUNNING\""
+            "}]"
+        "}");
+
+    ASSERT_SOME(expected);
+    EXPECT_TRUE(value->contains(expected.get()));
+  }
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -4052,6 +4531,11 @@ TEST_F(MasterTest, StateEndpointFrameworkInfo)
   AWAIT_READY(slaveRegisteredMessage);
 
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  frameworkInfo.clear_capabilities();
+
   frameworkInfo.set_webui_url("http://localhost:8080/");
 
   vector<FrameworkInfo::Capability::Type> capabilities = {
@@ -4175,7 +4659,7 @@ TEST_F(MasterTest, StateSummaryEndpoint)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskID taskId;
   taskId.set_value("1");
@@ -4284,8 +4768,11 @@ TEST_F(MasterTest, StateEndpointAgentCapabilities)
   ASSERT_EQ(1u, slaveInfo.values.count("capabilities"));
   JSON::Value slaveCapabilities = slaveInfo.values.at("capabilities");
 
-  // Agents should always have MULTI_ROLE capability in current implementation.
-  Try<JSON::Value> expectedCapabilities = JSON::parse("[\"MULTI_ROLE\"]");
+  // Agents should always have MULTI_ROLE, HIERARCHICAL_ROLE, and
+  // RESERVATION_REFINEMENT capabilities in current implementation.
+  Try<JSON::Value> expectedCapabilities = JSON::parse(
+      "[\"MULTI_ROLE\",\"HIERARCHICAL_ROLE\",\"RESERVATION_REFINEMENT\"]");
+
   ASSERT_SOME(expectedCapabilities);
   EXPECT_TRUE(slaveCapabilities.contains(expectedCapabilities.get()));
 }
@@ -4325,7 +4812,7 @@ TEST_F(MasterTest, StateEndpointAllocationRole)
 
   AWAIT_READY(registered);
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   Resources executorResources = Resources::parse("cpus:0.1;mem:32").get();
   executorResources.allocate("foo");
@@ -4448,7 +4935,7 @@ TEST_F(MasterTest, RecoveredSlaves)
 
     Result<JSON::Array> array1 = parse->find<JSON::Array>("slaves");
     ASSERT_SOME(array1);
-    EXPECT_EQ(0u, array1->values.size());
+    EXPECT_TRUE(array1->values.empty());
 
     Result<JSON::Array> array2 =
       parse->find<JSON::Array>("recovered_slaves");
@@ -4472,7 +4959,7 @@ TEST_F(MasterTest, RecoveredSlaves)
 
     Result<JSON::Array> array1 = parse->find<JSON::Array>("slaves");
     ASSERT_SOME(array1);
-    EXPECT_EQ(0u, array1->values.size());
+    EXPECT_TRUE(array1->values.empty());
 
     Result<JSON::Array> array2 =
       parse->find<JSON::Array>("recovered_slaves");
@@ -4514,7 +5001,7 @@ TEST_F(MasterTest, RecoveredSlaves)
     Result<JSON::Array> array2 =
       parse->find<JSON::Array>("recovered_slaves");
     ASSERT_SOME(array2);
-    EXPECT_EQ(0u, array2->values.size());
+    EXPECT_TRUE(array2->values.empty());
   }
 
   {
@@ -4536,7 +5023,7 @@ TEST_F(MasterTest, RecoveredSlaves)
     Result<JSON::Array> array2 =
       parse->find<JSON::Array>("recovered_slaves");
     ASSERT_SOME(array2);
-    EXPECT_EQ(0u, array2->values.size());
+    EXPECT_TRUE(array2->values.empty());
   }
 }
 
@@ -4569,7 +5056,7 @@ TEST_F(MasterTest, ExecutorLabels)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -4661,7 +5148,7 @@ TEST_F(MasterTest, TaskLabels)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -4765,7 +5252,7 @@ TEST_F(MasterTest, TaskStatusLabels)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
 
@@ -4867,7 +5354,7 @@ TEST_F(MasterTest, TaskStatusContainerStatus)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 100", DEFAULT_EXECUTOR_ID);
 
@@ -5069,7 +5556,7 @@ TEST_F(MasterTest, TaskDiscoveryInfo)
   driver.start();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("testtask");
@@ -5269,7 +5756,7 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task1;
   task1.set_name("");
@@ -5310,7 +5797,7 @@ TEST_F(MasterTest, MasterFailoverLongLivedExecutor)
   detector.appoint(master.get()->pid);
 
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
 
   // The second task is a just a copy of the first task (using the
   // same executor and resources). We have to set a new task id.
@@ -5513,43 +6000,195 @@ TEST_F(MasterTest, FrameworksEndpointWithoutFrameworks)
 }
 
 
-TEST_F(MasterTest, FrameworksEndpointOneFramework)
+// Ensures that the '/master/frameworks' endpoint returns the correct framework
+// when provided with a framework ID query parameter.
+TEST_F(MasterTest, FrameworksEndpointMultipleFrameworks)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+  // Start a slave to receive shutdown message when framework is terminated.
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
 
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, framework, master.get()->pid, DEFAULT_CREDENTIAL);
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
 
-  Future<Nothing> registered;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureSatisfy(&registered));
+  AWAIT_READY(registerSlaveMessage);
 
-  driver.start();
+  // Start two frameworks.
 
-  AWAIT_READY(registered);
+  Future<FrameworkID> frameworkId1;
+  Future<FrameworkID> frameworkId2;
 
-  Future<Response> response = process::http::get(
+  MockScheduler sched1;
+  MesosSchedulerDriver driver1(
+      &sched1,
+      DEFAULT_FRAMEWORK_INFO,
       master.get()->pid,
-      "frameworks",
-      None(),
-      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+      DEFAULT_CREDENTIAL);
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
-  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+  EXPECT_CALL(sched1, registered(_, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId1));
 
-  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
-  ASSERT_SOME(parse);
+  // Ignore any incoming resource offers to the scheduler.
+  EXPECT_CALL(sched1, resourceOffers(_, _))
+    .WillRepeatedly(Return());
 
-  Result<JSON::Array> array = parse->find<JSON::Array>("frameworks");
-  ASSERT_SOME(array);
-  EXPECT_EQ(1u, array->values.size());
+  driver1.start();
 
-  driver.stop();
-  driver.join();
+  MockScheduler sched2;
+  MesosSchedulerDriver driver2(
+      &sched2,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched2, registered(_, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId2));
+
+  // Ignore any incoming resource offers to the scheduler.
+  EXPECT_CALL(sched2, resourceOffers(_, _))
+    .WillRepeatedly(Return());
+
+  driver2.start();
+
+  AWAIT_READY(frameworkId1);
+  AWAIT_READY(frameworkId2);
+
+  // Request with no query parameter.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "frameworks",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+    ASSERT_SOME(value);
+
+    JSON::Object object = value->as<JSON::Object>();
+
+    Result<JSON::Array> array = object.find<JSON::Array>("frameworks");
+    ASSERT_SOME(array);
+    EXPECT_EQ(2u, array->values.size());
+
+    Try<JSON::Value> frameworkJson1 = JSON::parse(
+        "{"
+            "\"id\":\"" + frameworkId1->value() + "\","
+            "\"name\":\"default\""
+        "}");
+
+    Try<JSON::Value> frameworkJson2 = JSON::parse(
+        "{"
+            "\"id\":\"" + frameworkId2->value() + "\","
+            "\"name\":\"default\""
+        "}");
+
+    ASSERT_SOME(frameworkJson1);
+    ASSERT_SOME(frameworkJson2);
+
+    // Since frameworks are stored in a hashmap, there is no strict guarantee of
+    // their ordering when listed. For this reason, we test both possibilities.
+    if (array->values[0].contains(frameworkJson1.get())) {
+      ASSERT_TRUE(array->values[1].contains(frameworkJson2.get()));
+    } else {
+      ASSERT_TRUE(array->values[0].contains(frameworkJson2.get()));
+      ASSERT_TRUE(array->values[1].contains(frameworkJson1.get()));
+    }
+  }
+
+  // Query the first framework.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "frameworks?framework_id=" + frameworkId1->value(),
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+    ASSERT_SOME(value);
+
+    JSON::Object object = value->as<JSON::Object>();
+
+    Result<JSON::Array> array = object.find<JSON::Array>("frameworks");
+    ASSERT_SOME(array);
+    EXPECT_EQ(1u, array->values.size());
+
+    Try<JSON::Value> expected = JSON::parse(
+        "{"
+          "\"frameworks\":"
+            "[{"
+                "\"id\":\"" + frameworkId1->value() + "\","
+                "\"name\":\"default\""
+            "}]"
+        "}");
+
+    ASSERT_SOME(expected);
+
+    EXPECT_TRUE(value->contains(expected.get()));
+  }
+
+  // Expect a teardown call and a shutdown message to ensure that the
+  // master has marked the framework as completed.
+  Future<mesos::scheduler::Call> teardownCall = FUTURE_CALL(
+      mesos::scheduler::Call(), mesos::scheduler::Call::TEARDOWN, _, _);
+  Future<ShutdownFrameworkMessage> shutdownFrameworkMessage =
+    FUTURE_PROTOBUF(ShutdownFrameworkMessage(), _, _);
+
+  // Complete the first framework. As a result, it will appear in the response's
+  // 'completed_frameworks' field.
+  driver1.stop();
+  driver1.join();
+
+  AWAIT_READY(teardownCall);
+
+  AWAIT_READY(shutdownFrameworkMessage);
+
+  // Query the first framework.
+  {
+    Future<Response> response = process::http::get(
+        master.get()->pid,
+        "frameworks?framework_id=" + frameworkId1->value(),
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Value> value = JSON::parse<JSON::Value>(response->body);
+    ASSERT_SOME(value);
+
+    JSON::Object object = value->as<JSON::Object>();
+
+    Result<JSON::Array> array =
+      object.find<JSON::Array>("completed_frameworks");
+    ASSERT_SOME(array);
+    EXPECT_EQ(1u, array->values.size());
+
+    Try<JSON::Value> expected = JSON::parse(
+        "{"
+          "\"completed_frameworks\":"
+            "[{"
+                "\"id\":\"" + frameworkId1->value() + "\","
+                "\"name\":\"default\""
+            "}]"
+        "}");
+
+    ASSERT_SOME(expected);
+
+    EXPECT_TRUE(value->contains(expected.get()));
+  }
+
+  driver2.stop();
+  driver2.join();
 }
 
 
@@ -6005,7 +6644,7 @@ TEST_F(MasterTest, DISABLED_RecoverResourcesOrphanedTask)
   v1::FrameworkID frameworkId = subscribed->framework_id();
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->offers().size());
+  ASSERT_FALSE(offers->offers().empty());
 
   v1::executor::Mesos* execMesos = nullptr;
 
@@ -6718,7 +7357,7 @@ TEST_F(MasterTest, MultiRoleFrameworkReceivesOffers)
   Clock::settle();
 
   AWAIT_READY(offers1);
-  ASSERT_NE(0u, offers1->size());
+  ASSERT_FALSE(offers1->empty());
   ASSERT_TRUE(offers1.get()[0].has_allocation_info());
 
   // Start second agent.
@@ -6733,7 +7372,7 @@ TEST_F(MasterTest, MultiRoleFrameworkReceivesOffers)
   Clock::settle();
 
   AWAIT_READY(offers2);
-  ASSERT_NE(0u, offers2->size());
+  ASSERT_FALSE(offers2->empty());
   ASSERT_TRUE(offers2.get()[0].has_allocation_info());
 
   // We cannot deterministically expect roles for each offer, however we
@@ -7027,6 +7666,309 @@ TEST_F(MasterTest, MultiRoleSchedulerUnsubscribeFromRole)
 }
 
 
+// This test checks that if the agent and master are configured with
+// domains that specify the same region (but different zones), the
+// agent is allowed to register and its resources are offered to
+// frameworks as usual.
+TEST_F(MasterTest, AgentDomainSameRegion)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.domain = createDomainInfo("region-abc", "zone-123");
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.domain = createDomainInfo("region-abc", "zone-456");
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(slaveRegisteredMessage);
+
+  const SlaveID& slaveId = slaveRegisteredMessage->slave_id();
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<MasterInfo> masterInfo;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<2>(&masterInfo));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  AWAIT_READY(masterInfo);
+  EXPECT_EQ(masterFlags.domain, masterInfo->domain());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Offer offer = offers->front();
+  EXPECT_EQ(slaveId, offer.slave_id());
+  EXPECT_EQ(slaveFlags.domain.get(), offer.domain());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test checks that if the agent and master are configured with
+// domains that specify different regions, the agent is allowed to
+// register but its resources are only offered to region-aware
+// frameworks. We also check that tasks can be launched in remote
+// regions.
+TEST_F(MasterTest, AgentDomainDifferentRegion)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.domain = createDomainInfo("region-abc", "zone-123");
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.domain = createDomainInfo("region-xyz", "zone-123");
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(slaveRegisteredMessage);
+
+  const SlaveID& slaveId = slaveRegisteredMessage->slave_id();
+
+  // Launch a non-region-aware scheduler. It should NOT receive any
+  // resource offers for `slave`.
+  {
+    MockScheduler sched;
+    MesosSchedulerDriver driver(
+        &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+    Future<Nothing> registered;
+    EXPECT_CALL(sched, registered(&driver, _, _))
+      .WillOnce(FutureSatisfy(&registered));
+
+    // We do not expect to get offered any resources.
+    Future<vector<Offer>> offers;
+    EXPECT_CALL(sched, resourceOffers(&driver, _))
+      .Times(0);
+
+    driver.start();
+
+    AWAIT_READY(registered);
+
+    // Trigger a batch allocation, for good measure.
+    Clock::advance(masterFlags.allocation_interval);
+    Clock::settle();
+
+    driver.stop();
+    driver.join();
+  }
+
+  // Launch a region-aware scheduler. It should receive an offer for `slave`.
+  {
+    FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+    frameworkInfo.add_capabilities()->set_type(
+        FrameworkInfo::Capability::REGION_AWARE);
+
+    MockScheduler sched;
+    MesosSchedulerDriver driver(
+        &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+    EXPECT_CALL(sched, registered(&driver, _, _));
+
+    Future<vector<Offer>> offers;
+    EXPECT_CALL(sched, resourceOffers(&driver, _))
+      .WillOnce(FutureArg<1>(&offers));
+
+    driver.start();
+
+    AWAIT_READY(offers);
+    ASSERT_FALSE(offers->empty());
+
+    Offer offer = offers->front();
+    EXPECT_EQ(slaveId, offer.slave_id());
+    EXPECT_EQ(slaveFlags.domain.get(), offer.domain());
+
+    // Check that we can launch a task in a remote region.
+    TaskInfo task = createTask(offer, "sleep 60");
+
+    Future<TaskStatus> runningStatus;
+    EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&runningStatus));
+
+    driver.launchTasks(offer.id(), {task});
+
+    AWAIT_READY(runningStatus);
+    EXPECT_EQ(TASK_RUNNING, runningStatus->state());
+    EXPECT_EQ(task.task_id(), runningStatus->task_id());
+
+    driver.stop();
+    driver.join();
+  }
+
+  // Resume the clock so that executor/task cleanup happens correctly.
+  //
+  // TODO(neilc): Replace this with more fine-grained clock advancement.
+  Clock::resume();
+}
+
+
+// This test checks that if the master is configured with a domain but
+// the agent is not, the agent is allowed to register and its
+// resources are offered to frameworks as usual.
+TEST_F(MasterTest, AgentDomainUnset)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.domain = createDomainInfo("region-abc", "zone-123");
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(slaveRegisteredMessage);
+
+  const SlaveID& slaveId = slaveRegisteredMessage->slave_id();
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Offer offer = offers->front();
+  EXPECT_EQ(slaveId, offer.slave_id());
+  EXPECT_FALSE(offer.has_domain());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test checks that if the agent is configured with a domain but
+// the master is not, the agent is not allowed to register.
+TEST_F(MasterTest, AgentDomainMismatch)
+{
+  Clock::pause();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.domain = createDomainInfo("region-abc", "zone-456");
+
+  // Agent should attempt to register.
+  Future<RegisterSlaveMessage> registerSlaveMessage =
+    FUTURE_PROTOBUF(RegisterSlaveMessage(), _, _);
+
+  // If the agent is allowed to register, the master will update the
+  // registry. The agent should not be allowed to register, so we
+  // expect that no registrar operations will be observed.
+  EXPECT_CALL(*master.get()->registrar.get(), apply(_))
+    .Times(0);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(registerSlaveMessage);
+
+  Clock::settle();
+}
+
+
+// This test checks that if the agent is configured with a domain but
+// the master is not, the agent is not allowed to re-register. This
+// might happen if the leading master is configured with a domain but
+// one of the standby masters is not, and then the leader fails over.
+TEST_F(MasterTest, AgentDomainMismatchOnReregister)
+{
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.domain = createDomainInfo("region-abc", "zone-123");
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.domain = createDomainInfo("region-abc", "zone-456");
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Simulate master failover and start a new master with no domain
+  // configured.
+  master->reset();
+
+  masterFlags.domain = None();
+
+  master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Future<ReregisterSlaveMessage> reregisterSlaveMessage =
+    FUTURE_PROTOBUF(ReregisterSlaveMessage(), _, _);
+
+  // If the agent is allowed to re-register, the master will update
+  // the registry. The agent should not be allowed to register, so we
+  // expect that no registrar operations will be observed.
+  EXPECT_CALL(*master.get()->registrar.get(), apply(_))
+    .Times(0);
+
+  // Simulate a new master detected event.
+  detector.appoint(master.get()->pid);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+  AWAIT_READY(reregisterSlaveMessage);
+
+  Clock::settle();
+}
+
+
 // Check that the master does not allow old Mesos agents to register.
 // We do this by intercepting the agent's `RegisterSlaveMessage` and
 // then re-sending it with a tweaked version number.
@@ -7110,6 +8052,711 @@ TEST_F(MasterTest, IgnoreOldAgentReregistration)
 
   // Settle the clock to retire in-flight messages.
   Clock::settle();
+}
+
+
+class MasterTestPrePostReservationRefinement
+  : public MasterTest,
+    public WithParamInterface<bool> {
+public:
+  Resources inboundResources(RepeatedPtrField<Resource> resources)
+  {
+    // If reservation refinement is enabled, inbound resources are already
+    // in the "post-reservation-refinement" format and should not need to
+    // be upgraded.
+    if (GetParam()) {
+      return resources;
+    }
+
+    convertResourceFormat(&resources, POST_RESERVATION_REFINEMENT);
+    return resources;
+  }
+
+  RepeatedPtrField<Resource> outboundResources(
+      RepeatedPtrField<Resource> resources)
+  {
+    // If reservation refinement is enabled, outbound resources are already
+    // in the "post-reservation-refinement" format and should not need to
+    // be downgraded.
+    if (GetParam()) {
+      return resources;
+    }
+
+    CHECK_SOME(downgradeResources(&resources));
+    return resources;
+  }
+};
+
+
+// Parameterized on reservation-refinement.
+INSTANTIATE_TEST_CASE_P(
+    bool,
+    MasterTestPrePostReservationRefinement,
+    ::testing::Values(true, false));
+
+
+// This tests that a framework can launch a task with
+// and without the RESERVATION_REFINEMENT capability.
+TEST_P(MasterTestPrePostReservationRefinement, LaunchTask)
+{
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  frameworkInfo.clear_capabilities();
+
+  if (GetParam()) {
+    frameworkInfo.add_capabilities()->set_type(
+        FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+  }
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+  Offer offer = offers->front();
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Nothing> update;
+  EXPECT_CALL(containerizer, update(_, inboundResources(offer.resources())))
+    .WillOnce(DoAll(FutureSatisfy(&update), Return(Nothing())));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status->state());
+  EXPECT_TRUE(status->has_executor_id());
+  EXPECT_EQ(exec.id, status->executor_id());
+
+  AWAIT_READY(update);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This tests that a framework can launch a task group
+// with and without the RESERVATION_REFINEMENT capability.
+TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
+{
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  frameworkInfo.clear_capabilities();
+
+  if (GetParam()) {
+    frameworkInfo.add_capabilities()->set_type(
+        v1::FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+  }
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+#ifndef USE_SSL_SOCKET
+  // Disable operator API authentication for the default executor. Executor
+  // authentication currently has SSL as a dependency, so we cannot require
+  // executors to authenticate with the agent operator API if Mesos was not
+  // built with SSL support.
+  flags.authenticate_http_readwrite = false;
+#endif // USE_SSL_SOCKET
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  {
+    Call call;
+    call.set_type(Call::SUBSCRIBE);
+    Call::Subscribe* subscribe = call.mutable_subscribe();
+    subscribe->mutable_framework_info()->CopyFrom(frameworkInfo);
+
+    mesos.send(call);
+  }
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  RepeatedPtrField<Resource> resources =
+    Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo;
+  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
+  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
+  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
+  executorInfo.mutable_resources()->CopyFrom(
+      evolve<v1::Resource>(outboundResources(resources)));
+
+  AWAIT_READY(offers);
+  EXPECT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId, evolve<v1::Resource>(resources), SLEEP_COMMAND(1000));
+
+  taskInfo.mutable_resources()->CopyFrom(evolve<v1::Resource>(
+      outboundResources(devolve<Resource>(taskInfo.resources()))));
+
+  v1::TaskGroupInfo taskGroup;
+  taskGroup.add_tasks()->CopyFrom(taskInfo);
+
+  Future<v1::scheduler::Event::Update> update;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&update));
+
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::ACCEPT);
+
+    Call::Accept* accept = call.mutable_accept();
+    accept->add_offer_ids()->CopyFrom(offer.id());
+
+    v1::Offer::Operation* operation = accept->add_operations();
+    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
+
+    v1::Offer::Operation::LaunchGroup* launchGroup =
+      operation->mutable_launch_group();
+
+    launchGroup->mutable_executor()->CopyFrom(executorInfo);
+    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+
+    mesos.send(call);
+  }
+
+  AWAIT_READY(update);
+
+  EXPECT_EQ(TASK_RUNNING, update->status().state());
+  EXPECT_EQ(taskInfo.task_id(), update->status().task_id());
+  EXPECT_TRUE(update->status().has_timestamp());
+
+  // Ensure that the task sandbox symbolic link is created.
+  EXPECT_TRUE(os::exists(path::join(
+      slave::paths::getExecutorLatestRunPath(
+          flags.work_dir,
+          devolve(agentId),
+          devolve(frameworkId),
+          devolve(executorInfo.executor_id())),
+      "tasks",
+      taskInfo.task_id().value())));
+
+  // Verify that the executor's type is exposed in the agent's state
+  // endpoint.
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+  JSON::Object state = parse.get();
+
+  EXPECT_SOME_EQ(
+      JSON::String(v1::ExecutorInfo::Type_Name(executorInfo.type())),
+      state.find<JSON::String>("frameworks[0].executors[0].type"));
+}
+
+
+// This tests that a framework can perform the operations
+// RESERVE, CREATE, DESTROY, and UNRESERVE in that order
+// with and without the RESERVATION_REFINEMENT capability.
+TEST_P(MasterTestPrePostReservationRefinement,
+       ReserveCreateLaunchDestroyUnreserve)
+{
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  frameworkInfo.clear_capabilities();
+
+  if (GetParam()) {
+    frameworkInfo.add_capabilities()->set_type(
+        FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+  }
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.allocation_interval = Milliseconds(5);
+  masterFlags.roles = frameworkInfo.role();
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  slaveFlags.resources = "cpus:8;disk:512";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  // We use the filter explicitly here so that the resources will not
+  // be filtered for 5 seconds (the default).
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  Resources unreservedCpus = Resources::parse("cpus:8").get();
+  Resources unreservedDisk = Resources::parse("disk:512").get();
+
+  Resources reservedCpus =
+    unreservedCpus.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.role(), frameworkInfo.principal()));
+
+  Resources reservedDisk =
+    unreservedDisk.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.role(), frameworkInfo.principal()));
+
+  Resources volume = createPersistentVolume(
+      createDiskResource("512", DEFAULT_TEST_ROLE, None(), None()),
+      "id1",
+      "path1",
+      frameworkInfo.principal(),
+      frameworkInfo.principal());
+
+  // We use this to capture offers from 'resourceOffers'.
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  // The expectation for the first offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  // In the first offer, expect an offer with unreserved resources.
+  AWAIT_READY(offers);
+
+  ASSERT_EQ(1u, offers->size());
+  Offer offer = offers->front();
+
+  EXPECT_TRUE(inboundResources(offer.resources())
+                .contains(allocatedResources(
+                    unreservedCpus + unreservedDisk, frameworkInfo.role())));
+
+  // The expectation for the next offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  // We don't use the `RESERVE` helper function here currently because it
+  // takes `Resources` as its parameter, and the result of `outboundResources`
+  // may be in the "pre-reservation-refinement" format.
+  Offer::Operation reserve;
+  reserve.set_type(Offer::Operation::RESERVE);
+  reserve.mutable_reserve()->mutable_resources()->CopyFrom(
+      outboundResources(reservedCpus + reservedDisk));
+
+  // Reserve the resources.
+  driver.acceptOffers({offer.id()}, {reserve}, filters);
+
+  // In the next offer, expect an offer with reserved resources.
+  AWAIT_READY(offers);
+
+  ASSERT_EQ(1u, offers->size());
+  offer = offers->front();
+
+  EXPECT_TRUE(inboundResources(offer.resources())
+                .contains(allocatedResources(
+                    reservedCpus + reservedDisk, frameworkInfo.role())));
+
+  // The expectation for the next offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  // We don't use the `CREATE` helper function here currently because it
+  // takes `Resources` as its parameter, and the result of `outboundResources`
+  // may be in the "pre-reservation-refinement" format.
+  Offer::Operation create;
+  create.set_type(Offer::Operation::CREATE);
+  create.mutable_create()->mutable_volumes()->CopyFrom(
+      outboundResources(volume));
+
+  // Create a volume.
+  driver.acceptOffers({offer.id()}, {create}, filters);
+
+  // In the next offer, expect an offer with reserved resources.
+  AWAIT_READY(offers);
+
+  ASSERT_EQ(1u, offers->size());
+  offer = offers->front();
+
+  EXPECT_TRUE(inboundResources(offer.resources())
+                .contains(allocatedResources(
+                    reservedCpus + volume, frameworkInfo.role())));
+
+  // The expectation for the next offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  // We don't use the `DESTROY` helper function here currently because it
+  // takes `Resources` as its parameter, and the result of `outboundResources`
+  // may be in the "pre-reservation-refinement" format.
+  Offer::Operation destroy;
+  destroy.set_type(Offer::Operation::DESTROY);
+  destroy.mutable_destroy()->mutable_volumes()->CopyFrom(
+      outboundResources(volume));
+
+  // Destroy the volume.
+  driver.acceptOffers({offer.id()}, {destroy}, filters);
+
+  // In the next offer, expect an offer with unreserved resources.
+  AWAIT_READY(offers);
+
+  ASSERT_EQ(1u, offers->size());
+  offer = offers.get()[0];
+
+  EXPECT_TRUE(inboundResources(offer.resources())
+                .contains(allocatedResources(
+                    reservedCpus + reservedDisk, frameworkInfo.role())));
+
+  // The expectation for the next offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  // We don't use the `UNRESERVE` helper function here currently because it
+  // takes `Resources` as its parameter, and the result of `outboundResources`
+  // may be in the "pre-reservation-refinement" format.
+  Offer::Operation unreserve;
+  unreserve.set_type(Offer::Operation::UNRESERVE);
+  unreserve.mutable_unreserve()->mutable_resources()->CopyFrom(
+      outboundResources(reservedCpus + reservedDisk));
+
+  // Unreserve the resources.
+  driver.acceptOffers({offer.id()}, {unreserve}, filters);
+
+  // In the next offer, expect an offer with unreserved resources.
+  AWAIT_READY(offers);
+
+  ASSERT_EQ(1u, offers->size());
+  offer = offers.get()[0];
+
+  EXPECT_TRUE(inboundResources(offer.resources())
+                .contains(allocatedResources(
+                    unreservedCpus + unreservedDisk, frameworkInfo.role())));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that hitting the `/state` endpoint before '_accept()'
+// is called results in pending tasks being reported correctly.
+TEST_P(MasterTestPrePostReservationRefinement, StateEndpointPendingTasks)
+{
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  frameworkInfo.clear_capabilities();
+
+  if (GetParam()) {
+    frameworkInfo.add_capabilities()->set_type(
+        FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+  }
+
+  MockAuthorizer authorizer;
+  Try<Owned<cluster::Master>> master = StartMaster(&authorizer);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Offer offer = offers->front();
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // Return a pending future from authorizer.
+  Future<Nothing> authorize;
+  Promise<bool> promise;
+  EXPECT_CALL(authorizer, authorized(_))
+    .WillOnce(DoAll(FutureSatisfy(&authorize),
+                    Return(promise.future())));
+
+  driver.launchTasks(offer.id(), {task});
+
+  // Wait until authorization is in progress.
+  AWAIT_READY(authorize);
+
+  Future<Response> response = process::http::get(
+      master.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+
+  JSON::Value result = parse.get();
+
+  JSON::Object expected = {
+    {
+      "frameworks",
+      JSON::Array {
+        JSON::Object {
+          {
+            "tasks",
+            JSON::Array {
+              JSON::Object {
+                { "id", "1" },
+                { "role", frameworkInfo.role() },
+                { "state", "TASK_STAGING" }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  EXPECT_TRUE(result.contains(expected));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that an operator can reserve and unreserve
+// resources through the master operator API in both
+// "(pre|post)-reservation-refinement" formats.
+TEST_P(MasterTestPrePostReservationRefinement, ReserveAndUnreserveResourcesV1)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // For capturing the SlaveID.
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+  SlaveID slaveId = slaveRegisteredMessage->slave_id();
+
+  v1::master::Call v1ReserveResourcesCall;
+  v1ReserveResourcesCall.set_type(v1::master::Call::RESERVE_RESOURCES);
+  v1::master::Call::ReserveResources* reserveResources =
+    v1ReserveResourcesCall.mutable_reserve_resources();
+
+  Resources unreserved = Resources::parse("cpus:1;mem:512").get();
+  Resources dynamicallyReserved =
+    unreserved.pushReservation(createDynamicReservationInfo(
+        DEFAULT_TEST_ROLE, DEFAULT_CREDENTIAL.principal()));
+
+  reserveResources->mutable_agent_id()->CopyFrom(evolve(slaveId));
+  reserveResources->mutable_resources()->CopyFrom(
+      evolve<v1::Resource>(outboundResources(dynamicallyReserved)));
+
+  ContentType contentType = ContentType::PROTOBUF;
+
+  Future<Response> v1ReserveResourcesResponse = process::http::post(
+    master.get()->pid,
+    "api/v1",
+    createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+    serialize(contentType, v1ReserveResourcesCall),
+    stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      Accepted().status, v1ReserveResourcesResponse);
+
+  v1::master::Call v1UnreserveResourcesCall;
+  v1UnreserveResourcesCall.set_type(v1::master::Call::UNRESERVE_RESOURCES);
+  v1::master::Call::UnreserveResources* unreserveResources =
+    v1UnreserveResourcesCall.mutable_unreserve_resources();
+
+  unreserveResources->mutable_agent_id()->CopyFrom(evolve(slaveId));
+
+  unreserveResources->mutable_resources()->CopyFrom(
+      evolve<v1::Resource>(outboundResources(dynamicallyReserved)));
+
+  Future<Response> v1UnreserveResourcesResponse = process::http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1UnreserveResourcesCall),
+      stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      Accepted().status, v1UnreserveResourcesResponse);
+}
+
+
+// This test verifies that an operator can create and destroy
+// persistent volumes through the master operator API in both
+// "(pre|post)-reservation-refinement" formats.
+TEST_P(MasterTestPrePostReservationRefinement, CreateAndDestroyVolumesV1)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // For capturing the SlaveID so we can use it in the create/destroy volumes
+  // API call.
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+  // Do Static reservation so we can create persistent volumes from it.
+  slaveFlags.resources = "disk(role1):1024";
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+  SlaveID slaveId = slaveRegisteredMessage->slave_id();
+
+  // Create the persistent volume.
+  v1::master::Call v1CreateVolumesCall;
+  v1CreateVolumesCall.set_type(v1::master::Call::CREATE_VOLUMES);
+  v1::master::Call_CreateVolumes* createVolumes =
+    v1CreateVolumesCall.mutable_create_volumes();
+
+  Resources volume = createPersistentVolume(
+      Megabytes(64),
+      "role1",
+      "id1",
+      "path1",
+      None(),
+      None(),
+      DEFAULT_CREDENTIAL.principal());
+
+  createVolumes->mutable_agent_id()->CopyFrom(evolve(slaveId));
+  createVolumes->mutable_volumes()->CopyFrom(
+      evolve<v1::Resource>(outboundResources(volume)));
+
+  ContentType contentType = ContentType::PROTOBUF;
+
+  Future<Response> v1CreateVolumesResponse = process::http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1CreateVolumesCall),
+      stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, v1CreateVolumesResponse);
+
+  // Destroy the persistent volume.
+  v1::master::Call v1DestroyVolumesCall;
+  v1DestroyVolumesCall.set_type(v1::master::Call::DESTROY_VOLUMES);
+  v1::master::Call_DestroyVolumes* destroyVolumes =
+    v1DestroyVolumesCall.mutable_destroy_volumes();
+
+  destroyVolumes->mutable_agent_id()->CopyFrom(evolve(slaveId));
+  destroyVolumes->mutable_volumes()->CopyFrom(
+      evolve<v1::Resource>(outboundResources(volume)));
+
+  Future<Response> v1DestroyVolumesResponse = process::http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1DestroyVolumesCall),
+      stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, v1DestroyVolumesResponse);
 }
 
 } // namespace tests {

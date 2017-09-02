@@ -157,7 +157,7 @@ protected:
   // Creates a disk with / without a `source` based on the
   // parameterization of the test. `id` influences the `root` if one
   // is specified so that we can create multiple disks in the tests.
-  Resource getDiskResource(const Megabytes& mb, size_t id = 1)
+  Resource getDiskResource(const Bytes& mb, size_t id = 1)
   {
     CHECK_LE(1u, id);
     CHECK_GE(NUM_DISKS, id);
@@ -402,7 +402,7 @@ TEST_P(PersistentVolumeTest, CreateAndDestroyPersistentVolumes)
 
     Try<list<string>> files = ::fs::list(path::join(volume1Path, "*"));
     ASSERT_SOME(files);
-    EXPECT_EQ(0u, files->size());
+    EXPECT_TRUE(files->empty());
   } else {
     EXPECT_FALSE(os::exists(volume1Path));
   }
@@ -478,7 +478,13 @@ TEST_P(PersistentVolumeTest, ResourcesCheckpointing)
   ASSERT_SOME(slave);
 
   AWAIT_READY(reregisterSlave);
-  EXPECT_EQ(Resources(reregisterSlave->checkpointed_resources()), volume);
+
+  google::protobuf::RepeatedPtrField<Resource> checkpointedResources =
+    reregisterSlave->checkpointed_resources();
+
+  convertResourceFormat(&checkpointedResources, POST_RESERVATION_REFINEMENT);
+
+  EXPECT_EQ(Resources(checkpointedResources), volume);
 
   driver.stop();
   driver.join();
@@ -895,7 +901,7 @@ TEST_P(PersistentVolumeTest, AccessPersistentVolume)
 
     Try<list<string>> files = ::fs::list(path::join(volumePath, "*"));
     CHECK_SOME(files);
-    EXPECT_EQ(0u, files->size());
+    EXPECT_TRUE(files->empty());
   } else {
     EXPECT_FALSE(os::exists(volumePath));
   }
@@ -2157,6 +2163,8 @@ TEST_P(PersistentVolumeTest, GoodACLNoPrincipal)
   frameworkInfo.set_name("no-principal");
   frameworkInfo.set_user(os::user().get());
   frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
   // Create a master. Since the framework has no
   // principal, we don't authenticate frameworks.
@@ -2313,6 +2321,8 @@ TEST_P(PersistentVolumeTest, BadACLNoPrincipal)
   frameworkInfo1.set_name("no-principal");
   frameworkInfo1.set_user(os::user().get());
   frameworkInfo1.set_role(DEFAULT_TEST_ROLE);
+  frameworkInfo1.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
   // Create a `FrameworkInfo` with a principal.
   FrameworkInfo frameworkInfo2 = DEFAULT_FRAMEWORK_INFO;
@@ -2540,6 +2550,8 @@ TEST_P(PersistentVolumeTest, BadACLDropCreateAndDestroy)
   frameworkInfo2.set_user(os::user().get());
   frameworkInfo2.set_role(DEFAULT_TEST_ROLE);
   frameworkInfo2.set_principal("creator-principal");
+  frameworkInfo2.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
 
   // Create a master.
   master::Flags masterFlags = CreateMasterFlags();

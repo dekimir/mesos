@@ -33,6 +33,8 @@
 #include <stout/error.hpp>
 #include <stout/option.hpp>
 
+#include "common/protobuf_utils.hpp"
+
 namespace mesos {
 namespace internal {
 namespace master {
@@ -261,11 +263,14 @@ namespace operation {
 Option<Error> validate(
     const Offer::Operation::Reserve& reserve,
     const Option<process::http::authentication::Principal>& principal,
+    const protobuf::slave::Capabilities& agentCapabilities,
     const Option<FrameworkInfo>& frameworkInfo = None());
 
 
 // Validates the UNRESERVE operation.
-Option<Error> validate(const Offer::Operation::Unreserve& unreserve);
+Option<Error> validate(
+    const Offer::Operation::Unreserve& unreserve,
+    const Option<FrameworkInfo>& frameworkInfo = None());
 
 
 // Validates the CREATE operation. We need slave's checkpointed resources so
@@ -278,6 +283,7 @@ Option<Error> validate(
     const Offer::Operation::Create& create,
     const Resources& checkpointedResources,
     const Option<process::http::authentication::Principal>& principal,
+    const protobuf::slave::Capabilities& agentCapabilities,
     const Option<FrameworkInfo>& frameworkInfo = None());
 
 
@@ -289,7 +295,8 @@ Option<Error> validate(
     const Offer::Operation::Destroy& destroy,
     const Resources& checkpointedResources,
     const hashmap<FrameworkID, Resources>& usedResources,
-    const hashmap<FrameworkID, hashmap<TaskID, TaskInfo>>& pendingTasks);
+    const hashmap<FrameworkID, hashmap<TaskID, TaskInfo>>& pendingTasks,
+    const Option<FrameworkInfo>& frameworkInfo = None());
 
 } // namespace operation {
 

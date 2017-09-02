@@ -35,6 +35,8 @@
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 
+#include "common/resources_utils.hpp"
+
 #include "master/flags.hpp"
 #include "master/master.hpp"
 
@@ -347,9 +349,10 @@ TEST_F(MasterQuotaTest, SetRequestWithInvalidData)
   {
     Resources quotaResources = Resources::parse("cpus:4;mem:512").get();
 
-    Resource reserved = Resources::parse("disk", "128", ROLE1).get();
-    reserved.mutable_reservation()->CopyFrom(
-        createReservationInfo(DEFAULT_CREDENTIAL.principal()));
+    Resource reserved = createReservedResource(
+        "disk",
+        "128",
+        createDynamicReservationInfo(ROLE1, DEFAULT_CREDENTIAL.principal()));
 
     quotaResources += reserved;
 
@@ -405,7 +408,7 @@ TEST_F(MasterQuotaTest, SetExistingQuota)
 TEST_F(MasterQuotaTest, RemoveSingleQuota)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -506,7 +509,7 @@ TEST_F(MasterQuotaTest, Status)
     const Try<QuotaStatus> status = ::protobuf::parse<QuotaStatus>(parse.get());
     ASSERT_FALSE(status.isError());
 
-    EXPECT_EQ(0, status->infos().size());
+    EXPECT_TRUE(status->infos().empty());
   }
 
   // Send a quota request for the specified role.
@@ -545,8 +548,11 @@ TEST_F(MasterQuotaTest, Status)
     const Try<QuotaStatus> status = ::protobuf::parse<QuotaStatus>(parse.get());
     ASSERT_FALSE(status.isError());
 
+    RepeatedPtrField<Resource> guarantee = status->infos(0).guarantee();
+    convertResourceFormat(&guarantee, POST_RESERVATION_REFINEMENT);
+
     ASSERT_EQ(1, status->infos().size());
-    EXPECT_EQ(quotaResources, status->infos(0).guarantee());
+    EXPECT_EQ(quotaResources, guarantee);
   }
 }
 
@@ -574,7 +580,7 @@ TEST_F(MasterQuotaTest, Status)
 TEST_F(MasterQuotaTest, InsufficientResourcesSingleAgent)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -636,7 +642,7 @@ TEST_F(MasterQuotaTest, InsufficientResourcesSingleAgent)
 TEST_F(MasterQuotaTest, InsufficientResourcesMultipleAgents)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -713,7 +719,7 @@ TEST_F(MasterQuotaTest, InsufficientResourcesMultipleAgents)
 TEST_F(MasterQuotaTest, AvailableResourcesSingleAgent)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -763,7 +769,7 @@ TEST_F(MasterQuotaTest, AvailableResourcesSingleAgent)
 TEST_F(MasterQuotaTest, AvailableResourcesMultipleAgents)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -832,7 +838,7 @@ TEST_F(MasterQuotaTest, AvailableResourcesMultipleAgents)
 TEST_F(MasterQuotaTest, AvailableResourcesAfterRescinding)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
@@ -1068,7 +1074,7 @@ TEST_F(MasterQuotaTest, RecoverQuotaEmptyCluster)
   }
 
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   // Restart the master; configured quota should be recovered from the registry.
   master->reset();
@@ -1102,7 +1108,7 @@ TEST_F(MasterQuotaTest, RecoverQuotaEmptyCluster)
 TEST_F(MasterQuotaTest, NoAuthenticationNoAuthorization)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   // Disable http_readwrite authentication and authorization.
   // TODO(alexr): Setting master `--acls` flag to `ACLs()` or `None()` seems
@@ -1212,7 +1218,7 @@ TEST_F(MasterQuotaTest, UnauthenticatedQuotaRequest)
 TEST_F(MasterQuotaTest, AuthorizeGetUpdateQuotaRequests)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   // Setup ACLs so that only the default principal can modify quotas
   // for `ROLE1` and read status.
@@ -1322,7 +1328,7 @@ TEST_F(MasterQuotaTest, AuthorizeGetUpdateQuotaRequests)
     const Try<QuotaStatus> status = ::protobuf::parse<QuotaStatus>(parse.get());
     ASSERT_FALSE(status.isError());
 
-    EXPECT_EQ(0, status->infos().size());
+    EXPECT_TRUE(status->infos().empty());
   }
 
   // Get the previous requested quota using default principal, which is
@@ -1776,7 +1782,7 @@ TEST_F(MasterQuotaTest, DISABLED_ChildRoleDeleteParentQuota)
 TEST_F(MasterQuotaTest, DISABLED_ClusterCapacityWithNestedRoles)
 {
   TestAllocator<> allocator;
-  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
   Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);

@@ -86,6 +86,12 @@ v1::AgentInfo evolve(const SlaveInfo& slaveInfo)
 }
 
 
+v1::DomainInfo evolve(const DomainInfo& domainInfo)
+{
+  return evolve<v1::DomainInfo>(domainInfo);
+}
+
+
 v1::ExecutorID evolve(const ExecutorID& executorId)
 {
   return evolve<v1::ExecutorID>(executorId);
@@ -222,6 +228,19 @@ v1::maintenance::Schedule evolve(const maintenance::Schedule& schedule)
 v1::master::Response evolve(const mesos::master::Response& response)
 {
   return evolve<v1::master::Response>(response);
+}
+
+
+v1::resource_provider::Call evolve(const mesos::resource_provider::Call& call)
+{
+  return evolve<v1::resource_provider::Call>(call);
+}
+
+
+v1::resource_provider::Event evolve(
+    const mesos::resource_provider::Event& event)
+{
+  return evolve<v1::resource_provider::Event>(event);
 }
 
 

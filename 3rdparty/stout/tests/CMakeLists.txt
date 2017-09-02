@@ -33,6 +33,7 @@ set(STOUT_ROOT_TESTS_SRC
   ip_tests.cpp
   json_tests.cpp
   jsonify_tests.cpp
+  lambda_tests.cpp
   linkedhashmap_tests.cpp
   mac_tests.cpp
   main.cpp
@@ -51,6 +52,7 @@ set(STOUT_ROOT_TESTS_SRC
   subcommand_tests.cpp
   try_tests.cpp
   uuid_tests.cpp
+  variant_tests.cpp
   version_tests.cpp
   )
 
@@ -61,7 +63,7 @@ if (NOT WIN32)
     protobuf_tests.pb.cc
     svn_tests.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 set(STOUT_OS_TESTS_SRC
   ${STOUT_OS_TESTS_SRC}
@@ -80,11 +82,11 @@ if (NOT WIN32)
     os/sendfile_tests.cpp
     os/signals_tests.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 if (LINUX)
   set(STOUT_ROOT_TESTS_SRC ${STOUT_ROOT_TESTS_SRC} proc_tests.cpp)
-endif (LINUX)
+endif ()
 
 set(STOUT_TESTS_SRC
   ${STOUT_TESTS_SRC}
@@ -98,11 +100,22 @@ set(STOUT_TESTS_SRC
 #############################################################################
 include_directories(SYSTEM ${STOUT_TEST_3RDPARTY_INCLUDE_DIRS})
 include_directories(${STOUT_INCLUDE_DIRS})
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 
 # LINKING LIBRARIES BY DIRECTORY (might generate, e.g., -L/path/to/thing on
 # Linux).
 ###########################################################################
 link_directories(${STOUT_TEST_LIB_DIRS})
+
+# THE C++ PROTOCOL BUFFER CODE (protobuf_tests.pb.h and protobuf_tests.pb.cc).
+##############################################################################
+add_custom_command(
+  OUTPUT protobuf_tests.pb.h protobuf_tests.pb.cc
+  COMMAND ${PROTOC}
+    -I${CMAKE_SOURCE_DIR}/3rdparty/stout/tests
+    --cpp_out=.
+    ${CMAKE_SOURCE_DIR}/3rdparty/stout/tests/protobuf_tests.proto
+  DEPENDS ${CMAKE_SOURCE_DIR}/3rdparty/stout/tests/protobuf_tests.proto)
 
 # THE STOUT TEST EXECUTABLE (generates, e.g., stout-tests, etc., on Linux).
 ###########################################################################

@@ -20,6 +20,7 @@
 
 #include <mesos/slave/container_logger.hpp>
 
+#include <process/io.hpp>
 #include <process/future.hpp>
 #include <process/gmock.hpp>
 #include <process/owned.hpp>
@@ -76,6 +77,21 @@ using testing::DoDefault;
 using testing::Eq;
 using testing::Invoke;
 using testing::Return;
+
+constexpr char DOCKER_IPv6_NETWORK[] = "mesos-docker-ip6-test";
+
+namespace process {
+
+// We need to reinitialize libprocess in order to test against
+// different configurations, such as when libprocess is initialized
+// with SSL or IPv6 enabled.
+void reinitialize(
+    const Option<string>& delegate,
+    const Option<string>& readonlyAuthenticationRealm,
+    const Option<string>& readwriteAuthenticationRealm);
+
+} // namespace process {
+
 
 namespace mesos {
 namespace internal {
@@ -219,7 +235,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch_Executor)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -345,7 +361,7 @@ TEST_F(DockerContainerizerTest, DISABLED_ROOT_DOCKER_Launch_Executor_Bridged)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -463,7 +479,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -613,7 +629,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Kill)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -741,7 +757,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_TaskKillingCapability)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -862,7 +878,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -1008,7 +1024,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Update)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -1448,7 +1464,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_SkipRecoverNonDocker)
 
   // A MesosContainerizer task shouldn't be recovered by
   // DockerContainerizer.
-  EXPECT_EQ(0u, containers->size());
+  EXPECT_TRUE(containers->empty());
 }
 
 
@@ -1592,7 +1608,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_LaunchWithPersistentVolumes)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -1752,7 +1768,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_RecoverPersistentVolumes)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -1916,7 +1932,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_RecoverOrphanedPersistentVolumes)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2080,7 +2096,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Logs)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2220,7 +2236,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Default_CMD)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2353,7 +2369,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Default_CMD_Override)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2491,7 +2507,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Default_CMD_Args)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2631,7 +2647,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_SlaveRecoveryTaskContainer)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2792,7 +2808,7 @@ TEST_F(DockerContainerizerTest,
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2963,7 +2979,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_NC_PortMapping)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3113,7 +3129,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_LaunchSandboxWithColon)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3230,7 +3246,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_DestroyWhileFetching)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3350,7 +3366,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_DestroyWhilePulling)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3489,7 +3505,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_ExecutorCleanupWhenLaunchFailed)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3597,7 +3613,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_FetchFailure)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3708,7 +3724,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_DockerPullFailure)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3828,7 +3844,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_DockerInspectDiscard)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -4114,7 +4130,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_CGROUPS_CFS_CgroupsEnableCFS)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  ASSERT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -4190,6 +4206,757 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_CGROUPS_CFS_CgroupsEnableCFS)
 }
 #endif // __linux__
 
+
+// Run a task as non root while inheriting this ownership from the
+// framework supplied default user. Tests if the sandbox "stdout"
+// is correctly owned and writeable by the tasks user.
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_Non_Root_Sandbox)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Shared<Docker> docker(
+      new MockDocker(tests::flags.docker, tests::flags.docker_socket));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.switch_user = true;
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+  SlaveID slaveId = slaveRegisteredMessage.get().slave_id();
+
+  FrameworkInfo framework;
+  framework.set_name("default");
+  framework.set_user("nobody");
+  framework.set_principal(DEFAULT_CREDENTIAL.principal());
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, framework, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->CopyFrom(offer.slave_id());
+  task.mutable_resources()->CopyFrom(offer.resources());
+
+  // Start the task as a user without supplying an explicit command
+  // user. This should inherit the framework user for the task
+  // ownership.
+  CommandInfo* command = task.mutable_command();
+  command->set_value("echo \"foo\" && sleep 1000");
+
+  ContainerInfo* containerInfo = task.mutable_container();
+  containerInfo->set_type(ContainerInfo::DOCKER);
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo* dockerInfo = containerInfo->mutable_docker();
+  dockerInfo->set_image("alpine");
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  ASSERT_TRUE(exists(docker, containerId.get()));
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+
+  ASSERT_FALSE(
+    exists(docker, containerId.get(), ContainerState::RUNNING));
+
+  // Check that the sandbox was written to.
+  const string sandboxDirectory = slave::paths::getExecutorRunPath(
+      flags.work_dir,
+      slaveId,
+      frameworkId.get(),
+      statusRunning->executor_id(),
+      containerId.get());
+
+  ASSERT_TRUE(os::exists(sandboxDirectory));
+
+  // Check the sandbox "stdout" was written to.
+  const string stdoutPath = path::join(sandboxDirectory, "stdout");
+  ASSERT_TRUE(os::exists(stdoutPath));
+
+  // Check the sandbox "stdout" is owned by the framework default user.
+  struct stat stdoutStat;
+  ASSERT_GE(::stat(stdoutPath.c_str(), &stdoutStat), 0);
+
+  Result<uid_t> uid = os::getuid(framework.user());
+  ASSERT_SOME(uid);
+
+  ASSERT_EQ(stdoutStat.st_uid, uid.get());
+
+  // Validate that our task was able to log into the sandbox.
+  Result<string> stdout = os::read(stdoutPath);
+  ASSERT_SOME(stdout);
+
+  EXPECT_TRUE(strings::contains(stdout.get(), "foo"));
+}
+
+
+// This test verifies the DNS configuration of the Docker container
+// can be successfully set with the agent flag `--default_container_dns`.
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_DefaultDNS)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+  Try<ContainerDNSInfo> parse = flags::parse<ContainerDNSInfo>(
+      R"~(
+      {
+        "docker": [
+          {
+            "network_mode": "BRIDGE",
+            "dns": {
+              "nameservers": [ "8.8.8.8", "8.8.4.4" ],
+              "search": [ "example1.com", "example2.com" ],
+              "options": [ "timeout:3", "attempts:2" ]
+            }
+          }
+        ]
+      })~");
+
+  ASSERT_SOME(parse);
+
+  flags.default_container_dns = parse.get();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->CopyFrom(offer.slave_id());
+  task.mutable_resources()->CopyFrom(offer.resources());
+
+  CommandInfo command;
+  command.set_value("sleep 1000");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("alpine");
+  dockerInfo.set_network(ContainerInfo::DockerInfo::BRIDGE);
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  task.mutable_command()->CopyFrom(command);
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  ASSERT_TRUE(statusRunning->has_data());
+
+  // Find the DNS configuration of the container and verify
+  // if it is consistent with `flags.default_container_dns`.
+  string name = containerName(containerId.get());
+  Future<Docker::Container> inspect = docker->inspect(name);
+  AWAIT_READY(inspect);
+
+  vector<string> defaultDNS;
+  std::copy(
+      flags.default_container_dns->docker(0).dns().nameservers().begin(),
+      flags.default_container_dns->docker(0).dns().nameservers().end(),
+      std::back_inserter(defaultDNS));
+
+  EXPECT_EQ(inspect->dns, defaultDNS);
+
+  vector<string> defaultDNSSearch;
+  std::copy(
+      flags.default_container_dns->docker(0).dns().search().begin(),
+      flags.default_container_dns->docker(0).dns().search().end(),
+      std::back_inserter(defaultDNSSearch));
+
+  EXPECT_EQ(inspect->dnsSearch, defaultDNSSearch);
+
+  vector<string> defaultDNSOption;
+  std::copy(
+      flags.default_container_dns->docker(0).dns().options().begin(),
+      flags.default_container_dns->docker(0).dns().options().end(),
+      std::back_inserter(defaultDNSOption));
+
+  EXPECT_EQ(inspect->dnsOptions, defaultDNSOption);
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+}
+
+
+// Fixture for testing IPv6 support for docker containers on host network.
+//
+// TODO(asridharan): Currently in the `Setup` and `TearDown` methods
+// of this class we re-initialize libprocess to take an IPv6 address.
+// Ideally, we should be moving this into a more general test fixture
+// in mesos.hpp to be used by any other tests for IPv6. This might
+// need changes to `MesosTest` in to order to allow for multiple
+// inheritance.
+class DockerContainerizerIPv6Test : public DockerContainerizerTest
+{
+protected:
+  virtual void SetUp()
+  {
+    os::setenv("LIBPROCESS_IP6", "::1234");
+    process::reinitialize(
+        None(),
+        READWRITE_HTTP_AUTHENTICATION_REALM,
+        READONLY_HTTP_AUTHENTICATION_REALM);
+
+    DockerContainerizerTest::SetUp();
+  }
+
+  virtual void TearDown()
+  {
+    DockerContainerizerTest::TearDown();
+
+    os::unsetenv("LIBPROCESS_IP6");
+    process::reinitialize(
+        None(),
+        READWRITE_HTTP_AUTHENTICATION_REALM,
+        READONLY_HTTP_AUTHENTICATION_REALM);
+  }
+};
+
+
+// Launches a docker container on the host network. The host network
+// is assumed to have an IPv4 address and an IPv6 address. The test
+// passes if the Mesos state correctly exposes both the IPv4 and IPv6
+// address.
+TEST_F(DockerContainerizerIPv6Test, ROOT_DOCKER_LaunchIPv6HostNetwork)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+
+  ASSERT_SOME(slave);
+
+  // Check if the slave has the IPv6 address stored in its PID.
+  EXPECT_SOME(slave.get()->pid.addresses.v6);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      SLEEP_COMMAND(10000));
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("alpine");
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  ASSERT_TRUE(statusRunning->has_data());
+
+  Try<JSON::Array> array = JSON::parse<JSON::Array>(statusRunning->data());
+  ASSERT_SOME(array);
+
+  // Check if container information is exposed through master's state endpoint.
+  Future<http::Response> response = http::get(
+      master.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Value> find = parse->find<JSON::Value>(
+      "frameworks[0].tasks[0].container.docker.privileged");
+
+  EXPECT_SOME_FALSE(find);
+
+  // Check if container information is exposed through slave's state endpoint.
+  response = http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
+
+  parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+
+  find = parse->find<JSON::Value>(
+      "frameworks[0].executors[0].tasks[0].container.docker.privileged");
+
+  EXPECT_SOME_FALSE(find);
+
+  // Now verify the ContainerStatus fields in the TaskStatus.
+  ASSERT_TRUE(statusRunning->has_container_status());
+  EXPECT_TRUE(statusRunning->container_status().has_container_id());
+  ASSERT_EQ(1, statusRunning->container_status().network_infos().size());
+  EXPECT_EQ(2, statusRunning->container_status().network_infos(0).ip_addresses().size()); // NOLINT(whitespace/line_length)
+
+  Option<string> containerIPv4 = None();
+  Option<string> containerIPv6 = None();
+
+  foreach(const NetworkInfo::IPAddress& ipAddress,
+          statusRunning->container_status().network_infos(0).ip_addresses()) {
+    if (ipAddress.protocol() == NetworkInfo::IPv4) {
+      containerIPv4 = ipAddress.ip_address();
+    }
+
+    if (ipAddress.protocol() == NetworkInfo::IPv6) {
+      containerIPv6 = ipAddress.ip_address();
+    }
+  }
+
+  EXPECT_SOME(containerIPv4);
+  ASSERT_SOME(containerIPv6);
+  EXPECT_EQ(containerIPv6.get(), "::1234");
+
+  ASSERT_TRUE(exists(docker, containerId.get()));
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+
+  ASSERT_FALSE(
+    exists(docker, containerId.get(), ContainerState::RUNNING));
+}
+
+
+// Fixture for testing IPv6 support for docker containers on docker
+// user network.
+class DockerContainerizerIPv6UserNetworkTest : public DockerContainerizerTest
+{
+protected:
+  virtual void SetUp()
+  {
+    DockerContainerizerTest::SetUp();
+
+    Try<string> dockerCommand = strings::format(
+        "docker network create --driver=bridge --ipv6 "
+        "--subnet=fd01::/64 %s",
+        DOCKER_IPv6_NETWORK);
+
+    Try<Subprocess> s = subprocess(
+        dockerCommand.get(),
+        Subprocess::PATH("/dev/null"),
+        Subprocess::PATH("/dev/null"),
+        Subprocess::PIPE());
+
+    ASSERT_SOME(s) << "Unable to create the docker IPv6 network: "
+                   << DOCKER_IPv6_NETWORK;
+
+    Future<string> err = io::read(s->err().get());
+
+    // Wait for the network to be created.
+    AWAIT_READY(s->status());
+    AWAIT_READY(err);
+
+    ASSERT_SOME(s->status().get());
+    ASSERT_EQ(s->status().get().get(), 0)
+      << "Unable to create the docker IPv6 network "
+      << DOCKER_IPv6_NETWORK
+      << " : " << err.get();
+  }
+
+  virtual void TearDown()
+  {
+    DockerContainerizerTest::TearDown();
+
+    Try<string> dockerCommand = strings::format(
+        "docker network rm %s",
+        DOCKER_IPv6_NETWORK);
+
+    Try<Subprocess> s = subprocess(
+        dockerCommand.get(),
+        Subprocess::PATH("/dev/null"),
+        Subprocess::PATH("/dev/null"),
+        Subprocess::PIPE());
+
+    // This is best effort cleanup. In case of an error just a log an
+    // error.
+    ASSERT_SOME(s) << "Unable to delete the docker IPv6 network: "
+                   << DOCKER_IPv6_NETWORK;
+
+    Future<string> err = io::read(s->err().get());
+
+    // Wait for the network to be deleted.
+    AWAIT_READY(s->status());
+    AWAIT_READY(err);
+    ASSERT_SOME(s->status().get());
+
+    ASSERT_EQ(s->status().get().get(), 0)
+      << "Unable to delete the docker IPv6 network "
+      << DOCKER_IPv6_NETWORK
+      << " : " << err.get();
+  }
+};
+
+
+// Launches a docker container on the docker user network. The docker network
+// is assumed to have an IPv4 address and an IPv6 address. The test passes if
+// the Mesos state correctly exposes both the IPv4 and IPv6 address.
+TEST_F(
+    DockerContainerizerIPv6UserNetworkTest,
+    ROOT_DOCKER_USERNETWORK_LaunchIPv6Container)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher(flags);
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &dockerContainerizer, flags);
+
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      offer.resources(),
+      SLEEP_COMMAND(10000));
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("alpine");
+  dockerInfo.set_network(ContainerInfo::DockerInfo::USER);
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  // Setup the docker IPv6 network.
+  NetworkInfo networkInfo;
+  networkInfo.set_name(DOCKER_IPv6_NETWORK);
+  containerInfo.add_network_infos()->CopyFrom(networkInfo);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  ASSERT_TRUE(statusRunning->has_data());
+
+  // Now verify the ContainerStatus fields in the TaskStatus.
+  ASSERT_TRUE(statusRunning->has_container_status());
+  EXPECT_TRUE(statusRunning->container_status().has_container_id());
+  ASSERT_EQ(1, statusRunning->container_status().network_infos().size());
+  ASSERT_EQ(2, statusRunning->container_status().network_infos(0).ip_addresses().size()); // NOLINT(whitespace/line_length)
+
+  Option<string> containerIPv4 = None();
+  Option<string> containerIPv6 = None();
+
+  foreach(const NetworkInfo::IPAddress& ipAddress,
+          statusRunning->container_status().network_infos(0).ip_addresses()) {
+    if (ipAddress.protocol() == NetworkInfo::IPv4) {
+      containerIPv4 = ipAddress.ip_address();
+    }
+
+    if (ipAddress.protocol() == NetworkInfo::IPv6) {
+      containerIPv6 = ipAddress.ip_address();
+    }
+  }
+
+  ASSERT_SOME(containerIPv4);
+  ASSERT_SOME(containerIPv6);
+
+  // Check if container information is exposed through slave's state endpoint.
+  Future<http::Response> response = http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+
+  // Verify that the slave state information has the same container
+  // status as received in the status update message.
+  for (int i = 0; i < 2; i++) {
+    Result<JSON::String> protocol = parse->find<JSON::String>(
+        "frameworks[0].executors[0].tasks[0].statuses[0]"
+        ".container_status.network_infos[0].ip_addresses[" +
+        stringify(i) + "].protocol");
+
+    ASSERT_SOME(protocol);
+
+    Result<JSON::String> ip = parse->find<JSON::String>(
+        "frameworks[0].executors[0].tasks[0].statuses[0]"
+        ".container_status.network_infos[0].ip_addresses[" +
+        stringify(i) + "].ip_address");
+
+    ASSERT_SOME(ip);
+
+    if (protocol.get().value == "IPv4") {
+      EXPECT_EQ(ip.get().value, containerIPv4.get());
+    } else {
+      EXPECT_EQ(ip.get().value, containerIPv6.get());
+    }
+
+    LOG(INFO) << "IP: " << ip.get().value;
+  }
+
+  ASSERT_TRUE(exists(docker, containerId.get()));
+
+  Future<Option<ContainerTermination>> termination =
+    dockerContainerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+  EXPECT_SOME(termination.get());
+
+  ASSERT_FALSE(
+    exists(docker, containerId.get(), ContainerState::RUNNING));
+}
 } // namespace tests {
 } // namespace internal {
 } // namespace mesos {

@@ -45,6 +45,7 @@ public:
   Option<std::string> hostname;
   bool hostname_lookup;
   Option<std::string> resources;
+  Option<std::string> resource_provider_config_dir;
   std::string isolation;
   std::string launcher;
 
@@ -110,7 +111,9 @@ public:
   bool revocable_cpu_low_priority;
   bool systemd_enable_support;
   std::string systemd_runtime_directory;
-  Option<CapabilityInfo> allowed_capabilities;
+  Option<CapabilityInfo> effective_capabilities;
+  Option<CapabilityInfo> bounding_capabilities;
+  bool disallow_sharing_agent_pid_namespace;
 #endif
   Option<Firewall> firewall_rules;
   Option<Path> credential;
@@ -120,6 +123,7 @@ public:
   Option<std::string> docker_mesos_image;
   Duration docker_remove_delay;
   std::string sandbox_directory;
+  Option<ContainerDNSInfo> default_container_dns;
   Option<ContainerInfo> default_container_info;
 
   // TODO(alexr): Remove this after the deprecation cycle (started in 1.0).
@@ -166,6 +170,7 @@ public:
   std::string xfs_project_range;
 #endif
   bool http_command_executor;
+  Option<DomainInfo> domain;
 
   // The following flags are executable specific (e.g., since we only
   // have one instance of libprocess per execution, we only want to
@@ -177,9 +182,25 @@ public:
   Option<std::string> advertise_port;
   Option<std::string> master;
 
+  Duration zk_session_timeout;
+
   // Optional IP discover script that will set the slave's IP.
   // If set, its output is expected to be a valid parseable IP string.
   Option<std::string> ip_discovery_command;
+
+  // IPv6 flags.
+  //
+  // NOTE: These IPv6 flags are currently input mechanisms
+  // for the operator to specify v6 addresses on which containers
+  // running on host network can listen. Mesos itself doesn't listen
+  // or communicate over v6 addresses at this point.
+  Option<std::string> ip6;
+
+  // Similar to the `ip_discovery_command` this optional discover
+  // script is expected to output a valid IPv6 string. Only one of the
+  // two options `ip6` or `ip6_discovery_command` can be set at any
+  // given point of time.
+  Option<std::string> ip6_discovery_command;
 };
 
 } // namespace slave {

@@ -127,9 +127,9 @@ TEST_F(RoleTest, ImplicitRoleRegister)
   filters.set_refuse_seconds(0);
 
   Resources unreserved = Resources::parse("disk:1024").get();
-  Resources dynamicallyReserved = unreserved.flatten(
-      frameworkInfo.role(),
-      createReservationInfo(frameworkInfo.principal())).get();
+  Resources dynamicallyReserved =
+    unreserved.pushReservation(createDynamicReservationInfo(
+        frameworkInfo.role(), frameworkInfo.principal()));
 
   // We use this to capture offers from `resourceOffers`.
   Future<vector<Offer>> offers;
@@ -810,12 +810,10 @@ TEST_F(RoleTest, Validate)
   EXPECT_NONE(roles::validate("foo.bar"));
   EXPECT_NONE(roles::validate("foo..bar"));
   EXPECT_NONE(roles::validate("..."));
-
-  // TODO(neilc): These expectations will change when MESOS-7505 is fixed.
-  EXPECT_SOME(roles::validate("foo/bar"));
-  EXPECT_SOME(roles::validate("foo/.bar"));
-  EXPECT_SOME(roles::validate("foo/bar/baz"));
-  EXPECT_SOME(roles::validate("a/b/c/d/e/f/g/h"));
+  EXPECT_NONE(roles::validate("foo/bar"));
+  EXPECT_NONE(roles::validate("foo/.bar"));
+  EXPECT_NONE(roles::validate("foo/bar/baz"));
+  EXPECT_NONE(roles::validate("a/b/c/d/e/f/g/h"));
 
   EXPECT_SOME(roles::validate(""));
   EXPECT_SOME(roles::validate("."));
@@ -846,6 +844,16 @@ TEST_F(RoleTest, Validate)
   EXPECT_NONE(roles::validate({"foo", "bar", "*"}));
 
   EXPECT_SOME(roles::validate({"foo", ".", "*"}));
+}
+
+
+TEST_F(RoleTest, isStrictSubroleOf)
+{
+  EXPECT_TRUE(roles::isStrictSubroleOf("foo/bar", "foo"));
+  EXPECT_TRUE(roles::isStrictSubroleOf("foo/bar/baz", "foo"));
+  EXPECT_FALSE(roles::isStrictSubroleOf("foo", "foo"));
+  EXPECT_FALSE(roles::isStrictSubroleOf("bar", "foo"));
+  EXPECT_FALSE(roles::isStrictSubroleOf("foobar", "foo"));
 }
 
 
@@ -900,13 +908,10 @@ TEST_F(RoleTest, EndpointBadAuthentication)
 // subdirectory).
 //
 // TODO(bbannier): Figure out a way to run the test command on Windows.
-//
-// TODO(neilc): Re-enable this when MESOS-7505 is fixed.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(
-    RoleTest, DISABLED_VolumesInOverlappingHierarchies)
+TEST_F_TEMP_DISABLED_ON_WINDOWS(RoleTest, VolumesInOverlappingHierarchies)
 {
   constexpr char PATH[] = "path";
-  constexpr Megabytes DISK_SIZE(1);
+  constexpr Bytes DISK_SIZE = Megabytes(1);
 
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -926,7 +931,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   // persistent volume with the given id. The framework creates a task
   // using the volume and makes sure that no volumes from other roles
   // are leaked into the volume.
-  auto runTask = [&master, &PATH, DISK_SIZE](
+  auto runTask = [&master, &PATH](
       const string& role, const string& id) {
     FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
     frameworkInfo.set_role(role);
@@ -950,22 +955,18 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
 
     // Create a reserved disk. We only create a small disk so
     // we have remaining disk to offer to other frameworks.
-    Resource unreservedDisk = Resources::parse("disk", "1", "*").get();
-    Resource reservedDisk = unreservedDisk;
-    reservedDisk.set_role(role);
-    reservedDisk.mutable_reservation()->CopyFrom(
-        createReservationInfo(DEFAULT_CREDENTIAL.principal()));
+    Resource reservedDisk = createReservedResource(
+        "disk",
+        "1",
+        createDynamicReservationInfo(role, DEFAULT_CREDENTIAL.principal()));
 
     // Create a persistent volume on the reserved disk.
     Resource volume = createPersistentVolume(
-        createDiskResource(
-            stringify(DISK_SIZE.megabytes()), role, None(), None()),
+        reservedDisk,
         id,
         PATH,
-        None(),
+        DEFAULT_CREDENTIAL.principal(),
         frameworkInfo.principal());
-    volume.mutable_reservation()->CopyFrom(reservedDisk.reservation());
-    volume.set_role(reservedDisk.role());
 
     // Create a task which uses the volume and checks that
     // it contains no files leaked from another role.
@@ -1019,11 +1020,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
         role,
         id,
         PATH,
-        None(),
+        DEFAULT_CREDENTIAL.principal(),
         None(),
         DEFAULT_CREDENTIAL.principal());
-
-    volume.mutable_reservation()->set_principal(DEFAULT_CREDENTIAL.principal());
 
     v1::master::Call destroyVolumesCall;
     destroyVolumesCall.set_type(v1::master::Call::DESTROY_VOLUMES);

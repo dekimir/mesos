@@ -67,13 +67,25 @@ message Call {
   }
 
   // Request to subscribe with the master.
+  //
+  // TODO(bbannier): Once we have implemented a call to update a
+  // resource provider, consider removing resources here and instead
+  // moving to a protocol where a resource provider first subscribes
+  // and then updates its resources.
   message Subscribe {
     required ResourceProviderInfo resource_provider_info = 1;
+    repeated Resource resources = 2;
   }
 
   // Notify the master about the status of an operation.
   message Update {
     enum State {
+      // This must be the first enum value in this list, to
+      // ensure that if 'state' is not set, the default value
+      // is UNKNOWN. This enables enum values to be added
+      // in a backwards-compatible way. See: MESOS-4997.
+      UNKNOWN = 0;
+
       OK = 1;
       FAILED = 2;
     }
@@ -83,7 +95,17 @@ message Call {
     repeated Resource converted_resources = 3;
   }
 
-  optional Type type = 1;
-  optional Subscribe subscribe = 2;
-  optional Update update = 3;
+  // Identifies who generated this call.
+  // The 'ResourceProviderManager' assigns a resource provider ID when
+  // a new resource provider subscribes for the first time. Once
+  // assigned, the resource provider must set the 'resource_provider_id'
+  // here and within its 'ResourceProviderInfo' (in any further
+  // 'SUBSCRIBE' calls). This allows the 'ResourceProviderManager' to
+  // identify a resource provider correctly across disconnections,
+  // failovers, etc.
+  optional ResourceProviderID resource_provider_id = 1;
+
+  optional Type type = 2;
+  optional Subscribe subscribe = 3;
+  optional Update update = 4;
 }

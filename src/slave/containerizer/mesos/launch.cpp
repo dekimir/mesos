@@ -451,15 +451,18 @@ int MesosContainerizerLaunch::execute()
 
 #ifdef __linux__
   // Initialize capabilities support if necessary.
-  Try<Capabilities> capabilitiesManager = Error("Not initialized");
+  Option<Capabilities> capabilitiesManager = None();
 
-  if (launchInfo.has_capabilities()) {
-    capabilitiesManager = Capabilities::create();
-    if (capabilitiesManager.isError()) {
+  if (launchInfo.has_effective_capabilities() ||
+      launchInfo.has_bounding_capabilities()) {
+    Try<Capabilities> _capabilitiesManager = Capabilities::create();
+    if (_capabilitiesManager.isError()) {
       cerr << "Failed to initialize capabilities support: "
-           << capabilitiesManager.error() << endl;
+           << _capabilitiesManager.error() << endl;
       exitWithStatus(EXIT_FAILURE);
     }
+
+    capabilitiesManager = _capabilitiesManager.get();
 
     // Prevent clearing of capabilities on `setuid`.
     if (uid.isSome()) {
@@ -472,7 +475,8 @@ int MesosContainerizerLaunch::execute()
     }
   }
 #else
-  if (launchInfo.has_capabilities()) {
+  if (launchInfo.has_effective_capabilities() ||
+      launchInfo.has_bounding_capabilities()) {
     cerr << "Capabilities are not supported on non Linux system" << endl;
     exitWithStatus(EXIT_FAILURE);
   }
@@ -560,6 +564,39 @@ int MesosContainerizerLaunch::execute()
   }
 #endif // __WINDOWS__
 
+  if (launchInfo.has_working_directory()) {
+    // If working directory does not exist (e.g., being removed from
+    // the container image), create an empty directory even it may
+    // not be used. Please note that this case can only be possible
+    // if an image has 'WORKDIR' specified in its manifest but that
+    // 'WORKDIR' does not exist in the image's rootfs.
+    //
+    // TODO(gilbert): Set the proper ownership to this working
+    // directory to make sure a specified non-root user has the
+    // permission to write to this working directory. Right now
+    // it is owned by root, and any non-root user will fail to
+    // write to this directory. Please note that this is identical
+    // to the semantic as docker daemon. The semantic can be
+    // verified by:
+    // 'docker run -ti -u nobody quay.io/spinnaker/front50:master bash'
+    // The ownership of '/workdir' is root. Creating any file under
+    // '/workdir' will fail for 'Permission denied'.
+    Try<Nothing> mkdir = os::mkdir(launchInfo.working_directory());
+    if (mkdir.isError()) {
+      cerr << "Failed to create working directory "
+           << "'" << launchInfo.working_directory() << "': "
+           << mkdir.error() << endl;
+    }
+
+    Try<Nothing> chdir = os::chdir(launchInfo.working_directory());
+    if (chdir.isError()) {
+      cerr << "Failed to chdir into current working directory "
+           << "'" << launchInfo.working_directory() << "': "
+           << chdir.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
+    }
+  }
+
 #ifndef __WINDOWS__
   // Change user if provided. Note that we do that after executing the
   // preparation commands so that those commands will be run with the
@@ -589,7 +626,7 @@ int MesosContainerizerLaunch::execute()
 #endif // __WINDOWS__
 
 #ifdef __linux__
-  if (launchInfo.has_capabilities()) {
+  if (capabilitiesManager.isSome()) {
     Try<ProcessCapabilities> capabilities = capabilitiesManager->get();
     if (capabilities.isError()) {
       cerr << "Failed to get capabilities for the current process: "
@@ -597,9 +634,10 @@ int MesosContainerizerLaunch::execute()
       exitWithStatus(EXIT_FAILURE);
     }
 
-    // After 'setuid', 'effective' set is cleared. Since `SETPCAP` is
-    // required in the `effective` set of a process to change the
-    // bounding set, we need to restore it first.
+    // After 'setuid', the 'effective' set is cleared. Since `SETPCAP`
+    // is required in the `effective` set of a process to change the
+    // bounding set, we need to restore it first so we can make the
+    // final capability changes.
     capabilities->add(capabilities::EFFECTIVE, capabilities::SETPCAP);
 
     Try<Nothing> setPcap = capabilitiesManager->set(capabilities.get());
@@ -609,13 +647,36 @@ int MesosContainerizerLaunch::execute()
       exitWithStatus(EXIT_FAILURE);
     }
 
-    // Set up requested capabilities.
-    set<Capability> target = capabilities::convert(launchInfo.capabilities());
+    // If the task has any effective capabilities, grant them to all
+    // the capability sets.
+    if (launchInfo.has_effective_capabilities()) {
+      set<Capability> target =
+        capabilities::convert(launchInfo.effective_capabilities());
 
-    capabilities->set(capabilities::EFFECTIVE, target);
-    capabilities->set(capabilities::PERMITTED, target);
-    capabilities->set(capabilities::INHERITABLE, target);
-    capabilities->set(capabilities::BOUNDING, target);
+      capabilities->set(capabilities::AMBIENT, target);
+      capabilities->set(capabilities::EFFECTIVE, target);
+      capabilities->set(capabilities::PERMITTED, target);
+      capabilities->set(capabilities::INHERITABLE, target);
+      capabilities->set(capabilities::BOUNDING, target);
+    }
+
+    // If we also have bounding capabilities, apply that in preference to
+    // the effective capabilities.
+    if (launchInfo.has_bounding_capabilities()) {
+      set<Capability> bounding =
+        capabilities::convert(launchInfo.bounding_capabilities());
+
+      capabilities->set(capabilities::BOUNDING, bounding);
+    }
+
+    // Force the inherited set to be the same as the bounding set. If we
+    // are root and capabilities have not been specified, then this is a
+    // no-op. If capabilities have been specified, then we need to clip the
+    // inherited set to prevent file-based capabilities granting privileges
+    // outside the bounding set.
+    capabilities->set(
+        capabilities::INHERITABLE,
+        capabilities->get(capabilities::BOUNDING));
 
     Try<Nothing> set = capabilitiesManager->set(capabilities.get());
     if (set.isError()) {
@@ -624,16 +685,6 @@ int MesosContainerizerLaunch::execute()
     }
   }
 #endif // __linux__
-
-  if (launchInfo.has_working_directory()) {
-    Try<Nothing> chdir = os::chdir(launchInfo.working_directory());
-    if (chdir.isError()) {
-      cerr << "Failed to chdir into current working directory "
-           << "'" << launchInfo.working_directory() << "': "
-           << chdir.error() << endl;
-      exitWithStatus(EXIT_FAILURE);
-    }
-  }
 
   // Prepare the executable and the argument list for the child.
   string executable(launchInfo.command().shell()
@@ -683,7 +734,7 @@ int MesosContainerizerLaunch::execute()
     // cause applications to not work, but upon overriding system defaults, it
     // becomes the overidder's problem.
     Option<std::map<std::wstring, std::wstring>> systemEnvironment =
-      process::internal::getSystemEnvironment();
+      ::internal::windows::get_system_env();
     foreachpair (const std::wstring& key,
                  const std::wstring& value,
                  systemEnvironment.get()) {
@@ -768,13 +819,31 @@ int MesosContainerizerLaunch::execute()
   }
 #endif // __WINDOWS__
 
+#ifndef __WINDOWS__
+  // Search executable in the current working directory as well.
+  // execvpe and execvp will only search executable from the current
+  // working directory if environment variable PATH is not set.
+  // TODO(aaron.wood): 'os::which' current does not work on Windows.
+  // Remove the ifndef guard once it's supported on Windows.
+  if (!path::absolute(executable) &&
+      launchInfo.has_working_directory()) {
+    Option<string> which = os::which(
+        executable,
+        launchInfo.working_directory());
+
+    if (which.isSome()) {
+      executable = which.get();
+    }
+  }
+#endif // __WINDOWS__
+
   if (envp.isSome()) {
     os::execvpe(executable.c_str(), argv, envp.get());
   } else {
     os::execvp(executable.c_str(), argv);
   }
 
-  // If we get here, the execle call failed.
+  // If we get here, the execvp call failed.
   cerr << "Failed to execute command: " << os::strerror(errno) << endl;
   exitWithStatus(EXIT_FAILURE);
   UNREACHABLE();

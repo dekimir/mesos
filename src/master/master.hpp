@@ -92,6 +92,7 @@ namespace mesos {
 
 // Forward declarations.
 class Authorizer;
+class ObjectApprover;
 
 namespace internal {
 
@@ -115,13 +116,13 @@ struct Role;
 struct Slave
 {
   Slave(Master* const _master,
-        const SlaveInfo& _info,
+        SlaveInfo _info,
         const process::UPID& _pid,
         const MachineID& _machineId,
         const std::string& _version,
         const std::vector<SlaveInfo::Capability>& _capabilites,
         const process::Time& _registeredTime,
-        const Resources& _checkpointedResources,
+        std::vector<Resource> _checkpointedResources,
         const std::vector<ExecutorInfo>& executorInfos =
           std::vector<ExecutorInfo>(),
         const std::vector<Task>& tasks =
@@ -305,6 +306,63 @@ struct HttpConnection
 };
 
 
+// This process periodically sends heartbeats to a given HTTP connection.
+// The `Message` template parameter is the type of the heartbeat event passed
+// into the heartbeater during construction, while the `Event` template
+// parameter is the versioned event type which is sent to the client.
+// The optional delay parameter is used to specify the delay period before it
+// sends the first heartbeat.
+template <typename Message, typename Event>
+class Heartbeater : public process::Process<Heartbeater<Message, Event>>
+{
+public:
+  Heartbeater(const std::string& _logMessage,
+              const Message& _heartbeatMessage,
+              const HttpConnection& _http,
+              const Duration& _interval,
+              const Option<Duration>& _delay = None())
+    : process::ProcessBase(process::ID::generate("heartbeater")),
+      logMessage(_logMessage),
+      heartbeatMessage(_heartbeatMessage),
+      http(_http),
+      interval(_interval),
+      delay(_delay) {}
+
+protected:
+  virtual void initialize() override
+  {
+    if (delay.isSome()) {
+      process::delay(
+          delay.get(),
+          this,
+          &Heartbeater<Message, Event>::heartbeat);
+    } else {
+      heartbeat();
+    }
+  }
+
+private:
+  void heartbeat()
+  {
+    // Only send a heartbeat if the connection is not closed.
+    if (http.closed().isPending()) {
+      VLOG(1) << "Sending heartbeat to " << logMessage;
+
+      Message message(heartbeatMessage);
+      http.send<Message, Event>(message);
+    }
+
+    process::delay(interval, this, &Heartbeater<Message, Event>::heartbeat);
+  }
+
+  const std::string logMessage;
+  const Message heartbeatMessage;
+  HttpConnection http;
+  const Duration interval;
+  const Option<Duration> delay;
+};
+
+
 class Master : public ProtobufProcess<Master>
 {
 public:
@@ -423,9 +481,7 @@ public:
       const ExecutorID& executorId,
       int32_t status);
 
-  void updateSlave(
-      const SlaveID& slaveId,
-      const Resources& oversubscribedResources);
+  void updateSlave(const UpdateSlaveMessage& message);
 
   void updateUnavailability(
       const MachineID& machineId,
@@ -555,7 +611,6 @@ protected:
 
   void ___reregisterSlave(
       Slave* slave,
-      const std::vector<Task>& tasks,
       const std::vector<FrameworkInfo>& frameworks);
 
   // 'future' is the future returned by the authenticator.
@@ -895,7 +950,9 @@ private:
       const process::Future<bool>& authorized);
 
   // Subscribes a client to the 'api/vX' endpoint.
-  void subscribe(const HttpConnection& http);
+  void subscribe(
+      const HttpConnection& http,
+      const Option<process::http::authentication::Principal>& principal);
 
   void teardown(Framework* framework);
 
@@ -1365,31 +1422,49 @@ private:
             principal) const;
 
     process::Future<process::http::Response> _teardown(
+        const FrameworkID& id,
+        const Option<process::http::authentication::Principal>&
+            principal) const;
+
+    process::Future<process::http::Response> __teardown(
         const FrameworkID& id) const;
 
     process::Future<process::http::Response> _updateMaintenanceSchedule(
-        const mesos::maintenance::Schedule& schedule) const;
+        const mesos::maintenance::Schedule& schedule,
+        const Option<process::http::authentication::Principal>&
+            principal) const;
 
-    mesos::maintenance::Schedule _getMaintenanceSchedule() const;
+    process::Future<process::http::Response> __updateMaintenanceSchedule(
+        const mesos::maintenance::Schedule& schedule,
+        const process::Owned<ObjectApprover>& approver) const;
 
-    process::Future<mesos::maintenance::ClusterStatus>
-      _getMaintenanceStatus() const;
+    process::Future<process::http::Response> ___updateMaintenanceSchedule(
+        const mesos::maintenance::Schedule& schedule,
+        bool applied) const;
+
+    mesos::maintenance::Schedule _getMaintenanceSchedule(
+        const process::Owned<ObjectApprover>& approver) const;
+
+    process::Future<mesos::maintenance::ClusterStatus> _getMaintenanceStatus(
+        const process::Owned<ObjectApprover>& approver) const;
 
     process::Future<process::http::Response> _startMaintenance(
-        const google::protobuf::RepeatedPtrField<MachineID>& machineIds) const;
+        const google::protobuf::RepeatedPtrField<MachineID>& machineIds,
+        const process::Owned<ObjectApprover>& approver) const;
 
     process::Future<process::http::Response> _stopMaintenance(
-        const google::protobuf::RepeatedPtrField<MachineID>& machineIds) const;
+        const google::protobuf::RepeatedPtrField<MachineID>& machineIds,
+        const process::Owned<ObjectApprover>& approver) const;
 
     process::Future<process::http::Response> _reserve(
         const SlaveID& slaveId,
-        const Resources& resources,
+        const google::protobuf::RepeatedPtrField<Resource>& resources,
         const Option<process::http::authentication::Principal>&
             principal) const;
 
     process::Future<process::http::Response> _unreserve(
         const SlaveID& slaveId,
-        const Resources& resources,
+        const google::protobuf::RepeatedPtrField<Resource>& resources,
         const Option<process::http::authentication::Principal>&
             principal) const;
 
@@ -1440,7 +1515,8 @@ private:
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
 
-    mesos::master::Response::GetAgents _getAgents() const;
+    mesos::master::Response::GetAgents _getAgents(
+        const process::Owned<AuthorizationAcceptor>& rolesAcceptor) const;
 
     process::Future<process::http::Response> getFlags(
         const mesos::master::Call& call,
@@ -1566,7 +1642,8 @@ private:
     mesos::master::Response::GetState _getState(
         const process::Owned<ObjectApprover>& frameworksApprover,
         const process::Owned<ObjectApprover>& taskApprover,
-        const process::Owned<ObjectApprover>& executorsApprover) const;
+        const process::Owned<ObjectApprover>& executorsApprover,
+        const process::Owned<AuthorizationAcceptor>& rolesAcceptor) const;
 
     process::Future<process::http::Response> subscribe(
         const mesos::master::Call& call,
@@ -1574,6 +1651,11 @@ private:
         ContentType contentType) const;
 
     process::Future<process::http::Response> readFile(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> teardown(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>& principal,
         ContentType contentType) const;
@@ -1595,6 +1677,8 @@ private:
   friend struct Framework;
   friend struct Metrics;
   friend struct Slave;
+  friend struct SlavesWriter;
+  friend struct Subscriber;
 
   // NOTE: Since 'getOffer', 'getInverseOffer' and 'slaves' are
   // protected, we need to make the following functions friends.
@@ -1814,12 +1898,38 @@ private:
     // might only be interested in a subset of events.
     struct Subscriber
     {
-      Subscriber(const HttpConnection& _http)
-        : http(_http) {}
+      Subscriber(
+          Master* _master,
+          const HttpConnection& _http,
+          const Option<process::http::authentication::Principal> _principal)
+        : master(_master),
+          http(_http),
+          principal(_principal)
+      {
+        mesos::master::Event event;
+        event.set_type(mesos::master::Event::HEARTBEAT);
+
+        heartbeater =
+          process::Owned<Heartbeater<mesos::master::Event, v1::master::Event>>(
+              new Heartbeater<mesos::master::Event, v1::master::Event>(
+                  "subscriber " + stringify(http.streamId),
+                  event,
+                  http,
+                  DEFAULT_HEARTBEAT_INTERVAL,
+                  DEFAULT_HEARTBEAT_INTERVAL));
+
+        process::spawn(heartbeater.get());
+      }
 
       // Not copyable, not assignable.
       Subscriber(const Subscriber&) = delete;
       Subscriber& operator=(const Subscriber&) = delete;
+
+      void send(const mesos::master::Event& event,
+          const process::Owned<AuthorizationAcceptor>& authorizeRole,
+          const process::Owned<AuthorizationAcceptor>& authorizeFramework,
+          const process::Owned<AuthorizationAcceptor>& authorizeTask,
+          const process::Owned<AuthorizationAcceptor>& authorizeExecutor);
 
       ~Subscriber()
       {
@@ -1828,9 +1938,16 @@ private:
         // after passing ownership to the `Subscriber` object. See MESOS-5843
         // for more details.
         http.close();
+
+        terminate(heartbeater.get());
+        wait(heartbeater.get());
       }
 
+      Master* master;
       HttpConnection http;
+      process::Owned<Heartbeater<mesos::master::Event, v1::master::Event>>
+        heartbeater;
+      const Option<process::http::authentication::Principal> principal;
     };
 
     // Sends the event to all subscribers connected to the 'api/vX' endpoint.
@@ -2173,47 +2290,6 @@ private:
 inline std::ostream& operator<<(
     std::ostream& stream,
     const Framework& framework);
-
-
-// This process periodically sends heartbeats to a scheduler on the
-// given HTTP connection.
-class Heartbeater : public process::Process<Heartbeater>
-{
-public:
-  Heartbeater(const FrameworkID& _frameworkId,
-              const HttpConnection& _http,
-              const Duration& _interval)
-    : process::ProcessBase(process::ID::generate("heartbeater")),
-      frameworkId(_frameworkId),
-      http(_http),
-      interval(_interval) {}
-
-protected:
-  virtual void initialize() override
-  {
-    heartbeat();
-  }
-
-private:
-  void heartbeat()
-  {
-    // Only send a heartbeat if the connection is not closed.
-    if (http.closed().isPending()) {
-      VLOG(1) << "Sending heartbeat to " << frameworkId;
-
-      scheduler::Event event;
-      event.set_type(scheduler::Event::HEARTBEAT);
-
-      http.send(event);
-    }
-
-    process::delay(interval, self(), &Self::heartbeat);
-  }
-
-  const FrameworkID frameworkId;
-  HttpConnection http;
-  const Duration interval;
-};
 
 
 // TODO(bmahler): Keeping the task and executor information in sync
@@ -2702,8 +2778,15 @@ struct Framework
 
     // TODO(vinod): Make heartbeat interval configurable and include
     // this information in the SUBSCRIBED response.
+    scheduler::Event event;
+    event.set_type(scheduler::Event::HEARTBEAT);
+
     heartbeater =
-      new Heartbeater(info.id(), http.get(), DEFAULT_HEARTBEAT_INTERVAL);
+      new Heartbeater<scheduler::Event, v1::scheduler::Event>(
+          "framework " + stringify(info.id()),
+          event,
+          http.get(),
+          DEFAULT_HEARTBEAT_INTERVAL);
 
     process::spawn(heartbeater.get().get());
   }
@@ -2804,7 +2887,8 @@ struct Framework
   hashmap<SlaveID, Resources> offeredResources;
 
   // This is only set for HTTP frameworks.
-  Option<process::Owned<Heartbeater>> heartbeater;
+  Option<process::Owned<Heartbeater<scheduler::Event, v1::scheduler::Event>>>
+    heartbeater;
 
 private:
   Framework(Master* const _master,
@@ -2870,28 +2954,20 @@ struct Role
     frameworks.erase(framework->id());
   }
 
-  Resources resources() const
+  Resources allocatedResources() const
   {
     Resources resources;
 
     auto allocatedTo = [](const std::string& role) {
       return [role](const Resource& resource) {
+        CHECK(resource.has_allocation_info());
         return resource.allocation_info().role() == role;
       };
     };
 
     foreachvalue (Framework* framework, frameworks) {
-      // TODO(jay_guo): MULTI_ROLE is handled as a special case because
-      // the `Resource.allocation_info.role` is not yet populated. Once
-      // the support is complete, we do not need the `else` logic here.
-      if (protobuf::frameworkHasCapability(
-              framework->info, FrameworkInfo::Capability::MULTI_ROLE)) {
-        resources += framework->totalUsedResources.filter(allocatedTo(role));
-        resources += framework->totalOfferedResources.filter(allocatedTo(role));
-      } else {
-        resources += framework->totalUsedResources;
-        resources += framework->totalOfferedResources;
-      }
+      resources += framework->totalUsedResources.filter(allocatedTo(role));
+      resources += framework->totalOfferedResources.filter(allocatedTo(role));
     }
 
     return resources;

@@ -125,11 +125,15 @@ private:
   NetworkCniIsolatorProcess(
       const Flags& _flags,
       const hashmap<std::string, std::string>& _networkConfigs,
+      const hashmap<std::string, ContainerDNSInfo::MesosInfo>& _cniDNSMap,
+      const Option<ContainerDNSInfo::MesosInfo>& _defaultCniDNS = None(),
       const Option<std::string>& _rootDir = None(),
       const Option<std::string>& _pluginDir = None())
     : ProcessBase(process::ID::generate("mesos-network-cni-isolator")),
       flags(_flags),
       networkConfigs(_networkConfigs),
+      cniDNSMap(_cniDNSMap),
+      defaultCniDNS(_defaultCniDNS),
       rootDir(_rootDir),
       pluginDir(_pluginDir) {}
 
@@ -194,8 +198,14 @@ private:
   const Flags flags;
 
   // A map storing the path to CNI network configuration files keyed
-  // on the network name.
+  // by the network name.
   hashmap<std::string, std::string> networkConfigs;
+
+  // DNS informations of CNI networks keyed by CNI network name.
+  hashmap<string, ContainerDNSInfo::MesosInfo> cniDNSMap;
+
+  // Default DNS information for all CNI networks.
+  const Option<ContainerDNSInfo::MesosInfo> defaultCniDNS;
 
   // CNI network information root directory.
   const Option<std::string> rootDir;
@@ -229,6 +239,7 @@ public:
     Option<std::string> etc_hostname_path;
     Option<std::string> etc_resolv_conf;
     bool bind_host_files;
+    bool bind_readonly;
   };
 
   NetworkCniIsolatorSetup() : Subcommand(NAME) {}

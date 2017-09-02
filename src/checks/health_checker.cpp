@@ -54,6 +54,8 @@
 #include <stout/os/constants.hpp>
 #include <stout/os/killtree.hpp>
 
+#include "checks/checker_process.hpp"
+
 #include "common/http.hpp"
 #include "common/status_utils.hpp"
 #include "common/validation.hpp"
@@ -137,7 +139,7 @@ static Try<Nothing> interpretCheckStatusInfo(const CheckStatusInfo& result)
     case CheckInfo::COMMAND: {
       const int exitCode = result.command().exit_code();
       if (exitCode != 0) {
-        return Error("Command returned: " + WSTRINGIFY(exitCode));
+        return Error("Command " + WSTRINGIFY(exitCode));
       }
 
       break;
@@ -350,6 +352,7 @@ void HealthChecker::failure()
   // not exit before the data is sent to the executor.
   callback(taskHealthStatus);
 }
+
 
 void HealthChecker::success()
 {

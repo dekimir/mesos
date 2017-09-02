@@ -14,14 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <unordered_map>
+#include "slave/containerizer/fetcher.hpp"
 
 #include <process/async.hpp>
 #include <process/check.hpp>
 #include <process/collect.hpp>
 #include <process/dispatch.hpp>
+#include <process/id.hpp>
 #include <process/owned.hpp>
+#include <process/subprocess.hpp>
 
+#include <process/metrics/metrics.hpp>
+
+#include <stout/hashmap.hpp>
 #include <stout/hashset.hpp>
 #include <stout/net.hpp>
 #include <stout/path.hpp>
@@ -30,13 +35,15 @@
 #include <stout/windows.hpp>
 #endif // __WINDOWS__
 
+#include <stout/os/exists.hpp>
 #include <stout/os/find.hpp>
 #include <stout/os/killtree.hpp>
 #include <stout/os/read.hpp>
+#include <stout/os/rmdir.hpp>
 
 #include "hdfs/hdfs.hpp"
 
-#include "slave/containerizer/fetcher.hpp"
+#include "slave/containerizer/fetcher_process.hpp"
 
 using std::list;
 using std::map;
@@ -252,6 +259,51 @@ void Fetcher::kill(const ContainerID& containerId)
 }
 
 
+FetcherProcess::Metrics::Metrics(FetcherProcess *fetcher)
+  : task_fetches_succeeded("containerizer/fetcher/task_fetches_succeeded"),
+    task_fetches_failed("containerizer/fetcher/task_fetches_failed"),
+    cache_size_total_bytes(
+        "containerizer/fetcher/cache_size_total_bytes",
+        [=]() {
+          // This value is safe to read while it is concurrently updated.
+          return fetcher->cache.totalSpace().bytes();
+        }),
+    cache_size_used_bytes(
+        "containerizer/fetcher/cache_size_used_bytes",
+        [=]() {
+          // This value is safe to read while it is concurrently updated.
+          return fetcher->cache.usedSpace().bytes();
+        })
+{
+  process::metrics::add(task_fetches_succeeded);
+  process::metrics::add(task_fetches_failed);
+  process::metrics::add(cache_size_total_bytes);
+  process::metrics::add(cache_size_used_bytes);
+}
+
+
+FetcherProcess::Metrics::~Metrics()
+{
+  process::metrics::remove(task_fetches_succeeded);
+  process::metrics::remove(task_fetches_failed);
+
+  // Wait for the metrics to be removed before we allow the destructor
+  // to complete.
+  await(
+      process::metrics::remove(cache_size_total_bytes),
+      process::metrics::remove(cache_size_used_bytes)).await();
+}
+
+
+FetcherProcess::FetcherProcess(const Flags& _flags)
+    : ProcessBase(process::ID::generate("fetcher")),
+      metrics(this),
+      flags(_flags),
+      cache(_flags.fetcher_cache_size)
+{
+}
+
+
 FetcherProcess::~FetcherProcess()
 {
   foreachkey (const ContainerID& containerId, subprocessPids) {
@@ -272,7 +324,8 @@ static Try<Bytes> fetchSize(
     return Error(path.error());
   }
   if (path.isSome()) {
-    Try<Bytes> size = os::stat::size(path.get(), os::stat::FOLLOW_SYMLINK);
+    Try<Bytes> size = os::stat::size(
+        path.get(), os::stat::FollowSymlink::FOLLOW_SYMLINK);
     if (size.isError()) {
       return Error("Could not determine file size for: '" + path.get() +
                      "', error: " + size.error());
@@ -324,13 +377,9 @@ Future<Nothing> FetcherProcess::fetch(
   VLOG(1) << "Starting to fetch URIs for container: " << containerId
           << ", directory: " << sandboxDirectory;
 
-  // TODO(bernd-mesos): This will disappear once we inject flags at
-  // Fetcher/FetcherProcess creation time. For now we trust this is
-  // always the exact same value.
-  cache.setSpace(flags.fetcher_cache_size);
-
   Try<Nothing> validated = validateUris(commandInfo);
   if (validated.isError()) {
+    ++metrics.task_fetches_failed;
     return Failure("Could not fetch: " + validated.error());
   }
 
@@ -522,6 +571,8 @@ Future<Nothing> FetcherProcess::__fetch(
 
   return run(containerId, sandboxDirectory, user, info)
     .repair(defer(self(), [=](const Future<Nothing>& future) {
+      ++metrics.task_fetches_failed;
+
       LOG(ERROR) << "Failed to run mesos-fetcher: " << future.failure();
 
       foreachvalue (const Option<shared_ptr<Cache::Entry>>& entry, entries) {
@@ -543,6 +594,8 @@ Future<Nothing> FetcherProcess::__fetch(
     .operator std::function<process::Future<Nothing>(
         const process::Future<Nothing> &)>())
     .then(defer(self(), [=]() {
+      ++metrics.task_fetches_succeeded;
+
       foreachvalue (const Option<shared_ptr<Cache::Entry>>& entry, entries) {
         if (entry.isSome()) {
           entry.get()->unreference();
@@ -597,7 +650,7 @@ static off_t delta(
 
 
 // For testing only.
-Try<list<Path>> FetcherProcess::cacheFiles()
+Try<list<Path>> FetcherProcess::cacheFiles() const
 {
   list<Path> result;
 
@@ -623,13 +676,13 @@ Try<list<Path>> FetcherProcess::cacheFiles()
 
 
 // For testing only.
-size_t FetcherProcess::cacheSize()
+size_t FetcherProcess::cacheSize() const
 {
   return cache.size();
 }
 
 
-Bytes FetcherProcess::availableCacheSpace()
+Bytes FetcherProcess::availableCacheSpace() const
 {
   return cache.availableSpace();
 }
@@ -811,6 +864,13 @@ Future<Nothing> FetcherProcess::run(
     environment["HADOOP_HOME"] = flags.hadoop_home;
   }
 
+  // TODO(jieyu): This is to make sure the libprocess of the fetcher
+  // can properly initialize and find the IP. Since we don't need to
+  // use the TCP socket for communication, it's OK to use a local
+  // address. Consider disable TCP socket in libprocess if libprocess
+  // supports that.
+  environment.emplace("LIBPROCESS_IP", "127.0.0.1");
+
   VLOG(1) << "Fetching URIs using command '" << command << "'";
 
   Try<Subprocess> fetcherSubprocess = subprocess(
@@ -964,14 +1024,15 @@ FetcherProcess::Cache::get(
 
 bool FetcherProcess::Cache::contains(
     const Option<string>& user,
-    const string& uri)
+    const string& uri) const
 {
   const string key = cacheKey(user, uri);
   return table.get(key).isSome();
 }
 
 
-bool FetcherProcess::Cache::contains(const shared_ptr<Cache::Entry>& entry)
+bool FetcherProcess::Cache::contains(
+    const shared_ptr<Cache::Entry>& entry) const
 {
   Option<shared_ptr<Cache::Entry>> found = table.get(entry->key);
   if (found.isNone()) {
@@ -1107,7 +1168,7 @@ Try<Nothing> FetcherProcess::Cache::adjust(
 
   Try<Bytes> size = os::stat::size(
       entry.get()->path().string(),
-      os::stat::DO_NOT_FOLLOW_SYMLINK);
+      os::stat::FollowSymlink::DO_NOT_FOLLOW_SYMLINK);
 
   if (size.isSome()) {
     off_t d = delta(size.get(), entry);
@@ -1129,20 +1190,9 @@ Try<Nothing> FetcherProcess::Cache::adjust(
 }
 
 
-size_t FetcherProcess::Cache::size()
+size_t FetcherProcess::Cache::size() const
 {
   return table.size();
-}
-
-
-void FetcherProcess::Cache::setSpace(const Bytes& bytes)
-{
-  if (space > 0) {
-    // Dynamic cache size changes not supported.
-    CHECK_EQ(space, bytes);
-  } else {
-    space = bytes;
-  }
 }
 
 
@@ -1175,7 +1225,19 @@ void FetcherProcess::Cache::releaseSpace(const Bytes& bytes)
 }
 
 
-Bytes FetcherProcess::Cache::availableSpace()
+Bytes FetcherProcess::Cache::totalSpace() const
+{
+  return space;
+}
+
+
+Bytes FetcherProcess::Cache::usedSpace() const
+{
+  return tally;
+}
+
+
+Bytes FetcherProcess::Cache::availableSpace() const
 {
   if (tally > space) {
     LOG(WARNING) << "Fetcher cache space overflow - space used: " << tally
@@ -1223,7 +1285,7 @@ void FetcherProcess::Cache::Entry::unreference()
 }
 
 
-bool FetcherProcess::Cache::Entry::isReferenced()
+bool FetcherProcess::Cache::Entry::isReferenced() const
 {
   return referenceCount > 0;
 }

@@ -28,6 +28,8 @@
 
 #include <mesos/master/master.hpp>
 
+#include <mesos/resource_provider/resource_provider.hpp>
+
 #include <mesos/scheduler/scheduler.hpp>
 
 #include <mesos/v1/mesos.hpp>
@@ -38,6 +40,8 @@
 #include <mesos/v1/executor/executor.hpp>
 
 #include <mesos/v1/master/master.hpp>
+
+#include <mesos/v1/resource_provider/resource_provider.hpp>
 
 #include <mesos/v1/scheduler/scheduler.hpp>
 
@@ -58,10 +62,15 @@ InverseOffer devolve(const v1::InverseOffer& inverseOffer);
 Offer devolve(const v1::Offer& offer);
 Resource devolve(const v1::Resource& resource);
 Resources devolve(const v1::Resources& resources);
+ResourceProviderID devolve(const v1::ResourceProviderID& resourceProviderId);
 SlaveID devolve(const v1::AgentID& agentId);
 SlaveInfo devolve(const v1::AgentInfo& agentInfo);
 TaskID devolve(const v1::TaskID& taskId);
 TaskStatus devolve(const v1::TaskStatus& status);
+
+mesos::resource_provider::Call devolve(const v1::resource_provider::Call& call);
+mesos::resource_provider::Event devolve(
+    const v1::resource_provider::Event& event);
 
 scheduler::Call devolve(const v1::scheduler::Call& call);
 scheduler::Event devolve(const v1::scheduler::Event& event);

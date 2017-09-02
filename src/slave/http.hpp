@@ -81,6 +81,7 @@ public:
 
   static std::string API_HELP();
   static std::string EXECUTOR_HELP();
+  static std::string RESOURCE_PROVIDER_HELP();
   static std::string FLAGS_HELP();
   static std::string HEALTH_HELP();
   static std::string STATE_HELP();
@@ -113,7 +114,8 @@ private:
 
   // Helper function to collect containers status and resource statistics.
   process::Future<JSON::Array> __containers(
-      Option<process::Owned<ObjectApprover>> approver) const;
+      process::Owned<AuthorizationAcceptor> authorizeContainer,
+      Option<IDAcceptor<ContainerID>> selectContainerId) const;
 
   // Helper routines for endpoint authorization.
   Try<std::string> extractEndpoint(const process::http::URL& url) const;

@@ -53,6 +53,7 @@
 #include "slave/constants.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
+#include "slave/gc_process.hpp"
 #include "slave/paths.hpp"
 #include "slave/slave.hpp"
 
@@ -127,6 +128,13 @@ TEST_F(GarbageCollectorTest, Schedule)
   AWAIT_READY(scheduleDispatch3);
   Clock::settle();
 
+  JSON::Object metrics = Metrics();
+
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_pending"));
+  EXPECT_SOME_EQ(
+      3u,
+      metrics.at<JSON::Number>("gc/path_removals_pending"));
+
   // Advance the clock to trigger the GC of file1 and file2.
   Clock::advance(Seconds(10));
   Clock::settle();
@@ -146,6 +154,22 @@ TEST_F(GarbageCollectorTest, Schedule)
   AWAIT_READY(schedule3);
 
   EXPECT_FALSE(os::exists(file3));
+
+  metrics = Metrics();
+
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_pending"));
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_succeeded"));
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_failed"));
+
+  EXPECT_SOME_EQ(
+      0u,
+      metrics.at<JSON::Number>("gc/path_removals_pending"));
+  EXPECT_SOME_EQ(
+      3u,
+      metrics.at<JSON::Number>("gc/path_removals_succeeded"));
+  EXPECT_SOME_EQ(
+      0u,
+      metrics.at<JSON::Number>("gc/path_removals_failed"));
 
   Clock::resume();
 }
@@ -979,6 +1003,28 @@ TEST_F(GarbageCollectorIntegrationTest, ROOT_BusyMountPoint)
   EXPECT_TRUE(os::exists(sandbox));
   EXPECT_TRUE(os::exists(path::join(sandbox, mountPoint)));
   EXPECT_FALSE(os::exists(path::join(sandbox, regularFile)));
+
+  // Verify that GC metrics show that a path removal failed.
+  JSON::Object metrics = Metrics();
+
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_pending"));
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_succeeded"));
+  ASSERT_EQ(1u, metrics.values.count("gc/path_removals_failed"));
+
+  EXPECT_SOME_EQ(
+      0u,
+      metrics.at<JSON::Number>("gc/path_removals_pending"));
+  EXPECT_SOME_EQ(
+      0u,
+      metrics.at<JSON::Number>("gc/path_removals_succeeded"));
+
+  // The sandbox path removal failure will cascade to cause failures to
+  // remove the executor and framework directories. For testing purposes
+  // it is sufficient to verify that some failure was detected.
+  ASSERT_SOME(metrics.at<JSON::Number>("gc/path_removals_failed"));
+  EXPECT_GT(
+      metrics.at<JSON::Number>("gc/path_removals_failed")->as<unsigned>(),
+      0u);
 
   Clock::resume();
   driver.stop();

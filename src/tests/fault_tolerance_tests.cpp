@@ -221,7 +221,7 @@ TEST_F(FaultToleranceTest, ReregisterCompletedFrameworks)
   AWAIT_READY(frameworkId);
   EXPECT_NE("", frameworkId->value());
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   // Step 3. Create/launch a task.
   TaskInfo task =
@@ -951,7 +951,7 @@ TEST_F(FaultToleranceTest, DisconnectedSchedulerLaunchLost)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   AWAIT_READY(message);
 
@@ -1014,7 +1014,7 @@ TEST_F(FaultToleranceTest, DisconnectedSchedulerLaunchDropped)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   AWAIT_READY(message);
 
@@ -1076,7 +1076,7 @@ TEST_F(FaultToleranceTest, SchedulerFailoverStatusUpdate)
   driver1.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   // Launch a task.
   TaskInfo task;
@@ -1286,7 +1286,7 @@ TEST_F(FaultToleranceTest, ForwardStatusUpdateUnknownExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   TaskInfo task;
@@ -1375,7 +1375,7 @@ TEST_F(FaultToleranceTest, SchedulerFailoverExecutorToFrameworkMessage)
   driver1.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -1475,7 +1475,7 @@ TEST_F(FaultToleranceTest, SchedulerFailoverFrameworkToExecutorMessage)
   driver1.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched1, statusUpdate(&driver1, _))
@@ -1702,7 +1702,7 @@ TEST_F(FaultToleranceTest, SchedulerExit)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  EXPECT_FALSE(offers->empty());
 
   AWAIT_READY(offers);
 
@@ -2016,6 +2016,7 @@ TEST_F(FaultToleranceTest, SplitBrainMasters)
   driver.join();
 }
 
+
 // This test verifies that when a framework re-registers with updated
 // FrameworkInfo, it gets updated in the master. The steps involved
 // are:
@@ -2039,6 +2040,11 @@ TEST_F(FaultToleranceTest, UpdateFrameworkInfoOnSchedulerFailover)
   // scheduler with updated information.
 
   FrameworkInfo finfo1 = DEFAULT_FRAMEWORK_INFO;
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  finfo1.clear_capabilities();
+
   finfo1.set_name("Framework 1");
   finfo1.set_failover_timeout(1000);
   finfo1.mutable_labels()->add_labels()->CopyFrom(createLabel("foo", "bar"));
@@ -2064,6 +2070,11 @@ TEST_F(FaultToleranceTest, UpdateFrameworkInfoOnSchedulerFailover)
   // callback.
 
   FrameworkInfo finfo2 = DEFAULT_FRAMEWORK_INFO;
+
+  // TODO(mpark): Remove this once `RESERVATION_REFINEMENT`
+  // is removed from `DEFAULT_FRAMEWORK_INFO`.
+  finfo2.clear_capabilities();
+
   finfo2.mutable_id()->MergeFrom(frameworkId.get());
   auto capabilityType = FrameworkInfo::Capability::REVOCABLE_RESOURCES;
   finfo2.add_capabilities()->set_type(capabilityType);

@@ -25,6 +25,8 @@
 
 #include "encoder.hpp"
 
+namespace inet4 = process::network::inet4;
+
 using process::Future;
 using process::Message;
 using process::MessageEncoder;
@@ -120,7 +122,7 @@ int main(int argc, char** argv)
   }
 
   // Bind to some random port.
-  Try<Address> bind = __s__->bind(Address::ANY_ANY());
+  Try<Address> bind = __s__->bind(inet4::Address::ANY_ANY());
   if (bind.isError()) {
     EXIT(EXIT_FAILURE) << "Failed to bind: " << bind.error();
   }
@@ -185,7 +187,7 @@ int main(int argc, char** argv)
       message.from = UPID("(1)", address);
       message.to = parent;
 
-      outgoing->send(MessageEncoder::encode(&message));
+      outgoing->send(MessageEncoder::encode(message));
     });
 
   // Now sit and accept links until the linkee is killed.

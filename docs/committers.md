@@ -147,6 +147,13 @@ We'd like to thank the following committers to the Apache Mesos project who have
     </tr>
     <tr>
       <td>-8</td>
+      <td>Greg Mann</td>
+      <td>Mesosphere</td>
+      <td>greggomann</td>
+      <td>grag@apache.org</td>
+    </tr>
+    <tr>
+      <td>-8</td>
       <td>Thomas Marshall</td>
       <td>Carnegie Mellon University</td>
       <td></td>
@@ -207,6 +214,13 @@ We'd like to thank the following committers to the Apache Mesos project who have
       <td>Mesosphere</td>
       <td>alexr</td>
       <td>alexr@apache.org</td>
+    </tr>
+    <tr>
+      <td>+1</td>
+      <td>Alexander Rojas</td>
+      <td>Mesosphere</td>
+      <td>alexander</td>
+      <td>arojas@apache.org</td>
     </tr>
     <tr>
       <td>-8</td>
@@ -281,7 +295,7 @@ We'd like to thank the following committers to the Apache Mesos project who have
     <tr>
       <td>+8</td>
       <td>Qian Zhang</td>
-      <td>IBM</td>
+      <td>Mesosphere</td>
       <td></td>
       <td>qianzhang@apache.org</td>
     </tr>

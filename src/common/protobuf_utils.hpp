@@ -48,10 +48,14 @@ struct UPID;
 }
 
 namespace mesos {
+
+class AuthorizationAcceptor;
+
 namespace internal {
 
 namespace master {
 // Forward declaration (in lieu of an include).
+struct Framework;
 struct Slave;
 } // namespace master {
 
@@ -197,6 +201,12 @@ struct Capabilities
         case SlaveInfo::Capability::MULTI_ROLE:
           multiRole = true;
           break;
+        case SlaveInfo::Capability::HIERARCHICAL_ROLE:
+          hierarchicalRole = true;
+          break;
+        case SlaveInfo::Capability::RESERVATION_REFINEMENT:
+          reservationRefinement = true;
+          break;
         // If adding another case here be sure to update the
         // equality operator.
       }
@@ -205,6 +215,8 @@ struct Capabilities
 
   // See mesos.proto for the meaning of agent capabilities.
   bool multiRole = false;
+  bool hierarchicalRole = false;
+  bool reservationRefinement = false;
 
   google::protobuf::RepeatedPtrField<SlaveInfo::Capability>
   toRepeatedPtrField() const
@@ -212,6 +224,12 @@ struct Capabilities
     google::protobuf::RepeatedPtrField<SlaveInfo::Capability> result;
     if (multiRole) {
       result.Add()->set_type(SlaveInfo::Capability::MULTI_ROLE);
+    }
+    if (hierarchicalRole) {
+      result.Add()->set_type(SlaveInfo::Capability::HIERARCHICAL_ROLE);
+    }
+    if (reservationRefinement) {
+      result.Add()->set_type(SlaveInfo::Capability::RESERVATION_REFINEMENT);
     }
 
     return result;
@@ -289,9 +307,25 @@ mesos::master::Event createTaskUpdated(
 mesos::master::Event createTaskAdded(const Task& task);
 
 
+// Helper for creating a 'FRAMEWORK_ADDED' event from a `Framework`.
+mesos::master::Event createFrameworkAdded(
+    const mesos::internal::master::Framework& framework);
+
+
+// Helper for creating a 'FRAMEWORK_UPDATED' event from a `Framework`.
+mesos::master::Event createFrameworkUpdated(
+    const mesos::internal::master::Framework& framework);
+
+
+// Helper for creating a 'FRAMEWORK_REMOVED' event from a `FrameworkInfo`.
+mesos::master::Event createFrameworkRemoved(const FrameworkInfo& frameworkInfo);
+
+
 // Helper for creating an `Agent` response.
 mesos::master::Response::GetAgents::Agent createAgentResponse(
-    const mesos::internal::master::Slave& slave);
+    const mesos::internal::master::Slave& slave,
+    const Option<process::Owned<AuthorizationAcceptor>>& rolesAcceptor =
+      None());
 
 
 // Helper for creating an `AGENT_ADDED` event from a `Slave`.
@@ -338,6 +372,12 @@ struct Capabilities
         case FrameworkInfo::Capability::MULTI_ROLE:
           multiRole = true;
           break;
+        case FrameworkInfo::Capability::RESERVATION_REFINEMENT:
+          reservationRefinement = true;
+          break;
+        case FrameworkInfo::Capability::REGION_AWARE:
+          regionAware = true;
+          break;
       }
     }
   }
@@ -349,6 +389,8 @@ struct Capabilities
   bool sharedResources = false;
   bool partitionAware = false;
   bool multiRole = false;
+  bool reservationRefinement = false;
+  bool regionAware = false;
 };
 
 

@@ -134,7 +134,7 @@ if (WIN32)
   set_target_properties(
     ${MESOS_PROTOBUF_TARGET}
     PROPERTIES COMPILE_FLAGS "/w")
-endif (WIN32)
+endif ()
 
 
 # Configure Mesos files.
@@ -207,7 +207,7 @@ if (NOT WIN32)
     slave/containerizer/mesos/isolators/posix/rlimits.cpp
     slave/containerizer/mesos/isolators/volume/sandbox_path.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 set(APPC_SRC
   appc/spec.cpp
@@ -225,14 +225,14 @@ if (NOT WIN32)
     authentication/cram_md5/authenticator.cpp
     authentication/cram_md5/auxprop.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 if (ENABLE_SSL)
   set(AUTHENTICATION_SRC
     ${AUTHENTICATION_SRC}
     authentication/executor/jwt_secret_generator.cpp
     )
-endif (ENABLE_SSL)
+endif ()
 
 set(AUTHORIZER_SRC
   authorizer/acls.cpp
@@ -321,6 +321,7 @@ set(LINUX_SRC
   slave/containerizer/mesos/isolators/namespaces/ipc.cpp
   slave/containerizer/mesos/isolators/namespaces/pid.cpp
   slave/containerizer/mesos/isolators/network/cni/cni.cpp
+  slave/containerizer/mesos/isolators/volume/host_path.cpp
   slave/containerizer/mesos/isolators/volume/image.cpp
   slave/containerizer/mesos/isolators/volume/secret.cpp
   slave/containerizer/mesos/provisioner/backends/aufs.cpp
@@ -398,6 +399,16 @@ set(POSIX_SRC
   posix/rlimits.cpp
   )
 
+set(RESOURCE_PROVIDER_SRC
+  resource_provider/daemon.cpp
+  resource_provider/detector.cpp
+  resource_provider/driver.cpp
+  resource_provider/local.cpp
+  resource_provider/manager.cpp
+  resource_provider/validation.cpp
+  resource_provider/storage/provider.cpp
+  )
+
 set(SCHEDULER_SRC
   sched/sched.cpp
   scheduler/scheduler.cpp
@@ -418,7 +429,7 @@ if (NOT WIN32)
     state/leveldb.cpp
     state/log.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 set(URI_SRC
   uri/fetcher.cpp
@@ -433,7 +444,7 @@ if (NOT WIN32)
     uri/fetchers/docker.cpp
     uri/fetchers/hadoop.cpp
     )
-endif (NOT WIN32)
+endif ()
 
 set(USAGE_SRC
   usage/usage.cpp
@@ -487,6 +498,7 @@ set(MESOS_SRC
   ${MESSAGES_SRC}
   ${MODULE_SRC}
   ${OCI_SRC}
+  ${RESOURCE_PROVIDER_SRC}
   ${SCHEDULER_SRC}
   ${SECRET_SRC}
   ${STATE_SRC}
@@ -505,17 +517,17 @@ if (NOT WIN32)
     ${LOG_SRC}
     ${POSIX_SRC}
     )
-endif (NOT WIN32)
+endif ()
 
 # Include source for linux build.
 if (LINUX)
   set(MESOS_SRC ${MESOS_SRC} ${LINUX_SRC})
-endif (LINUX)
+endif ()
 
 # Include source for Windows build.
 if (WIN32)
   set(MESOS_SRC ${MESOS_SRC} ${WIN32_SRC})
-endif (WIN32)
+endif ()
 
 # INCLUDE DIRECTIVES FOR MESOS LIBRARY (generates, e.g., -I/path/to/thing
 # on Linux).
@@ -528,14 +540,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/src)
 if (WIN32)
   SET(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/src)
   SET(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/src)
-endif (WIN32)
+endif ()
 
 # Generate all libraries in the same folder to conform with the Automake build.
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/src/.libs)
 if (WIN32)
   SET(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/src/.libs)
   SET(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/src/.libs)
-endif (WIN32)
+endif ()
 
 # LINKING LIBRARIES BY DIRECTORY (might generate, e.g., -L/path/to/thing on
 # Linux).
@@ -569,7 +581,7 @@ if (ENABLE_PRECOMPILED_HEADERS)
       "${AGENT_INCLUDE_DIRS};${AGENT_3RDPARTY_INCLUDE_DIRS}")
 
   cotire(${MESOS_LIBS_TARGET})
-endif (ENABLE_PRECOMPILED_HEADERS)
+endif ()
 
 # ADD LIBRARY DEPENDENCIES (tells CMake what to compile/build first).
 ####################################################################

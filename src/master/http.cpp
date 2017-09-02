@@ -69,6 +69,7 @@
 #include "common/build.hpp"
 #include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
+#include "common/resources_utils.hpp"
 
 #include "internal/devolve.hpp"
 
@@ -160,6 +161,10 @@ static void json(JSON::ObjectWriter* writer, const MasterInfo& info)
   writer->field("pid", info.pid());
   writer->field("port", info.port());
   writer->field("hostname", info.hostname());
+
+  if (info.has_domain()) {
+    writer->field("domain", info.domain());
+  }
 }
 
 
@@ -169,6 +174,10 @@ static void json(JSON::ObjectWriter* writer, const SlaveInfo& slaveInfo)
   writer->field("hostname", slaveInfo.hostname());
   writer->field("port", slaveInfo.port());
   writer->field("attributes", Attributes(slaveInfo.attributes()));
+
+  if (slaveInfo.has_domain()) {
+    writer->field("domain", slaveInfo.domain());
+  }
 }
 
 namespace internal {
@@ -210,11 +219,11 @@ static void json(JSON::ObjectWriter* writer, const Summary<Framework>& summary);
 // user is authorized to view them.
 struct FullFrameworkWriter {
   FullFrameworkWriter(
-      const Owned<ObjectApprover>& taskApprover,
-      const Owned<ObjectApprover>& executorApprover,
+      const Owned<AuthorizationAcceptor>& authorizeTask,
+      const Owned<AuthorizationAcceptor>& authorizeExecutorInfo,
       const Framework* framework)
-    : taskApprover_(taskApprover),
-      executorApprover_(executorApprover),
+    : authorizeTask_(authorizeTask),
+      authorizeExecutorInfo_(authorizeExecutorInfo),
       framework_(framework) {}
 
   void operator()(JSON::ObjectWriter* writer) const
@@ -259,7 +268,7 @@ struct FullFrameworkWriter {
     writer->field("tasks", [this](JSON::ArrayWriter* writer) {
       foreachvalue (const TaskInfo& taskInfo, framework_->pendingTasks) {
         // Skip unauthorized tasks.
-        if (!approveViewTaskInfo(taskApprover_, taskInfo, framework_->info)) {
+        if (!authorizeTask_->accept(taskInfo, framework_->info)) {
           continue;
         }
 
@@ -300,7 +309,7 @@ struct FullFrameworkWriter {
 
       foreachvalue (Task* task, framework_->tasks) {
         // Skip unauthorized tasks.
-        if (!approveViewTask(taskApprover_, *task, framework_->info)) {
+        if (!authorizeTask_->accept(*task, framework_->info)) {
           continue;
         }
 
@@ -311,7 +320,7 @@ struct FullFrameworkWriter {
     writer->field("unreachable_tasks", [this](JSON::ArrayWriter* writer) {
       foreachvalue (const Owned<Task>& task, framework_->unreachableTasks) {
         // Skip unauthorized tasks.
-        if (!approveViewTask(taskApprover_, *task.get(), framework_->info)) {
+        if (!authorizeTask_->accept(*task.get(), framework_->info)) {
           continue;
         }
 
@@ -322,7 +331,7 @@ struct FullFrameworkWriter {
     writer->field("completed_tasks", [this](JSON::ArrayWriter* writer) {
       foreach (const Owned<Task>& task, framework_->completedTasks) {
         // Skip unauthorized tasks.
-        if (!approveViewTask(taskApprover_, *task.get(), framework_->info)) {
+        if (!authorizeTask_->accept(*task.get(), framework_->info)) {
           continue;
         }
 
@@ -348,10 +357,7 @@ struct FullFrameworkWriter {
                            &executor,
                            &slaveId](JSON::ObjectWriter* writer) {
             // Skip unauthorized executors.
-            if (!approveViewExecutorInfo(
-                    executorApprover_,
-                    executor,
-                    framework_->info)) {
+            if (!authorizeExecutorInfo_->accept(executor, framework_->info)) {
               return;
             }
 
@@ -368,44 +374,173 @@ struct FullFrameworkWriter {
     }
   }
 
-  const Owned<ObjectApprover>& taskApprover_;
-  const Owned<ObjectApprover>& executorApprover_;
+  const Owned<AuthorizationAcceptor>& authorizeTask_;
+  const Owned<AuthorizationAcceptor>& authorizeExecutorInfo_;
   const Framework* framework_;
 };
 
 
-static void json(JSON::ObjectWriter* writer, const Summary<Slave>& summary)
+struct SlaveWriter
 {
-  const Slave& slave = summary;
+  SlaveWriter(
+      const Slave& slave,
+      const Owned<AuthorizationAcceptor>& authorizeRole)
+    : slave_(slave), authorizeRole_(authorizeRole) {}
 
-  json(writer, slave.info);
+  void operator()(JSON::ObjectWriter* writer) const
+  {
+    json(writer, slave_.info);
 
-  writer->field("pid", string(slave.pid));
-  writer->field("registered_time", slave.registeredTime.secs());
+    writer->field("pid", string(slave_.pid));
+    writer->field("registered_time", slave_.registeredTime.secs());
 
-  if (slave.reregisteredTime.isSome()) {
-    writer->field("reregistered_time", slave.reregisteredTime.get().secs());
+    if (slave_.reregisteredTime.isSome()) {
+      writer->field("reregistered_time", slave_.reregisteredTime.get().secs());
+    }
+
+    const Resources& totalResources = slave_.totalResources;
+    writer->field("resources", totalResources);
+    writer->field("used_resources", Resources::sum(slave_.usedResources));
+    writer->field("offered_resources", slave_.offeredResources);
+    writer->field(
+        "reserved_resources",
+        [&totalResources, this](JSON::ObjectWriter* writer) {
+          foreachpair (const string& role, const Resources& reservation,
+                       totalResources.reservations()) {
+            // TODO(arojas): Consider showing unapproved resources in an
+            // aggregated special field, so that all resource values add up
+            // MESOS-7779.
+            if (authorizeRole_->accept(role)) {
+              writer->field(role, reservation);
+            }
+          }
+        });
+    writer->field("unreserved_resources", totalResources.unreserved());
+
+    writer->field("active", slave_.active);
+    writer->field("version", slave_.version);
+    writer->field("capabilities", slave_.capabilities.toRepeatedPtrField());
   }
 
-  const Resources& totalResources = slave.totalResources;
-  writer->field("resources", totalResources);
-  writer->field("used_resources", Resources::sum(slave.usedResources));
-  writer->field("offered_resources", slave.offeredResources);
-  writer->field("reserved_resources", totalResources.reservations());
-  writer->field("unreserved_resources", totalResources.unreserved());
-
-  writer->field("active", slave.active);
-  writer->field("version", slave.version);
-  writer->field("capabilities", slave.capabilities.toRepeatedPtrField());
-}
+  const Slave& slave_;
+  const Owned<AuthorizationAcceptor>& authorizeRole_;
+};
 
 
-static void json(JSON::ObjectWriter* writer, const Full<Slave>& full)
+struct SlavesWriter
 {
-  const Slave& slave = full;
+  SlavesWriter(
+      const Master::Slaves& slaves,
+      const Owned<AuthorizationAcceptor>& authorizeRole,
+      const IDAcceptor<SlaveID>& selectSlaveId)
+    : slaves_(slaves),
+      authorizeRole_(authorizeRole),
+      selectSlaveId_(selectSlaveId) {}
 
-  json(writer, Summary<Slave>(slave));
-}
+  void operator()(JSON::ObjectWriter* writer) const
+  {
+    writer->field("slaves", [this](JSON::ArrayWriter* writer) {
+      foreachvalue (const Slave* slave, slaves_.registered) {
+        if (!selectSlaveId_.accept(slave->id)) {
+          continue;
+        }
+
+        writer->element([this, &slave](JSON::ObjectWriter* writer) {
+          writeSlave(slave, writer);
+        });
+      }
+    });
+
+    writer->field("recovered_slaves", [this](JSON::ArrayWriter* writer) {
+      foreachvalue (const SlaveInfo& slaveInfo, slaves_.recovered) {
+        if (!selectSlaveId_.accept(slaveInfo.id())) {
+          continue;
+        }
+
+        writer->element([&slaveInfo](JSON::ObjectWriter* writer) {
+          json(writer, slaveInfo);
+        });
+      }
+    });
+  }
+
+  void writeSlave(const Slave* slave, JSON::ObjectWriter* writer) const
+  {
+    SlaveWriter(*slave, authorizeRole_)(writer);
+
+    // Add the complete protobuf->JSON for all used, reserved,
+    // and offered resources. The other endpoints summarize
+    // resource information, which omits the details of
+    // reservations and persistent volumes. Full resource
+    // information is necessary so that operators can use the
+    // `/unreserve` and `/destroy-volumes` endpoints.
+
+    hashmap<string, Resources> reserved = slave->totalResources.reservations();
+
+    writer->field(
+        "reserved_resources_full",
+        [&reserved, this](JSON::ObjectWriter* writer) {
+          foreachpair (const string& role,
+                       const Resources& resources,
+                       reserved) {
+            if (authorizeRole_->accept(role)) {
+              writer->field(role, [&resources, this](
+                  JSON::ArrayWriter* writer) {
+                foreach (Resource resource, resources) {
+                  if (authorizeResource(resource, authorizeRole_)) {
+                    convertResourceFormat(&resource, ENDPOINT);
+                    writer->element(JSON::Protobuf(resource));
+                  }
+                }
+              });
+            }
+          }
+        });
+
+    Resources unreservedResources = slave->totalResources.unreserved();
+
+    writer->field(
+        "unreserved_resources_full",
+        [&unreservedResources, this](JSON::ArrayWriter* writer) {
+          foreach (Resource resource, unreservedResources) {
+            if (authorizeResource(resource, authorizeRole_)) {
+              convertResourceFormat(&resource, ENDPOINT);
+              writer->element(JSON::Protobuf(resource));
+            }
+          }
+        });
+
+    Resources usedResources = Resources::sum(slave->usedResources);
+
+    writer->field(
+        "used_resources_full",
+        [&usedResources, this](JSON::ArrayWriter* writer) {
+          foreach (Resource resource, usedResources) {
+            if (authorizeResource(resource, authorizeRole_)) {
+              convertResourceFormat(&resource, ENDPOINT);
+              writer->element(JSON::Protobuf(resource));
+            }
+          }
+        });
+
+    const Resources& offeredResources = slave->offeredResources;
+
+    writer->field(
+        "offered_resources_full",
+        [&offeredResources, this](JSON::ArrayWriter* writer) {
+          foreach (Resource resource, offeredResources) {
+            if (authorizeResource(resource, authorizeRole_)) {
+              convertResourceFormat(&resource, ENDPOINT);
+              writer->element(JSON::Protobuf(resource));
+            }
+          }
+        });
+  }
+
+  const Master::Slaves& slaves_;
+  const Owned<AuthorizationAcceptor>& authorizeRole_;
+  const IDAcceptor<SlaveID>& selectSlaveId_;
+};
 
 
 static void json(JSON::ObjectWriter* writer, const Summary<Framework>& summary)
@@ -641,6 +776,9 @@ Future<Response> Master::Http::api(
 
     case mesos::master::Call::REMOVE_QUOTA:
       return quotaHandler.remove(call, principal);
+
+    case mesos::master::Call::TEARDOWN:
+      return teardown(call, principal, acceptType);
   }
 
   UNREACHABLE();
@@ -675,38 +813,59 @@ Future<Response> Master::Http::subscribe(
     executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
   }
 
-  return collect(frameworksApprover, tasksApprover, executorsApprover)
+  Future<Owned<AuthorizationAcceptor>> rolesAcceptor =
+    AuthorizationAcceptor::create(
+        principal,
+        master->authorizer,
+        authorization::VIEW_ROLE);
+
+  return collect(
+      frameworksApprover, tasksApprover, executorsApprover, rolesAcceptor)
     .then(defer(master->self(),
-      [=](const tuple<Owned<ObjectApprover>,
-                      Owned<ObjectApprover>,
-                      Owned<ObjectApprover>>& approvers)
-        -> Future<Response> {
-      // Get approver from tuple.
-      Owned<ObjectApprover> frameworksApprover;
-      Owned<ObjectApprover> tasksApprover;
-      Owned<ObjectApprover> executorsApprover;
-      tie(frameworksApprover, tasksApprover, executorsApprover) = approvers;
+        [=](const tuple<Owned<ObjectApprover>,
+                        Owned<ObjectApprover>,
+                        Owned<ObjectApprover>,
+                        Owned<AuthorizationAcceptor>>& approvers)
+            -> Future<Response> {
+          // Get approver from tuple.
+          Owned<ObjectApprover> frameworksApprover;
+          Owned<ObjectApprover> tasksApprover;
+          Owned<ObjectApprover> executorsApprover;
+          Owned<AuthorizationAcceptor> rolesAcceptor;
+          tie(frameworksApprover,
+              tasksApprover,
+              executorsApprover,
+              rolesAcceptor) = approvers;
 
-      Pipe pipe;
-      OK ok;
+          Pipe pipe;
+          OK ok;
 
-      ok.headers["Content-Type"] = stringify(contentType);
-      ok.type = Response::PIPE;
-      ok.reader = pipe.reader();
+          ok.headers["Content-Type"] = stringify(contentType);
+          ok.type = Response::PIPE;
+          ok.reader = pipe.reader();
 
-      HttpConnection http {pipe.writer(), contentType, UUID::random()};
-      master->subscribe(http);
+          HttpConnection http{pipe.writer(), contentType, UUID::random()};
+          master->subscribe(http, principal);
 
-      mesos::master::Event event;
-      event.set_type(mesos::master::Event::SUBSCRIBED);
-      event.mutable_subscribed()->mutable_get_state()->CopyFrom(
-          _getState(frameworksApprover,
-                    tasksApprover,
-                    executorsApprover));
+          mesos::master::Event event;
+          event.set_type(mesos::master::Event::SUBSCRIBED);
+          event.mutable_subscribed()->mutable_get_state()->CopyFrom(
+              _getState(
+                  frameworksApprover,
+                  tasksApprover,
+                  executorsApprover,
+                  rolesAcceptor));
 
-      http.send<mesos::master::Event, v1::master::Event>(event);
+          event.mutable_subscribed()->set_heartbeat_interval_seconds(
+              DEFAULT_HEARTBEAT_INTERVAL.secs());
 
-      return ok;
+          http.send<mesos::master::Event, v1::master::Event>(event);
+
+          mesos::master::Event heartbeatEvent;
+          heartbeatEvent.set_type(mesos::master::Event::HEARTBEAT);
+          http.send<mesos::master::Event, v1::master::Event>(heartbeatEvent);
+
+          return ok;
     }));
 }
 
@@ -1079,7 +1238,7 @@ Future<Response> Master::Http::createVolumes(
         parse.error());
   }
 
-  Resources volumes;
+  RepeatedPtrField<Resource> volumes;
   foreach (const JSON::Value& value, parse.get().values) {
     Try<Resource> volume = ::protobuf::parse<Resource>(value);
     if (volume.isError()) {
@@ -1088,14 +1247,7 @@ Future<Response> Master::Http::createVolumes(
           volume.error());
     }
 
-    // Since the `+=` operator will silently drop invalid resources, we validate
-    // each resource individually.
-    Option<Error> error = Resources::validate(volume.get());
-    if (error.isSome()) {
-      return BadRequest(error.get().message);
-    }
-
-    volumes += volume.get();
+    volumes.Add()->CopyFrom(volume.get());
   }
 
   return _createVolumes(slaveId, volumes, principal);
@@ -1117,11 +1269,21 @@ Future<Response> Master::Http::_createVolumes(
   operation.set_type(Offer::Operation::CREATE);
   operation.mutable_create()->mutable_volumes()->CopyFrom(volumes);
 
-  Option<Error> validate = validation::operation::validate(
-      operation.create(), slave->checkpointedResources, principal);
+  Option<Error> error = validateAndNormalizeResources(&operation);
+  if (error.isSome()) {
+    return BadRequest(error->message);
+  }
 
-  if (validate.isSome()) {
-    return BadRequest("Invalid CREATE operation: " + validate.get().message);
+  error = validation::operation::validate(
+      operation.create(),
+      slave->checkpointedResources,
+      principal,
+      slave->capabilities);
+
+  if (error.isSome()) {
+    return BadRequest(
+        "Invalid CREATE operation on agent " + stringify(*slave) + ": " +
+        error->message);
   }
 
   return master->authorizeCreateVolume(operation.create(), principal)
@@ -1133,7 +1295,8 @@ Future<Response> Master::Http::_createVolumes(
       // The resources required for this operation are equivalent to the
       // volumes specified by the user minus any DiskInfo (DiskInfo will
       // be created when this operation is applied).
-      return _operation(slaveId, removeDiskInfos(volumes), operation);
+      return _operation(
+          slaveId, removeDiskInfos(operation.create().volumes()), operation);
     }));
 }
 
@@ -1249,7 +1412,7 @@ Future<Response> Master::Http::destroyVolumes(
         parse.error());
   }
 
-  Resources volumes;
+  RepeatedPtrField<Resource> volumes;
   foreach (const JSON::Value& value, parse.get().values) {
     Try<Resource> volume = ::protobuf::parse<Resource>(value);
     if (volume.isError()) {
@@ -1258,14 +1421,7 @@ Future<Response> Master::Http::destroyVolumes(
           volume.error());
     }
 
-    // Since the `+=` operator will silently drop invalid resources, we validate
-    // each resource individually.
-    Option<Error> error = Resources::validate(volume.get());
-    if (error.isSome()) {
-      return BadRequest(error.get().message);
-    }
-
-    volumes += volume.get();
+    volumes.Add()->CopyFrom(volume.get());
   }
 
   return _destroyVolumes(slaveId, volumes, principal);
@@ -1287,14 +1443,19 @@ Future<Response> Master::Http::_destroyVolumes(
   operation.set_type(Offer::Operation::DESTROY);
   operation.mutable_destroy()->mutable_volumes()->CopyFrom(volumes);
 
-  Option<Error> validate = validation::operation::validate(
+  Option<Error> error = validateAndNormalizeResources(&operation);
+  if (error.isSome()) {
+    return BadRequest(error->message);
+  }
+
+  error = validation::operation::validate(
       operation.destroy(),
       slave->checkpointedResources,
       slave->usedResources,
       slave->pendingTasks);
 
-  if (validate.isSome()) {
-    return BadRequest("Invalid DESTROY operation: " + validate.get().message);
+  if (error.isSome()) {
+    return BadRequest("Invalid DESTROY operation: " + error->message);
   }
 
   return master->authorizeDestroyVolume(operation.destroy(), principal)
@@ -1303,7 +1464,7 @@ Future<Response> Master::Http::_destroyVolumes(
         return Forbidden();
       }
 
-      return _operation(slaveId, volumes, operation);
+      return _operation(slaveId, operation.destroy().volumes(), operation);
     }));
 }
 
@@ -1343,7 +1504,11 @@ string Master::Http::FRAMEWORKS_HELP()
         "current master is not the leader.",
         "",
         "Returns 503 SERVICE_UNAVAILABLE if the leading master cannot be",
-        "found."),
+        "found.",
+        "",
+        "Query parameters:",
+        ">        framework_id=VALUE   The ID of the framework returned "
+        "(if no framework ID is specified, all frameworks will be returned)."),
     AUTHENTICATION(true),
     AUTHORIZATION(
         "This endpoint might be filtered based on the user accessing it.",
@@ -1369,87 +1534,89 @@ Future<Response> Master::Http::frameworks(
     return redirect(request);
   }
 
-  // Retrieve `ObjectApprover`s for authorizing frameworks and tasks and
-  // executors.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> tasksApprover;
-  Future<Owned<ObjectApprover>> executorsApprover;
+  Future<Owned<AuthorizationAcceptor>> authorizeFrameworkInfo =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_FRAMEWORK);
+  Future<Owned<AuthorizationAcceptor>> authorizeTask =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_TASK);
+  Future<Owned<AuthorizationAcceptor>> authorizeExecutorInfo =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_EXECUTOR);
+  Future<IDAcceptor<FrameworkID>> selectFrameworkId =
+    IDAcceptor<FrameworkID>(request.url.query.get("framework_id"));
 
-  if (master->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    frameworksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
-
-    tasksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_TASK);
-
-    executorsApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_EXECUTOR);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    tasksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return collect(frameworksApprover, tasksApprover, executorsApprover)
+  return collect(
+      authorizeFrameworkInfo,
+      authorizeTask,
+      authorizeExecutorInfo,
+      selectFrameworkId)
     .then(defer(master->self(),
-        [this, request](const tuple<Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>>& approvers)
+        [this, request](const tuple<Owned<AuthorizationAcceptor>,
+                                    Owned<AuthorizationAcceptor>,
+                                    Owned<AuthorizationAcceptor>,
+                                    IDAcceptor<FrameworkID>>& acceptors)
           -> Response {
       // This lambda is consumed before the outer lambda
       // returns, hence capture by reference is fine here.
-      auto frameworks = [this, &approvers](JSON::ObjectWriter* writer) {
-        // Get approver from tuple.
-        Owned<ObjectApprover> frameworksApprover;
-        Owned<ObjectApprover> tasksApprover;
-        Owned<ObjectApprover> executorsApprover;
-        tie(frameworksApprover, tasksApprover, executorsApprover) = approvers;
+      auto frameworks = [this, &acceptors](JSON::ObjectWriter* writer) {
+        Owned<AuthorizationAcceptor> authorizeFrameworkInfo;
+        Owned<AuthorizationAcceptor> authorizeTask;
+        Owned<AuthorizationAcceptor> authorizeExecutorInfo;
+        IDAcceptor<FrameworkID> selectFrameworkId;
+        tie(authorizeFrameworkInfo,
+            authorizeTask,
+            authorizeExecutorInfo,
+            selectFrameworkId) = acceptors;
 
         // Model all of the frameworks.
         writer->field(
             "frameworks",
-            [this, &frameworksApprover, &executorsApprover, &tasksApprover](
-                JSON::ArrayWriter* writer) {
-              foreachvalue (Framework* framework,
-                            master->frameworks.registered) {
-                // Skip unauthorized frameworks.
-                if (!approveViewFrameworkInfo(
-                        frameworksApprover, framework->info)) {
-                  continue;
-                }
+            [this,
+             &authorizeFrameworkInfo,
+             &authorizeTask,
+             &authorizeExecutorInfo,
+             &selectFrameworkId](JSON::ArrayWriter* writer) {
+          foreachvalue (Framework* framework, master->frameworks.registered) {
+            // Skip unauthorized frameworks or frameworks without a matching ID.
+            if (!selectFrameworkId.accept(framework->id()) ||
+                !authorizeFrameworkInfo->accept(framework->info)) {
+              continue;
+            }
 
-                FullFrameworkWriter frameworkWriter(
-                    tasksApprover,
-                    executorsApprover,
-                    framework);
+            FullFrameworkWriter frameworkWriter(
+                authorizeTask,
+                authorizeExecutorInfo,
+                framework);
 
-                writer->element(frameworkWriter);
-              }
-            });
+            writer->element(frameworkWriter);
+          }
+        });
 
         // Model all of the completed frameworks.
         writer->field(
             "completed_frameworks",
-            [this, &frameworksApprover, &executorsApprover, &tasksApprover](
-                JSON::ArrayWriter* writer) {
-              foreachvalue (const Owned<Framework>& framework,
-                            master->frameworks.completed) {
-                // Skip unauthorized frameworks.
-                if (!approveViewFrameworkInfo(
-                        frameworksApprover, framework->info)) {
-                  continue;
-                }
+            [this,
+             &authorizeFrameworkInfo,
+             &authorizeTask,
+             &authorizeExecutorInfo,
+             &selectFrameworkId](JSON::ArrayWriter* writer) {
+          foreachvalue (const Owned<Framework>& framework,
+                        master->frameworks.completed) {
+            // Skip unauthorized frameworks or frameworks without a matching ID.
+            if (!selectFrameworkId.accept(framework->id()) ||
+                !authorizeFrameworkInfo->accept(framework->info)) {
+              continue;
+            }
 
-                FullFrameworkWriter frameworkWriter(
-                    tasksApprover,
-                    executorsApprover,
-                    framework.get());
+            FullFrameworkWriter frameworkWriter(
+                authorizeTask,
+                authorizeExecutorInfo,
+                framework.get());
 
-                writer->element(frameworkWriter);
-              }
-            });
+            writer->element(frameworkWriter);
+          }
+        });
 
         // Unregistered frameworks are no longer possible. We emit an
         // empty array for the sake of backward compatibility.
@@ -1495,11 +1662,15 @@ mesos::master::Response::GetFrameworks::Framework model(
     _framework.mutable_inverse_offers()->Add()->CopyFrom(*offer);
   }
 
-  foreach (const Resource& resource, framework.totalUsedResources) {
+  foreach (Resource resource, framework.totalUsedResources) {
+    convertResourceFormat(&resource, ENDPOINT);
+
     _framework.mutable_allocated_resources()->Add()->CopyFrom(resource);
   }
 
-  foreach (const Resource& resource, framework.totalOfferedResources) {
+  foreach (Resource resource, framework.totalOfferedResources) {
+    convertResourceFormat(&resource, ENDPOINT);
+
     _framework.mutable_offered_resources()->Add()->CopyFrom(resource);
   }
 
@@ -1694,27 +1865,41 @@ Future<Response> Master::Http::getState(
     executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
   }
 
-  return collect(frameworksApprover, tasksApprover, executorsApprover)
+  Future<Owned<AuthorizationAcceptor>> rolesAcceptor =
+    AuthorizationAcceptor::create(
+        principal,
+        master->authorizer,
+        authorization::VIEW_ROLE);
+
+  return collect(
+      frameworksApprover, tasksApprover, executorsApprover, rolesAcceptor)
     .then(defer(master->self(),
-      [=](const tuple<Owned<ObjectApprover>,
-                      Owned<ObjectApprover>,
-                      Owned<ObjectApprover>>& approvers)
-        -> Future<Response> {
-      // Get approver from tuple.
-      Owned<ObjectApprover> frameworksApprover;
-      Owned<ObjectApprover> tasksApprover;
-      Owned<ObjectApprover> executorsApprover;
-      tie(frameworksApprover, tasksApprover, executorsApprover) = approvers;
+        [=](const tuple<Owned<ObjectApprover>,
+                        Owned<ObjectApprover>,
+                        Owned<ObjectApprover>,
+                        Owned<AuthorizationAcceptor>>& approvers)
+            -> Future<Response> {
+          // Get approver from tuple.
+          Owned<ObjectApprover> frameworksApprover;
+          Owned<ObjectApprover> tasksApprover;
+          Owned<ObjectApprover> executorsApprover;
+          Owned<AuthorizationAcceptor> rolesAcceptor;
+          tie(frameworksApprover,
+              tasksApprover,
+              executorsApprover,
+              rolesAcceptor) = approvers;
 
-      mesos::master::Response response;
-      response.set_type(mesos::master::Response::GET_STATE);
-      response.mutable_get_state()->CopyFrom(
-          _getState(frameworksApprover,
-                    tasksApprover,
-                    executorsApprover));
+          mesos::master::Response response;
+          response.set_type(mesos::master::Response::GET_STATE);
+          response.mutable_get_state()->CopyFrom(
+              _getState(
+                  frameworksApprover,
+                  tasksApprover,
+                  executorsApprover,
+                  rolesAcceptor));
 
-      return OK(serialize(contentType, evolve(response)),
-                stringify(contentType));
+          return OK(
+              serialize(contentType, evolve(response)), stringify(contentType));
     }));
 }
 
@@ -1722,7 +1907,8 @@ Future<Response> Master::Http::getState(
 mesos::master::Response::GetState Master::Http::_getState(
     const Owned<ObjectApprover>& frameworksApprover,
     const Owned<ObjectApprover>& tasksApprover,
-    const Owned<ObjectApprover>& executorsApprover) const
+    const Owned<ObjectApprover>& executorsApprover,
+    const Owned<AuthorizationAcceptor>& rolesAcceptor) const
 {
   // NOTE: This function must be blocking instead of returning a
   // `Future`. This is because `subscribe()` needs to atomically
@@ -1740,7 +1926,7 @@ mesos::master::Response::GetState Master::Http::_getState(
   getState.mutable_get_frameworks()->CopyFrom(
       _getFrameworks(frameworksApprover));
 
-  getState.mutable_get_agents()->CopyFrom(_getAgents());
+  getState.mutable_get_agents()->CopyFrom(_getAgents(rolesAcceptor));
 
   return getState;
 }
@@ -1998,10 +2184,32 @@ Future<Response> Master::Http::setLoggingLevel(
   Duration duration =
     Nanoseconds(call.set_logging_level().duration().nanoseconds());
 
-  return dispatch(process::logging(), &Logging::set_level, level, duration)
-      .then([]() -> Response {
-        return OK();
-      });
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::SET_LOG_LEVEL);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver.then([level, duration](const Owned<ObjectApprover>& approver)
+      -> Future<Response> {
+    Try<bool> approved = approver->approved((ObjectApprover::Object()));
+
+    if (approved.isError()) {
+      return InternalServerError("Authorization error: " + approved.error());
+    } else if (!approved.get()) {
+      return Forbidden();
+    }
+
+    return dispatch(process::logging(), &Logging::set_level, level, duration)
+        .then([]() -> Response {
+          return OK();
+        });
+  });
 }
 
 
@@ -2191,7 +2399,7 @@ Future<Response> Master::Http::reserve(
         parse.error());
   }
 
-  Resources resources;
+  RepeatedPtrField<Resource> resources;
   foreach (const JSON::Value& value, parse.get().values) {
     Try<Resource> resource = ::protobuf::parse<Resource>(value);
     if (resource.isError()) {
@@ -2200,14 +2408,7 @@ Future<Response> Master::Http::reserve(
           resource.error());
     }
 
-    // Since the `+=` operator will silently drop invalid resources, we validate
-    // each resource individually.
-    Option<Error> error = Resources::validate(resource.get());
-    if (error.isSome()) {
-      return BadRequest(error.get().message);
-    }
-
-    resources += resource.get();
+    resources.Add()->CopyFrom(resource.get());
   }
 
   return _reserve(slaveId, resources, principal);
@@ -2216,7 +2417,7 @@ Future<Response> Master::Http::reserve(
 
 Future<Response> Master::Http::_reserve(
     const SlaveID& slaveId,
-    const Resources& resources,
+    const RepeatedPtrField<Resource>& resources,
     const Option<Principal>& principal) const
 {
   Slave* slave = master->slaves.registered.get(slaveId);
@@ -2229,11 +2430,18 @@ Future<Response> Master::Http::_reserve(
   operation.set_type(Offer::Operation::RESERVE);
   operation.mutable_reserve()->mutable_resources()->CopyFrom(resources);
 
-  Option<Error> error = validation::operation::validate(
-      operation.reserve(), principal);
+  Option<Error> error = validateAndNormalizeResources(&operation);
+  if (error.isSome()) {
+    return BadRequest(error->message);
+  }
+
+  error = validation::operation::validate(
+      operation.reserve(), principal, slave->capabilities);
 
   if (error.isSome()) {
-    return BadRequest("Invalid RESERVE operation: " + error.get().message);
+    return BadRequest(
+        "Invalid RESERVE operation on agent " + stringify(*slave) + ": " +
+        error->message);
   }
 
   return master->authorizeReserveResources(operation.reserve(), principal)
@@ -2242,11 +2450,12 @@ Future<Response> Master::Http::_reserve(
         return Forbidden();
       }
 
-      // NOTE: `flatten()` is important. To make a dynamic reservation,
-      // we want to ensure that the required resources are available
-      // and unreserved; `flatten()` removes the role and
-      // ReservationInfo from the resources.
-      return _operation(slaveId, resources.flatten(), operation);
+      // We only allow "pushing" a single reservation at a time, so we require
+      // the resources with one reservation "popped" to be present on the agent.
+      Resources required =
+        Resources(operation.reserve().resources()).popReservation();
+
+      return _operation(slaveId, required, operation);
     }));
 }
 
@@ -2259,7 +2468,8 @@ Future<Response> Master::Http::reserveResources(
   CHECK_EQ(mesos::master::Call::RESERVE_RESOURCES, call.type());
 
   const SlaveID& slaveId = call.reserve_resources().slave_id();
-  const Resources& resources = call.reserve_resources().resources();
+  const RepeatedPtrField<Resource>& resources =
+    call.reserve_resources().resources();
 
   return _reserve(slaveId, resources, principal);
 }
@@ -2281,95 +2491,46 @@ string Master::Http::SLAVES_HELP()
         "",
         "This endpoint shows information about the agents which are registered",
         "in this master or recovered from registry, formatted as a JSON",
-        "object."),
+        "object.",
+        "",
+        "Query parameters:",
+        ">        slave_id=VALUE       The ID of the slave returned "
+        "(when no slave_id is specified, all slaves will be returned)."),
     AUTHENTICATION(true));
 }
 
 
 Future<Response> Master::Http::slaves(
     const Request& request,
-    const Option<Principal>&) const
+    const Option<Principal>& principal) const
 {
   // When current master is not the leader, redirect to the leading master.
   if (!master->elected()) {
     return redirect(request);
   }
 
-  auto slaves = [this](JSON::ObjectWriter* writer) {
-    writer->field("slaves", [this](JSON::ArrayWriter* writer) {
-      foreachvalue (const Slave* slave, master->slaves.registered) {
-        writer->element([&slave](JSON::ObjectWriter* writer) {
-          json(writer, Full<Slave>(*slave));
+  Future<Owned<AuthorizationAcceptor>> authorizeRole =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_ROLE);
+  Future<IDAcceptor<SlaveID>> selectSlaveId =
+    IDAcceptor<SlaveID>(request.url.query.get("slave_id"));
 
-          // Add the complete protobuf->JSON for all used, reserved,
-          // and offered resources. The other endpoints summarize
-          // resource information, which omits the details of
-          // reservations and persistent volumes. Full resource
-          // information is necessary so that operators can use the
-          // `/unreserve` and `/destroy-volumes` endpoints.
+  Master* master = this->master;
+  Option<string> jsonp = request.url.query.get("jsonp");
 
-          hashmap<string, Resources> reserved =
-            slave->totalResources.reservations();
+  return collect(authorizeRole, selectSlaveId)
+    .then(defer(master->self(),
+        [master, jsonp](const tuple<Owned<AuthorizationAcceptor>,
+                                    IDAcceptor<SlaveID>>& acceptors)
+          -> Future<Response> {
+      Owned<AuthorizationAcceptor> authorizeRole;
+      IDAcceptor<SlaveID> selectSlaveId;
+      tie(authorizeRole, selectSlaveId) = acceptors;
 
-          writer->field(
-              "reserved_resources_full",
-              [&reserved](JSON::ObjectWriter* writer) {
-                foreachpair (const string& role,
-                             const Resources& resources,
-                             reserved) {
-                  writer->field(role, [&resources](JSON::ArrayWriter* writer) {
-                    foreach (const Resource& resource, resources) {
-                      writer->element(JSON::Protobuf(resource));
-                    }
-                  });
-                }
-              });
-
-
-          Resources unreservedResources = slave->totalResources.unreserved();
-
-          writer->field(
-              "unreserved_resources_full",
-              [&unreservedResources](JSON::ArrayWriter* writer) {
-                foreach (const Resource& resource, unreservedResources) {
-                  writer->element(JSON::Protobuf(resource));
-                }
-              });
-
-          Resources usedResources = Resources::sum(slave->usedResources);
-
-          writer->field(
-              "used_resources_full",
-              [&usedResources](JSON::ArrayWriter* writer) {
-                foreach (const Resource& resource, usedResources) {
-                  writer->element(JSON::Protobuf(resource));
-                }
-              });
-
-          const Resources& offeredResources = slave->offeredResources;
-
-          writer->field(
-              "offered_resources_full",
-              [&offeredResources](JSON::ArrayWriter* writer) {
-                foreach (const Resource& resource, offeredResources) {
-                  writer->element(JSON::Protobuf(resource));
-                }
-              });
-        });
-      };
-    });
-
-    // Model all of the recovered slaves.
-    writer->field("recovered_slaves", [this](JSON::ArrayWriter* writer) {
-      foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
-        writer->element([&slaveInfo](JSON::ObjectWriter* writer) {
-          json(writer, slaveInfo);
-        });
-      }
-    });
-  };
-
-  return OK(jsonify(slaves), request.url.query.get("jsonp"));
+      return OK(
+          jsonify(SlavesWriter(master->slaves, authorizeRole, selectSlaveId)),
+          jsonp);
+  }));
 }
 
 
@@ -2380,25 +2541,42 @@ Future<process::http::Response> Master::Http::getAgents(
 {
   CHECK_EQ(mesos::master::Call::GET_AGENTS, call.type());
 
-  mesos::master::Response response;
-  response.set_type(mesos::master::Response::GET_AGENTS);
-  response.mutable_get_agents()->CopyFrom(_getAgents());
+  return AuthorizationAcceptor::create(
+      principal,
+      master->authorizer,
+      authorization::VIEW_ROLE)
+    .then(defer(master->self(),
+        [=](const Owned<AuthorizationAcceptor>& rolesAcceptor)
+            -> Future<process::http::Response> {
+          mesos::master::Response response;
+          response.set_type(mesos::master::Response::GET_AGENTS);
+          response.mutable_get_agents()->CopyFrom(_getAgents(rolesAcceptor));
 
-  return OK(serialize(contentType, evolve(response)),
-            stringify(contentType));
+          return OK(serialize(contentType, evolve(response)),
+                    stringify(contentType));
+    }));
 }
 
 
-mesos::master::Response::GetAgents Master::Http::_getAgents() const
+mesos::master::Response::GetAgents Master::Http::_getAgents(
+    const Owned<AuthorizationAcceptor>& rolesAcceptor) const
 {
   mesos::master::Response::GetAgents getAgents;
   foreachvalue (const Slave* slave, master->slaves.registered) {
     mesos::master::Response::GetAgents::Agent* agent = getAgents.add_agents();
-    agent->CopyFrom(protobuf::master::event::createAgentResponse(*slave));
+    agent->CopyFrom(
+        protobuf::master::event::createAgentResponse(*slave, rolesAcceptor));
   }
 
   foreachvalue (const SlaveInfo& slaveInfo, master->slaves.recovered) {
-    getAgents.add_recovered_agents()->CopyFrom(slaveInfo);
+    SlaveInfo* agent = getAgents.add_recovered_agents();
+    agent->CopyFrom(slaveInfo);
+    agent->clear_resources();
+    foreach (const Resource& resource, slaveInfo.resources()) {
+      if (authorizeResource(resource, rolesAcceptor)) {
+        agent->add_resources()->CopyFrom(resource);
+      }
+    }
   }
 
   return getAgents;
@@ -2648,57 +2826,49 @@ Future<Response> Master::Http::state(
     return redirect(request);
   }
 
-  // Retrieve `ObjectApprover`s for authorizing frameworks and tasks.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> tasksApprover;
-  Future<Owned<ObjectApprover>> executorsApprover;
-  Future<Owned<ObjectApprover>> flagsApprover;
-
-  if (master->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    frameworksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
-
-    tasksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_TASK);
-
-    executorsApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_EXECUTOR);
-
-    flagsApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FLAGS);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    tasksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    executorsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    flagsApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
+  Future<Owned<AuthorizationAcceptor>> authorizeRole =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_ROLE);
+  Future<Owned<AuthorizationAcceptor>> authorizeFrameworkInfo =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_FRAMEWORK);
+  Future<Owned<AuthorizationAcceptor>> authorizeTask =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_TASK);
+  Future<Owned<AuthorizationAcceptor>> authorizeExecutorInfo =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_EXECUTOR);
+  Future<Owned<AuthorizationAcceptor>> authorizeFlags =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_FLAGS);
 
   return collect(
-      frameworksApprover,
-      tasksApprover,
-      executorsApprover,
-      flagsApprover)
+      authorizeRole,
+      authorizeFrameworkInfo,
+      authorizeTask,
+      authorizeExecutorInfo,
+      authorizeFlags)
     .then(defer(
         master->self(),
-        [this, request](const tuple<Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>,
-                                    Owned<ObjectApprover>>& approvers)
+        [this, request](const tuple<Owned<AuthorizationAcceptor>,
+                                    Owned<AuthorizationAcceptor>,
+                                    Owned<AuthorizationAcceptor>,
+                                    Owned<AuthorizationAcceptor>,
+                                    Owned<AuthorizationAcceptor>>& acceptors)
           -> Response {
       // This lambda is consumed before the outer lambda
       // returns, hence capture by reference is fine here.
-      auto state = [this, &approvers](JSON::ObjectWriter* writer) {
-        // Get approver from tuple.
-        Owned<ObjectApprover> frameworksApprover;
-        Owned<ObjectApprover> tasksApprover;
-        Owned<ObjectApprover> executorsApprover;
-        Owned<ObjectApprover> flagsApprover;
-        tie(frameworksApprover,
-            tasksApprover,
-            executorsApprover,
-            flagsApprover) = approvers;
+      auto state = [this, &acceptors](JSON::ObjectWriter* writer) {
+        Owned<AuthorizationAcceptor> authorizeRole;
+        Owned<AuthorizationAcceptor> authorizeFrameworkInfo;
+        Owned<AuthorizationAcceptor> authorizeTask;
+        Owned<AuthorizationAcceptor> authorizeExecutorInfo;
+        Owned<AuthorizationAcceptor> authorizeFlags;
+        tie(authorizeRole,
+            authorizeFrameworkInfo,
+            authorizeTask,
+            authorizeExecutorInfo,
+            authorizeFlags) = acceptors;
 
         writer->field("version", MESOS_VERSION);
 
@@ -2730,6 +2900,10 @@ Future<Response> Master::Http::state(
         writer->field("deactivated_slaves", master->_slaves_inactive());
         writer->field("unreachable_slaves", master->_slaves_unreachable());
 
+        if (master->info().has_domain()) {
+          writer->field("domain", master->info().domain());
+        }
+
         // TODO(haosdent): Deprecated this in favor of `leader_info` below.
         if (master->leader.isSome()) {
           writer->field("leader", master->leader->pid());
@@ -2741,7 +2915,7 @@ Future<Response> Master::Http::state(
           });
         }
 
-        if (approveViewFlags(flagsApprover)) {
+        if (authorizeFlags->accept()) {
           if (master->flags.cluster.isSome()) {
             writer->field("cluster", master->flags.cluster.get());
           }
@@ -2766,11 +2940,12 @@ Future<Response> Master::Http::state(
         }
 
         // Model all of the registered slaves.
-        writer->field("slaves", [this](JSON::ArrayWriter* writer) {
-          foreachvalue (Slave* slave, master->slaves.registered) {
-            writer->element(Full<Slave>(*slave));
-          }
-        });
+        writer->field("slaves",
+          [this, &authorizeRole](JSON::ArrayWriter* writer) {
+            foreachvalue (Slave* slave, master->slaves.registered) {
+              writer->element(SlaveWriter(*slave, authorizeRole));
+            }
+          });
 
         // Model all of the recovered slaves.
         writer->field("recovered_slaves", [this](JSON::ArrayWriter* writer) {
@@ -2784,43 +2959,49 @@ Future<Response> Master::Http::state(
         // Model all of the frameworks.
         writer->field(
             "frameworks",
-            [this, &frameworksApprover, &executorsApprover, &tasksApprover](
-                JSON::ArrayWriter* writer) {
-              foreachvalue (
-                  Framework* framework,
-                  master->frameworks.registered) {
-                // Skip unauthorized frameworks.
-                if (!approveViewFrameworkInfo(
-                        frameworksApprover, framework->info)) {
-                  continue;
-                }
+            [this,
+             &authorizeFrameworkInfo,
+             &authorizeTask,
+             &authorizeExecutorInfo](JSON::ArrayWriter* writer) {
+          foreachvalue (
+              Framework* framework,
+              master->frameworks.registered) {
+            // Skip unauthorized frameworks.
+            if (!authorizeFrameworkInfo->accept(framework->info)) {
+              continue;
+            }
 
-                auto frameworkWriter = FullFrameworkWriter(
-                    tasksApprover, executorsApprover, framework);
+            auto frameworkWriter = FullFrameworkWriter(
+                authorizeTask,
+                authorizeExecutorInfo,
+                framework);
 
-                writer->element(frameworkWriter);
-              }
-            });
+            writer->element(frameworkWriter);
+          }
+        });
 
         // Model all of the completed frameworks.
         writer->field(
             "completed_frameworks",
-            [this, &frameworksApprover, &executorsApprover, &tasksApprover](
-                JSON::ArrayWriter* writer) {
-              foreachvalue (const Owned<Framework>& framework,
-                            master->frameworks.completed) {
-                // Skip unauthorized frameworks.
-                if (!approveViewFrameworkInfo(
-                    frameworksApprover, framework->info)) {
-                  continue;
-                }
+            [this,
+             &authorizeFrameworkInfo,
+             &authorizeTask,
+             &authorizeExecutorInfo](JSON::ArrayWriter* writer) {
+          foreachvalue (const Owned<Framework>& framework,
+                        master->frameworks.completed) {
+            // Skip unauthorized frameworks.
+            if (!authorizeFrameworkInfo->accept(framework->info)) {
+              continue;
+            }
 
-                auto frameworkWriter = FullFrameworkWriter(
-                    tasksApprover, executorsApprover, framework.get());
+            auto frameworkWriter = FullFrameworkWriter(
+                authorizeTask,
+                authorizeExecutorInfo,
+                framework.get());
 
-                writer->element(frameworkWriter);
-              }
-            });
+            writer->element(frameworkWriter);
+          }
+        });
 
         // Orphan tasks are no longer possible. We emit an empty array
         // for the sake of backward compatibility.
@@ -3107,147 +3288,156 @@ Future<Response> Master::Http::stateSummary(
     return redirect(request);
   }
 
-  Future<Owned<ObjectApprover>> frameworksApprover;
+  Future<Owned<AuthorizationAcceptor>> authorizeRole =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_ROLE);
+  Future<Owned<AuthorizationAcceptor>> authorizeFrameworkInfo =
+    AuthorizationAcceptor::create(
+        principal, master->authorizer, authorization::VIEW_FRAMEWORK);
 
-  if (master->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
-
-    frameworksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
-
-  return frameworksApprover
-    .then(defer(
-        master->self(),
-        [this, request](const Owned<ObjectApprover>& frameworksApprover)
+  return collect(authorizeRole, authorizeFrameworkInfo).then(defer(
+      master->self(),
+      [this, request](const tuple<Owned<AuthorizationAcceptor>,
+                                  Owned<AuthorizationAcceptor>>& acceptors)
           -> Response {
-      auto stateSummary =
-          [this, &frameworksApprover](JSON::ObjectWriter* writer) {
-        writer->field("hostname", master->info().hostname());
+        auto stateSummary = [this, &acceptors](JSON::ObjectWriter* writer) {
+          Owned<AuthorizationAcceptor> authorizeRole;
+          Owned<AuthorizationAcceptor> authorizeFrameworkInfo;
+          tie(authorizeRole, authorizeFrameworkInfo) = acceptors;
 
-        if (master->flags.cluster.isSome()) {
-          writer->field("cluster", master->flags.cluster.get());
-        }
+          writer->field("hostname", master->info().hostname());
 
-        // We use the tasks in the 'Frameworks' struct to compute summaries
-        // for this endpoint. This is done 1) for consistency between the
-        // 'slaves' and 'frameworks' subsections below 2) because we want to
-        // provide summary information for frameworks that are currently
-        // registered 3) the frameworks keep a circular buffer of completed
-        // tasks that we can use to keep a limited view on the history of
-        // recent completed / failed tasks.
+          if (master->flags.cluster.isSome()) {
+            writer->field("cluster", master->flags.cluster.get());
+          }
 
-        // Generate mappings from 'slave' to 'framework' and reverse.
-        SlaveFrameworkMapping slaveFrameworkMapping(
-            master->frameworks.registered);
+          // We use the tasks in the 'Frameworks' struct to compute summaries
+          // for this endpoint. This is done 1) for consistency between the
+          // 'slaves' and 'frameworks' subsections below 2) because we want to
+          // provide summary information for frameworks that are currently
+          // registered 3) the frameworks keep a circular buffer of completed
+          // tasks that we can use to keep a limited view on the history of
+          // recent completed / failed tasks.
 
-        // Generate 'TaskState' summaries for all framework and slave ids.
-        TaskStateSummaries taskStateSummaries(master->frameworks.registered);
+          // Generate mappings from 'slave' to 'framework' and reverse.
+          SlaveFrameworkMapping slaveFrameworkMapping(
+              master->frameworks.registered);
 
-        // Model all of the slaves.
-        writer->field(
-            "slaves",
-            [this, &slaveFrameworkMapping, &taskStateSummaries](
-                JSON::ArrayWriter* writer) {
-          foreachvalue (Slave* slave, master->slaves.registered) {
-            writer->element(
-                [&slave, &slaveFrameworkMapping, &taskStateSummaries](
-                    JSON::ObjectWriter* writer) {
-              json(writer, Summary<Slave>(*slave));
+          // Generate 'TaskState' summaries for all framework and slave ids.
+          TaskStateSummaries taskStateSummaries(master->frameworks.registered);
 
-              // Add the 'TaskState' summary for this slave.
-              const TaskStateSummary& summary =
-                taskStateSummaries.slave(slave->id);
+          // Model all of the slaves.
+          writer->field(
+              "slaves",
+              [this,
+               &slaveFrameworkMapping,
+               &taskStateSummaries,
+               &authorizeRole](JSON::ArrayWriter* writer) {
+                foreachvalue (Slave* slave, master->slaves.registered) {
+                  writer->element(
+                      [&slave,
+                       &slaveFrameworkMapping,
+                       &taskStateSummaries,
+                       &authorizeRole](JSON::ObjectWriter* writer) {
+                        SlaveWriter slaveWriter(*slave, authorizeRole);
+                        slaveWriter(writer);
 
-              // Certain per-agent status totals will always be zero
-              // (e.g., TASK_ERROR, TASK_UNREACHABLE). We report them
-              // here anyway, for completeness.
-              //
-              // TODO(neilc): Update for TASK_GONE and TASK_GONE_BY_OPERATOR.
-              writer->field("TASK_STAGING", summary.staging);
-              writer->field("TASK_STARTING", summary.starting);
-              writer->field("TASK_RUNNING", summary.running);
-              writer->field("TASK_KILLING", summary.killing);
-              writer->field("TASK_FINISHED", summary.finished);
-              writer->field("TASK_KILLED", summary.killed);
-              writer->field("TASK_FAILED", summary.failed);
-              writer->field("TASK_LOST", summary.lost);
-              writer->field("TASK_ERROR", summary.error);
-              writer->field("TASK_UNREACHABLE", summary.unreachable);
+                        // Add the 'TaskState' summary for this slave.
+                        const TaskStateSummary& summary =
+                            taskStateSummaries.slave(slave->id);
 
-              // Add the ids of all the frameworks running on this slave.
-              const hashset<FrameworkID>& frameworks =
-                slaveFrameworkMapping.frameworks(slave->id);
+                        // Certain per-agent status totals will always be zero
+                        // (e.g., TASK_ERROR, TASK_UNREACHABLE). We report them
+                        // here anyway, for completeness.
+                        //
+                        // TODO(neilc): Update for TASK_GONE and
+                        // TASK_GONE_BY_OPERATOR.
+                        writer->field("TASK_STAGING", summary.staging);
+                        writer->field("TASK_STARTING", summary.starting);
+                        writer->field("TASK_RUNNING", summary.running);
+                        writer->field("TASK_KILLING", summary.killing);
+                        writer->field("TASK_FINISHED", summary.finished);
+                        writer->field("TASK_KILLED", summary.killed);
+                        writer->field("TASK_FAILED", summary.failed);
+                        writer->field("TASK_LOST", summary.lost);
+                        writer->field("TASK_ERROR", summary.error);
+                        writer->field("TASK_UNREACHABLE", summary.unreachable);
 
-              writer->field(
-                  "framework_ids",
-                  [&frameworks](JSON::ArrayWriter* writer) {
-                foreach (const FrameworkID& frameworkId, frameworks) {
-                  writer->element(frameworkId.value());
+                        // Add the ids of all the frameworks running on this
+                        // slave.
+                        const hashset<FrameworkID>& frameworks =
+                            slaveFrameworkMapping.frameworks(slave->id);
+
+                        writer->field(
+                            "framework_ids",
+                            [&frameworks](JSON::ArrayWriter* writer) {
+                              foreach (
+                                  const FrameworkID& frameworkId,
+                                  frameworks) {
+                                writer->element(frameworkId.value());
+                              }
+                            });
+                      });
                 }
               });
-            });
-          }
-        });
 
-        // Model all of the frameworks.
-        writer->field(
-            "frameworks",
-            [this,
-             &slaveFrameworkMapping,
-             &taskStateSummaries,
-             &frameworksApprover](JSON::ArrayWriter* writer) {
-          foreachpair (const FrameworkID& frameworkId,
-                       Framework* framework,
-                       master->frameworks.registered) {
-            // Skip unauthorized frameworks.
-            if (!approveViewFrameworkInfo(
-                    frameworksApprover,
-                    framework->info)) {
-              continue;
-            }
+          // Model all of the frameworks.
+          writer->field(
+              "frameworks",
+              [this,
+               &slaveFrameworkMapping,
+               &taskStateSummaries,
+               &authorizeFrameworkInfo](JSON::ArrayWriter* writer) {
+                foreachpair (const FrameworkID& frameworkId,
+                             Framework* framework,
+                             master->frameworks.registered) {
+                  // Skip unauthorized frameworks.
+                  if (!authorizeFrameworkInfo->accept(framework->info)) {
+                    continue;
+                  }
 
-            writer->element(
-                [&frameworkId,
-                 &framework,
-                 &slaveFrameworkMapping,
-                 &taskStateSummaries](JSON::ObjectWriter* writer) {
-              json(writer, Summary<Framework>(*framework));
+                  writer->element(
+                      [&frameworkId,
+                       &framework,
+                       &slaveFrameworkMapping,
+                       &taskStateSummaries](JSON::ObjectWriter* writer) {
+                        json(writer, Summary<Framework>(*framework));
 
-              // Add the 'TaskState' summary for this framework.
-              const TaskStateSummary& summary =
-                taskStateSummaries.framework(frameworkId);
+                        // Add the 'TaskState' summary for this framework.
+                        const TaskStateSummary& summary =
+                            taskStateSummaries.framework(frameworkId);
 
-              // TODO(neilc): Update for TASK_GONE and TASK_GONE_BY_OPERATOR.
-              writer->field("TASK_STAGING", summary.staging);
-              writer->field("TASK_STARTING", summary.starting);
-              writer->field("TASK_RUNNING", summary.running);
-              writer->field("TASK_KILLING", summary.killing);
-              writer->field("TASK_FINISHED", summary.finished);
-              writer->field("TASK_KILLED", summary.killed);
-              writer->field("TASK_FAILED", summary.failed);
-              writer->field("TASK_LOST", summary.lost);
-              writer->field("TASK_ERROR", summary.error);
-              writer->field("TASK_UNREACHABLE", summary.unreachable);
+                        // TODO(neilc): Update for TASK_GONE and
+                        // TASK_GONE_BY_OPERATOR.
+                        writer->field("TASK_STAGING", summary.staging);
+                        writer->field("TASK_STARTING", summary.starting);
+                        writer->field("TASK_RUNNING", summary.running);
+                        writer->field("TASK_KILLING", summary.killing);
+                        writer->field("TASK_FINISHED", summary.finished);
+                        writer->field("TASK_KILLED", summary.killed);
+                        writer->field("TASK_FAILED", summary.failed);
+                        writer->field("TASK_LOST", summary.lost);
+                        writer->field("TASK_ERROR", summary.error);
+                        writer->field("TASK_UNREACHABLE", summary.unreachable);
 
-              // Add the ids of all the slaves running this framework.
-              const hashset<SlaveID>& slaves =
-                slaveFrameworkMapping.slaves(frameworkId);
+                        // Add the ids of all the slaves running this framework.
+                        const hashset<SlaveID>& slaves =
+                            slaveFrameworkMapping.slaves(frameworkId);
 
-              writer->field("slave_ids", [&slaves](JSON::ArrayWriter* writer) {
-                foreach (const SlaveID& slaveId, slaves) {
-                  writer->element(slaveId.value());
+                        writer->field(
+                            "slave_ids",
+                            [&slaves](JSON::ArrayWriter* writer) {
+                              foreach (const SlaveID& slaveId, slaves) {
+                                writer->element(slaveId.value());
+                              }
+                            });
+                      });
                 }
               });
-            });
-          }
-        });
-      };
+        };
 
-      return OK(jsonify(stateSummary), request.url.query.get("jsonp"));
-    }));
+        return OK(jsonify(stateSummary), request.url.query.get("jsonp"));
+      }));
 }
 
 
@@ -3277,7 +3467,7 @@ JSON::Object model(
   } else {
     Role* role = _role.get();
 
-    object.values["resources"] = model(role->resources());
+    object.values["resources"] = model(role->allocatedResources());
 
     {
       JSON::Array array;
@@ -3512,7 +3702,7 @@ Future<Response> Master::Http::getRoles(
         if (master->roles.contains(name)) {
           Role* role_ = master->roles.at(name);
 
-          role.mutable_resources()->CopyFrom(role_->resources());
+          role.mutable_resources()->CopyFrom(role_->allocatedResources());
 
           foreachkey (const FrameworkID& frameworkId, role_->frameworks) {
             role.add_frameworks()->CopyFrom(frameworkId);
@@ -3598,6 +3788,14 @@ Future<Response> Master::Http::teardown(
   FrameworkID id;
   id.set_value(value.get());
 
+  return _teardown(id, principal);
+}
+
+
+Future<Response> Master::Http::_teardown(
+    const FrameworkID& id,
+    const Option<Principal>& principal) const
+{
   Framework* framework = master->getFramework(id);
 
   if (framework == nullptr) {
@@ -3606,7 +3804,7 @@ Future<Response> Master::Http::teardown(
 
   // Skip authorization if no ACLs were provided to the master.
   if (master->authorizer.isNone()) {
-    return _teardown(id);
+    return __teardown(id);
   }
 
   authorization::Request teardown;
@@ -3628,12 +3826,13 @@ Future<Response> Master::Http::teardown(
       if (!authorized) {
         return Forbidden();
       }
-      return _teardown(id);
+
+      return __teardown(id);
     }));
 }
 
 
-Future<Response> Master::Http::_teardown(const FrameworkID& id) const
+Future<Response> Master::Http::__teardown(const FrameworkID& id) const
 {
   Framework* framework = master->getFramework(id);
 
@@ -3645,6 +3844,17 @@ Future<Response> Master::Http::_teardown(const FrameworkID& id) const
   master->removeFramework(framework);
 
   return OK();
+}
+
+
+Future<Response> Master::Http::teardown(
+    const mesos::master::Call& call,
+    const Option<Principal>& principal,
+    ContentType contentType) const
+{
+  CHECK_EQ(mesos::master::Call::TEARDOWN, call.type());
+
+  return _teardown(call.teardown().framework_id(), principal);
 }
 
 
@@ -3712,11 +3922,15 @@ string Master::Http::TASKS_HELP()
         "",
         "Query parameters:",
         "",
+        ">        framework_id=VALUE   Only return tasks belonging to the "
+        "framework with this ID.",
         ">        limit=VALUE          Maximum number of tasks returned "
         "(default is " + stringify(TASK_LIMIT) + ").",
         ">        offset=VALUE         Starts task list at offset.",
         ">        order=(asc|desc)     Ascending or descending sort order "
-        "(default is descending)."
+        "(default is descending).",
+        ">        task_id=VALUE        Only return tasks with this ID "
+        "(should be used together with parameter 'framework_id')."
         ""),
     AUTHENTICATION(true),
     AUTHORIZATION(
@@ -3755,106 +3969,126 @@ Future<Response> Master::Http::tasks(
   Option<string> order = request.url.query.get("order");
   string _order = order.isSome() && (order.get() == "asc") ? "asc" : "des";
 
-  // Retrieve Approvers for authorizing frameworks and tasks.
-  Future<Owned<ObjectApprover>> frameworksApprover;
-  Future<Owned<ObjectApprover>> tasksApprover;
-  if (master->authorizer.isSome()) {
-    Option<authorization::Subject> subject = createSubject(principal);
+  Future<Owned<AuthorizationAcceptor>> authorizeFrameworkInfo =
+    AuthorizationAcceptor::create(
+        principal,
+        master->authorizer,
+        authorization::VIEW_FRAMEWORK);
+  Future<Owned<AuthorizationAcceptor>> authorizeTask =
+    AuthorizationAcceptor::create(
+        principal,
+        master->authorizer,
+        authorization::VIEW_TASK);
+  Future<IDAcceptor<FrameworkID>> selectFrameworkId =
+    IDAcceptor<FrameworkID>(request.url.query.get("framework_id"));
+  Future<IDAcceptor<TaskID>> selectTaskId =
+    IDAcceptor<TaskID>(request.url.query.get("task_id"));
 
-    frameworksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_FRAMEWORK);
+  return collect(
+      authorizeFrameworkInfo,
+      authorizeTask,
+      selectFrameworkId,
+      selectTaskId)
+    .then(defer(
+        master->self(),
+        [=](const tuple<Owned<AuthorizationAcceptor>,
+                        Owned<AuthorizationAcceptor>,
+                        IDAcceptor<FrameworkID>,
+                        IDAcceptor<TaskID>>& acceptors)-> Future<Response> {
+          Owned<AuthorizationAcceptor> authorizeFrameworkInfo;
+          Owned<AuthorizationAcceptor> authorizeTask;
+          IDAcceptor<FrameworkID> selectFrameworkId;
+          IDAcceptor<TaskID> selectTaskId;
+          tie(authorizeFrameworkInfo,
+              authorizeTask,
+              selectFrameworkId,
+              selectTaskId) = acceptors;
 
-    tasksApprover = master->authorizer.get()->getObjectApprover(
-        subject, authorization::VIEW_TASK);
-  } else {
-    frameworksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-    tasksApprover = Owned<ObjectApprover>(new AcceptingObjectApprover());
-  }
+          // Construct framework list with both active and completed frameworks.
+          vector<const Framework*> frameworks;
+          foreachvalue (Framework* framework, master->frameworks.registered) {
+            // Skip unauthorized frameworks or frameworks without matching
+            // framework ID.
+            if (!selectFrameworkId.accept(framework->id()) ||
+                !authorizeFrameworkInfo->accept(framework->info)) {
+              continue;
+            }
 
-  return collect(frameworksApprover, tasksApprover)
-    .then(defer(master->self(),
-      [=](const tuple<Owned<ObjectApprover>,
-                      Owned<ObjectApprover>>& approvers)
-        -> Future<Response> {
-      // Get approver from tuple.
-      Owned<ObjectApprover> frameworksApprover;
-      Owned<ObjectApprover> tasksApprover;
-      tie(frameworksApprover, tasksApprover) = approvers;
-
-      // Construct framework list with both active and completed frameworks.
-      vector<const Framework*> frameworks;
-      foreachvalue (Framework* framework, master->frameworks.registered) {
-        // Skip unauthorized frameworks.
-        if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
-          continue;
-        }
-
-        frameworks.push_back(framework);
-      }
-
-      foreachvalue (const Owned<Framework>& framework,
-                    master->frameworks.completed) {
-        // Skip unauthorized frameworks.
-        if (!approveViewFrameworkInfo(frameworksApprover, framework->info)) {
-          continue;
-        }
-
-        frameworks.push_back(framework.get());
-      }
-
-      // Construct task list with both running and finished tasks.
-      vector<const Task*> tasks;
-      foreach (const Framework* framework, frameworks) {
-        foreachvalue (Task* task, framework->tasks) {
-          CHECK_NOTNULL(task);
-          // Skip unauthorized tasks.
-          if (!approveViewTask(tasksApprover, *task, framework->info)) {
-            continue;
+            frameworks.push_back(framework);
           }
 
-          tasks.push_back(task);
-        }
+          foreachvalue (const Owned<Framework>& framework,
+                        master->frameworks.completed) {
+            // Skip unauthorized frameworks or frameworks without matching
+            // framework ID.
+            if (!selectFrameworkId.accept(framework->id()) ||
+                !authorizeFrameworkInfo->accept(framework->info)) {
+             continue;
+            }
 
-        foreachvalue (const Owned<Task>& task, framework->unreachableTasks) {
-          // Skip unauthorized tasks.
-          if (!approveViewTask(tasksApprover, *task.get(), framework->info)) {
-            continue;
+            frameworks.push_back(framework.get());
           }
 
-          tasks.push_back(task.get());
-        }
+          // Construct task list with both running,
+          // completed and unreachable tasks.
+          vector<const Task*> tasks;
+          foreach (const Framework* framework, frameworks) {
+            foreachvalue (Task* task, framework->tasks) {
+              CHECK_NOTNULL(task);
+              // Skip unauthorized tasks or tasks without matching task ID.
+              if (!selectTaskId.accept(task->task_id()) ||
+                  !authorizeTask->accept(*task, framework->info)) {
+                continue;
+              }
 
-        foreach (const Owned<Task>& task, framework->completedTasks) {
-          // Skip unauthorized tasks.
-          if (!approveViewTask(tasksApprover, *task.get(), framework->info)) {
-            continue;
+              tasks.push_back(task);
+            }
+
+            foreachvalue (
+                const Owned<Task>& task,
+                framework->unreachableTasks) {
+              // Skip unauthorized tasks or tasks without matching task ID.
+              if (!selectTaskId.accept(task.get()->task_id()) ||
+                  !authorizeTask->accept(*task.get(), framework->info)) {
+                continue;
+              }
+
+              tasks.push_back(task.get());
+            }
+
+            foreach (const Owned<Task>& task, framework->completedTasks) {
+              // Skip unauthorized tasks or tasks without matching task ID.
+              if (!selectTaskId.accept(task.get()->task_id()) ||
+                  !authorizeTask->accept(*task.get(), framework->info)) {
+                continue;
+              }
+
+              tasks.push_back(task.get());
+            }
           }
 
-          tasks.push_back(task.get());
-        }
-      }
-
-      // Sort tasks by task status timestamp. Default order is descending.
-      // The earliest timestamp is chosen for comparison when
-      // multiple are present.
-      if (_order == "asc") {
-        sort(tasks.begin(), tasks.end(), TaskComparator::ascending);
-      } else {
-        sort(tasks.begin(), tasks.end(), TaskComparator::descending);
-      }
-
-      auto tasksWriter = [&tasks, limit, offset](JSON::ObjectWriter* writer) {
-        writer->field("tasks",
-                      [&tasks, limit, offset](JSON::ArrayWriter* writer) {
-          // Collect 'limit' number of tasks starting from 'offset'.
-          size_t end = std::min(offset + limit, tasks.size());
-          for (size_t i = offset; i < end; i++) {
-            writer->element(*tasks[i]);
+          // Sort tasks by task status timestamp. Default order is descending.
+          // The earliest timestamp is chosen for comparison when
+          // multiple are present.
+          if (_order == "asc") {
+            sort(tasks.begin(), tasks.end(), TaskComparator::ascending);
+          } else {
+            sort(tasks.begin(), tasks.end(), TaskComparator::descending);
           }
-        });
-      };
 
-      return OK(jsonify(tasksWriter), request.url.query.get("jsonp"));
+          auto tasksWriter =
+            [&tasks, limit, offset](JSON::ObjectWriter* writer) {
+            writer->field("tasks",
+                          [&tasks, limit, offset](JSON::ArrayWriter* writer) {
+              // Collect 'limit' number of tasks starting from 'offset'.
+              size_t end = std::min(offset + limit, tasks.size());
+              for (size_t i = offset; i < end; i++) {
+                writer->element(*tasks[i]);
+              }
+            });
+          };
+
+          return OK(jsonify(tasksWriter), request.url.query.get("jsonp"));
   }));
 }
 
@@ -4004,14 +4238,23 @@ string Master::Http::MAINTENANCE_SCHEDULE_HELP()
         "",
         "POST: Validates the request body as JSON",
         "and updates the maintenance schedule."),
-    AUTHENTICATION(true));
+    AUTHENTICATION(true),
+    AUTHORIZATION(
+        "GET: The response will contain only the maintenance schedule for",
+        "those machines the current principal is allowed to see. If none",
+        "an empty response will be returned.",
+        "",
+        "POST: The current principal must be authorized to modify the",
+        "maintenance schedule of all the machines in the request. If the",
+        "principal is unauthorized to modify the schedule for at least one",
+        "machine, the whole request will fail."));
 }
 
 
 // /master/maintenance/schedule endpoint handler.
 Future<Response> Master::Http::maintenanceSchedule(
     const Request& request,
-    const Option<Principal>&) const
+    const Option<Principal>& principal) const
 {
   // When current master is not the leader, redirect to the leading master.
   if (!master->elected()) {
@@ -4024,8 +4267,27 @@ Future<Response> Master::Http::maintenanceSchedule(
 
   // JSON-ify and return the current maintenance schedule.
   if (request.method == "GET") {
-    const mesos::maintenance::Schedule schedule = _getMaintenanceSchedule();
-    return OK(JSON::protobuf(schedule), request.url.query.get("jsonp"));
+    Future<Owned<ObjectApprover>> approver;
+
+    if (master->authorizer.isSome()) {
+      Option<authorization::Subject> subject = createSubject(principal);
+
+      approver = master->authorizer.get()->getObjectApprover(
+          subject, authorization::GET_MAINTENANCE_SCHEDULE);
+    } else {
+      approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+    }
+
+    Option<string> jsonp = request.url.query.get("jsonp");
+
+    return approver.then(defer(
+        master->self(),
+        [this, jsonp](
+            const Owned<ObjectApprover>& approver) -> Future<Response> {
+          const mesos::maintenance::Schedule schedule =
+            _getMaintenanceSchedule(approver);
+          return OK(JSON::protobuf(schedule), jsonp);
+        }));
   }
 
   // Parse the POST body as JSON.
@@ -4042,24 +4304,55 @@ Future<Response> Master::Http::maintenanceSchedule(
     return BadRequest(protoSchedule.error());
   }
 
-  return _updateMaintenanceSchedule(protoSchedule.get());
+  return _updateMaintenanceSchedule(protoSchedule.get(), principal);
 }
 
 
-mesos::maintenance::Schedule Master::Http::_getMaintenanceSchedule() const
+mesos::maintenance::Schedule Master::Http::_getMaintenanceSchedule(
+    const Owned<ObjectApprover>& approver) const
 {
   // TODO(josephw): Return more than one schedule.
-  const mesos::maintenance::Schedule schedule =
-    master->maintenance.schedules.empty() ?
-      mesos::maintenance::Schedule() :
-      master->maintenance.schedules.front();
+  if (master->maintenance.schedules.empty()) {
+    return mesos::maintenance::Schedule();
+  }
+
+  mesos::maintenance::Schedule schedule;
+
+  foreach (const mesos::maintenance::Window& window,
+           master->maintenance.schedules.front().windows()) {
+    mesos::maintenance::Window window_;
+
+    foreach (const MachineID& machine_id, window.machine_ids()) {
+      Try<bool> approved =
+        approver->approved(ObjectApprover::Object(machine_id));
+
+      if (approved.isError()) {
+        LOG(WARNING) << "Error during MachineID authorization: "
+                     << approved.error();
+        // TODO(arojas): Consider exposing these errors to the caller.
+        continue;
+      }
+
+      if (!approved.get()) {
+        continue;
+      }
+
+      window_.add_machine_ids()->CopyFrom(machine_id);
+    }
+
+    if (window_.machine_ids_size() > 0) {
+      window_.mutable_unavailability()->CopyFrom(window.unavailability());
+      schedule.add_windows()->CopyFrom(window_);
+    }
+  }
 
   return schedule;
 }
 
 
 Future<Response> Master::Http::_updateMaintenanceSchedule(
-    const mesos::maintenance::Schedule& schedule) const
+    const mesos::maintenance::Schedule& schedule,
+    const Option<process::http::authentication::Principal>& principal) const
 {
   // Validate that the schedule only transitions machines between
   // `UP` and `DRAINING` modes.
@@ -4071,80 +4364,121 @@ Future<Response> Master::Http::_updateMaintenanceSchedule(
     return BadRequest(isValid.error());
   }
 
-  return master->registrar->apply(Owned<Operation>(
-      new maintenance::UpdateSchedule(schedule)))
-    .then(defer(master->self(), [=](bool result) -> Future<Response> {
-      // See the top comment in "master/maintenance.hpp" for why this check
-      // is here, and is appropriate.
-      CHECK(result);
+  Future<Owned<ObjectApprover>> approver;
 
-      // Update the master's local state with the new schedule.
-      // NOTE: We only add or remove differences between the current schedule
-      // and the new schedule.  This is because the `MachineInfo` struct
-      // holds more information than a maintenance schedule.
-      // For example, the `mode` field is not part of a maintenance schedule.
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
 
-      // TODO(josephw): allow more than one schedule.
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::UPDATE_MAINTENANCE_SCHEDULE);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
 
-      // Put the machines in the updated schedule into a set.
-      // Save the unavailability, to help with updating some machines.
-      hashmap<MachineID, Unavailability> unavailabilities;
-      foreach (const mesos::maintenance::Window& window, schedule.windows()) {
-        foreach (const MachineID& id, window.machine_ids()) {
-          unavailabilities[id] = window.unavailability();
-        }
+  return approver.then(defer(
+      master->self(),
+      [this, schedule](const Owned<ObjectApprover>& approver) {
+        return __updateMaintenanceSchedule(schedule, approver);
+      }));
+}
+
+Future<Response> Master::Http::__updateMaintenanceSchedule(
+    const mesos::maintenance::Schedule& schedule,
+    const Owned<ObjectApprover>& approver) const
+{
+  foreach (const mesos::maintenance::Window& window, schedule.windows()) {
+    foreach (const MachineID& machine, window.machine_ids()) {
+      Try<bool> approved = approver->approved(ObjectApprover::Object(machine));
+
+      if (approved.isError()) {
+        return InternalServerError("Authorization error: " + approved.error());
+      } else if (!approved.get()) {
+        return Forbidden();
       }
+    }
+  }
 
-      // NOTE: Copies are needed because `updateUnavailability()` in this loop
-      // modifies the container.
-      foreachkey (const MachineID& id, utils::copy(master->machines)) {
-        // Update the `unavailability` for each existing machine, except for
-        // machines going from `UP` to `DRAINING` (handled in the next loop).
-        // Each machine will only be touched by 1 of the 2 loops here to
-        // avoid sending inverse offer twice for a single machine since
-        // `updateUnavailability` will trigger an inverse offer.
-        // TODO(gyliu513): Merge this logic with `Master::updateUnavailability`,
-        // having it in two places results in more conditionals to handle.
-        if (unavailabilities.contains(id)) {
-          if (master->machines[id].info.mode() == MachineInfo::UP) {
-            continue;
-          }
-
-          master->updateUnavailability(id, unavailabilities[id]);
-          continue;
-        }
-
-        // Transition each removed machine back to the `UP` mode and remove the
-        // unavailability.
-        master->machines[id].info.set_mode(MachineInfo::UP);
-        master->updateUnavailability(id, None());
-      }
-
-      // Save each new machine, with the unavailability
-      // and starting in `DRAINING` mode.
-      foreach (const mesos::maintenance::Window& window, schedule.windows()) {
-        foreach (const MachineID& id, window.machine_ids()) {
-          if (master->machines.contains(id) &&
-              master->machines[id].info.mode() != MachineInfo::UP) {
-            continue;
-          }
-
-          MachineInfo info;
-          info.mutable_id()->CopyFrom(id);
-          info.set_mode(MachineInfo::DRAINING);
-
-          master->machines[id].info.CopyFrom(info);
-
-          master->updateUnavailability(id, window.unavailability());
-        }
-      }
-
-      // Replace the old schedule(s) with the new schedule.
-      master->maintenance.schedules.clear();
-      master->maintenance.schedules.push_back(schedule);
-
-      return OK();
+  return master->registrar
+    ->apply(Owned<Operation>(new maintenance::UpdateSchedule(schedule)))
+    .then(defer(master->self(), [this, schedule](bool result) {
+      return ___updateMaintenanceSchedule(schedule, result);
     }));
+}
+
+Future<Response> Master::Http::___updateMaintenanceSchedule(
+    const mesos::maintenance::Schedule& schedule,
+    bool applied) const
+{
+  // See the top comment in "master/maintenance.hpp" for why this check
+  // is here, and is appropriate.
+  CHECK(applied);
+
+  // Update the master's local state with the new schedule.
+  // NOTE: We only add or remove differences between the current schedule
+  // and the new schedule.  This is because the `MachineInfo` struct
+  // holds more information than a maintenance schedule.
+  // For example, the `mode` field is not part of a maintenance schedule.
+
+  // TODO(josephw): allow more than one schedule.
+
+  // Put the machines in the updated schedule into a set.
+  // Save the unavailability, to help with updating some machines.
+  hashmap<MachineID, Unavailability> unavailabilities;
+  foreach (const mesos::maintenance::Window& window, schedule.windows()) {
+    foreach (const MachineID& id, window.machine_ids()) {
+      unavailabilities[id] = window.unavailability();
+    }
+  }
+
+  // NOTE: Copies are needed because `updateUnavailability()` in this loop
+  // modifies the container.
+  foreachkey (const MachineID& id, utils::copy(master->machines)) {
+    // Update the `unavailability` for each existing machine, except for
+    // machines going from `UP` to `DRAINING` (handled in the next loop).
+    // Each machine will only be touched by 1 of the 2 loops here to
+    // avoid sending inverse offer twice for a single machine since
+    // `updateUnavailability` will trigger an inverse offer.
+    // TODO(gyliu513): Merge this logic with `Master::updateUnavailability`,
+    // having it in two places results in more conditionals to handle.
+    if (unavailabilities.contains(id)) {
+      if (master->machines[id].info.mode() == MachineInfo::UP) {
+        continue;
+      }
+
+      master->updateUnavailability(id, unavailabilities[id]);
+      continue;
+    }
+
+    // Transition each removed machine back to the `UP` mode and remove the
+    // unavailability.
+    master->machines[id].info.set_mode(MachineInfo::UP);
+    master->updateUnavailability(id, None());
+  }
+
+  // Save each new machine, with the unavailability
+  // and starting in `DRAINING` mode.
+  foreach (const mesos::maintenance::Window& window, schedule.windows()) {
+    foreach (const MachineID& id, window.machine_ids()) {
+      if (master->machines.contains(id) &&
+          master->machines[id].info.mode() != MachineInfo::UP) {
+        continue;
+      }
+
+      MachineInfo info;
+      info.mutable_id()->CopyFrom(id);
+      info.set_mode(MachineInfo::DRAINING);
+
+      master->machines[id].info.CopyFrom(info);
+
+      master->updateUnavailability(id, window.unavailability());
+    }
+  }
+
+  // Replace the old schedule(s) with the new schedule.
+  master->maintenance.schedules.clear();
+  master->maintenance.schedules.push_back(schedule);
+
+  return OK();
 }
 
 
@@ -4155,13 +4489,31 @@ Future<Response> Master::Http::getMaintenanceSchedule(
 {
   CHECK_EQ(mesos::master::Call::GET_MAINTENANCE_SCHEDULE, call.type());
 
-  mesos::master::Response response;
-  response.set_type(mesos::master::Response::GET_MAINTENANCE_SCHEDULE);
-  response.mutable_get_maintenance_schedule()->mutable_schedule()->CopyFrom(
-      _getMaintenanceSchedule());
+  Future<Owned<ObjectApprover>> approver;
 
-  return OK(serialize(contentType, evolve(response)),
-            stringify(contentType));
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::GET_MAINTENANCE_SCHEDULE);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver.then(defer(
+      master->self(),
+      [this, contentType](
+          const Owned<ObjectApprover>& approver) -> Future<Response> {
+        mesos::master::Response response;
+
+        response.set_type(mesos::master::Response::GET_MAINTENANCE_SCHEDULE);
+
+        response.mutable_get_maintenance_schedule()->mutable_schedule()
+          ->CopyFrom(_getMaintenanceSchedule(approver));
+
+        return OK(serialize(contentType, evolve(response)),
+                  stringify(contentType));
+      }));
 }
 
 
@@ -4176,7 +4528,7 @@ Future<Response> Master::Http::updateMaintenanceSchedule(
   mesos::maintenance::Schedule schedule =
     call.update_maintenance_schedule().schedule();
 
-  return _updateMaintenanceSchedule(schedule);
+  return _updateMaintenanceSchedule(schedule, principal);
 }
 
 
@@ -4198,14 +4550,17 @@ string Master::Http::MACHINE_DOWN_HELP()
         "POST: Validates the request body as JSON and transitions",
         "  the list of machines into DOWN mode.  Currently, only",
         "  machines in DRAINING mode are allowed to be brought down."),
-    AUTHENTICATION(true));
+    AUTHENTICATION(true),
+    AUTHORIZATION(
+        "The current principal must be allowed to bring down all the machines",
+        "in the request, otherwise the request will fail."));
 }
 
 
 // /master/machine/down endpoint handler.
 Future<Response> Master::Http::machineDown(
     const Request& request,
-    const Option<Principal>&) const
+    const Option<Principal>& principal) const
 {
   // When current master is not the leader, redirect to the leading master.
   if (!master->elected()) {
@@ -4228,12 +4583,28 @@ Future<Response> Master::Http::machineDown(
     return BadRequest(ids.error());
   }
 
-  return _startMaintenance(ids.get());
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::START_MAINTENANCE);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver.then(defer(
+      master->self(),
+      [this, ids](const Owned<ObjectApprover>& approver) {
+        return _startMaintenance(ids.get(), approver);
+      }));
 }
 
 
 Future<Response> Master::Http::_startMaintenance(
-    const RepeatedPtrField<MachineID>& machineIds) const
+    const RepeatedPtrField<MachineID>& machineIds,
+    const Owned<ObjectApprover>& approver) const
 {
   // Validate every machine in the list.
   Try<Nothing> isValid = maintenance::validation::machines(machineIds);
@@ -4254,6 +4625,14 @@ Future<Response> Master::Http::_startMaintenance(
       return BadRequest(
           "Machine '" + stringify(JSON::protobuf(id)) +
             "' is not in DRAINING mode and cannot be brought down");
+    }
+
+    Try<bool> approved = approver->approved(ObjectApprover::Object(id));
+
+    if (approved.isError()) {
+      return InternalServerError("Authorization error: " + approved.error());
+    } else if (!approved.get()) {
+      return Forbidden();
     }
   }
 
@@ -4313,9 +4692,24 @@ Future<Response> Master::Http::startMaintenance(
   CHECK_EQ(mesos::master::Call::START_MAINTENANCE, call.type());
   CHECK(call.has_start_maintenance());
 
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::START_MAINTENANCE);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
   RepeatedPtrField<MachineID> machineIds = call.start_maintenance().machines();
 
-  return _startMaintenance(machineIds);
+  return approver.then(defer(
+      master->self(),
+      [this, machineIds](const Owned<ObjectApprover>& approver) {
+        return _startMaintenance(machineIds, approver);
+      }));
 }
 
 
@@ -4337,14 +4731,17 @@ string Master::Http::MACHINE_UP_HELP()
         "POST: Validates the request body as JSON and transitions",
         "  the list of machines into UP mode.  This also removes",
         "  the list of machines from the maintenance schedule."),
-    AUTHENTICATION(true));
+    AUTHENTICATION(true),
+    AUTHORIZATION(
+        "The current principal must be allowed to bring up all the machines",
+        "in the request, otherwise the request will fail."));
 }
 
 
 // /master/machine/up endpoint handler.
 Future<Response> Master::Http::machineUp(
     const Request& request,
-    const Option<Principal>&) const
+    const Option<Principal>& principal) const
 {
   // When current master is not the leader, redirect to the leading master.
   if (!master->elected()) {
@@ -4367,12 +4764,28 @@ Future<Response> Master::Http::machineUp(
     return BadRequest(ids.error());
   }
 
-  return _stopMaintenance(ids.get());
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::STOP_MAINTENANCE);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver.then(defer(
+      master->self(),
+      [this, ids](const Owned<ObjectApprover>& approver) {
+        return _stopMaintenance(ids.get(), approver);
+      }));
 }
 
 
 Future<Response> Master::Http::_stopMaintenance(
-    const RepeatedPtrField<MachineID>& machineIds) const
+    const RepeatedPtrField<MachineID>& machineIds,
+    const Owned<ObjectApprover>& approver) const
 {
   // Validate every machine in the list.
   Try<Nothing> isValid = maintenance::validation::machines(machineIds);
@@ -4392,6 +4805,14 @@ Future<Response> Master::Http::_stopMaintenance(
       return BadRequest(
           "Machine '" + stringify(JSON::protobuf(id)) +
             "' is not in DOWN mode and cannot be brought up");
+    }
+
+    Try<bool> approved = approver->approved(ObjectApprover::Object(id));
+
+    if (approved.isError()) {
+      return InternalServerError("Authorization error: " + approved.error());
+    } else if (!approved.get()) {
+      return Forbidden();
     }
   }
 
@@ -4453,7 +4874,23 @@ Future<Response> Master::Http::stopMaintenance(
 
   RepeatedPtrField<MachineID> machineIds = call.stop_maintenance().machines();
 
-  return _stopMaintenance(machineIds);
+
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::STOP_MAINTENANCE);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver.then(defer(
+      master->self(),
+      [this, machineIds](const Owned<ObjectApprover>& approver) {
+        return _stopMaintenance(machineIds, approver);
+      }));
 }
 
 
@@ -4478,14 +4915,18 @@ string Master::Http::MAINTENANCE_STATUS_HELP()
         "**NOTE**:",
         "Inverse offer responses are cleared if the master fails over.",
         "However, new inverse offers will be sent once the master recovers."),
-    AUTHENTICATION(true));
+    AUTHENTICATION(true),
+    AUTHORIZATION(
+        "The response will contain only the maintenance status for those",
+        "machines the current principal is allowed to see. If none, an empty",
+        "response will be returned."));
 }
 
 
 // /master/maintenance/status endpoint handler.
 Future<Response> Master::Http::maintenanceStatus(
     const Request& request,
-    const Option<Principal>&) const
+    const Option<Principal>& principal) const
 {
   // When current master is not the leader, redirect to the leading master.
   if (!master->elected()) {
@@ -4496,16 +4937,33 @@ Future<Response> Master::Http::maintenanceStatus(
     return MethodNotAllowed({"GET"}, request.method);
   }
 
-  return _getMaintenanceStatus()
-    .then([request](const mesos::maintenance::ClusterStatus& status)
-      -> Response {
-      return OK(JSON::protobuf(status), request.url.query.get("jsonp"));
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::GET_MAINTENANCE_STATUS);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  Option<string> jsonp = request.url.query.get("jsonp");
+
+  return approver
+    .then(defer(
+      master->self(),
+      [this](const Owned<ObjectApprover>& approver) {
+        return _getMaintenanceStatus(approver);
+      }))
+    .then([jsonp](const mesos::maintenance::ClusterStatus& status) -> Response {
+      return OK(JSON::protobuf(status), jsonp);
     });
 }
 
 
-Future<mesos::maintenance::ClusterStatus>
-  Master::Http::_getMaintenanceStatus() const
+Future<mesos::maintenance::ClusterStatus> Master::Http::_getMaintenanceStatus(
+    const Owned<ObjectApprover>& approver) const
 {
   return master->allocator->getInverseOfferStatuses()
     .then(defer(
@@ -4522,6 +4980,19 @@ Future<mesos::maintenance::ClusterStatus>
         const MachineID& id,
         const Machine& machine,
         master->machines) {
+      Try<bool> approved = approver->approved(ObjectApprover::Object(id));
+
+      if (approved.isError()) {
+        LOG(WARNING) << "Error during MachineID authorization: "
+                     << approved.error();
+        // TODO(arojas): Consider exposing these errors to the caller.
+        continue;
+      }
+
+      if (!approved.get()) {
+        continue;
+      }
+
       switch (machine.info.mode()) {
         case MachineInfo::DRAINING: {
           mesos::maintenance::ClusterStatus::DrainingMachine* drainingMachine =
@@ -4567,17 +5038,33 @@ Future<Response> Master::Http::getMaintenanceStatus(
 {
   CHECK_EQ(mesos::master::Call::GET_MAINTENANCE_STATUS, call.type());
 
-  return _getMaintenanceStatus()
+  Future<Owned<ObjectApprover>> approver;
+
+  if (master->authorizer.isSome()) {
+    Option<authorization::Subject> subject = createSubject(principal);
+
+    approver = master->authorizer.get()->getObjectApprover(
+        subject, authorization::GET_MAINTENANCE_STATUS);
+  } else {
+    approver = Owned<ObjectApprover>(new AcceptingObjectApprover());
+  }
+
+  return approver
+    .then(defer(
+      master->self(),
+      [this](const Owned<ObjectApprover>& approver) {
+        return _getMaintenanceStatus(approver);
+      }))
     .then([contentType](const mesos::maintenance::ClusterStatus& status)
           -> Response {
-      mesos::master::Response response;
-      response.set_type(mesos::master::Response::GET_MAINTENANCE_STATUS);
-      response.mutable_get_maintenance_status()->mutable_status()
-        ->CopyFrom(status);
+        mesos::master::Response response;
+        response.set_type(mesos::master::Response::GET_MAINTENANCE_STATUS);
+        response.mutable_get_maintenance_status()->mutable_status()
+            ->CopyFrom(status);
 
-      return OK(serialize(contentType, evolve(response)),
-                stringify(contentType));
-    });
+        return OK(serialize(contentType, evolve(response)),
+                  stringify(contentType));
+      });
 }
 
 
@@ -4669,7 +5156,7 @@ Future<Response> Master::Http::unreserve(
         parse.error());
   }
 
-  Resources resources;
+  RepeatedPtrField<Resource> resources;
   foreach (const JSON::Value& value, parse.get().values) {
     Try<Resource> resource = ::protobuf::parse<Resource>(value);
     if (resource.isError()) {
@@ -4678,14 +5165,7 @@ Future<Response> Master::Http::unreserve(
           resource.error());
     }
 
-    // Since the `+=` operator will silently drop invalid resources, we validate
-    // each resource individually.
-    Option<Error> error = Resources::validate(resource.get());
-    if (error.isSome()) {
-      return BadRequest(error.get().message);
-    }
-
-    resources += resource.get();
+    resources.Add()->CopyFrom(resource.get());
   }
 
   return _unreserve(slaveId, resources, principal);
@@ -4694,7 +5174,7 @@ Future<Response> Master::Http::unreserve(
 
 Future<Response> Master::Http::_unreserve(
     const SlaveID& slaveId,
-    const Resources& resources,
+    const RepeatedPtrField<Resource>& resources,
     const Option<Principal>& principal) const
 {
   Slave* slave = master->slaves.registered.get(slaveId);
@@ -4707,11 +5187,14 @@ Future<Response> Master::Http::_unreserve(
   operation.set_type(Offer::Operation::UNRESERVE);
   operation.mutable_unreserve()->mutable_resources()->CopyFrom(resources);
 
-  Option<Error> error = validation::operation::validate(operation.unreserve());
-
+  Option<Error> error = validateAndNormalizeResources(&operation);
   if (error.isSome()) {
-    return BadRequest(
-        "Invalid UNRESERVE operation: " + error.get().message);
+    return BadRequest(error->message);
+  }
+
+  error = validation::operation::validate(operation.unreserve());
+  if (error.isSome()) {
+    return BadRequest("Invalid UNRESERVE operation: " + error->message);
   }
 
   return master->authorizeUnreserveResources(operation.unreserve(), principal)
@@ -4720,7 +5203,7 @@ Future<Response> Master::Http::_unreserve(
         return Forbidden();
       }
 
-      return _operation(slaveId, resources, operation);
+      return _operation(slaveId, operation.unreserve().resources(), operation);
     }));
 }
 
@@ -4797,7 +5280,8 @@ Future<Response> Master::Http::unreserveResources(
   CHECK_EQ(mesos::master::Call::UNRESERVE_RESOURCES, call.type());
 
   const SlaveID& slaveId = call.unreserve_resources().slave_id();
-  const Resources& resources = call.unreserve_resources().resources();
+  const RepeatedPtrField<Resource>& resources =
+    call.unreserve_resources().resources();
 
   return _unreserve(slaveId, resources, principal);
 }

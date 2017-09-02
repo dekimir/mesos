@@ -220,10 +220,11 @@ protected:
       }
     }
 
-    // Inject the MULTI_ROLE capability since the allocator never looks at
-    // whether the framework is MULTI_ROLE capable. The logic between a
-    // non-MULTI_ROLE scheduler and a single role MULTI_ROLE scheduler is
-    // the same as far as the allocator is concerned.
+    // Inject the MULTI_ROLE capability by default. The allocator ONLY looks
+    // at whether the framework is MULTI_ROLE capable to filter out offers
+    // from non-MULTI_ROLE agents (see MESOS-6940). Other than that, the logic
+    // between a non-MULTI_ROLE scheduler and a single role MULTI_ROLE scheduler
+    // is the same as far as the allocator is concerned.
     if (!multiRole) {
       frameworkInfo.add_capabilities()->set_type(
           FrameworkInfo::Capability::MULTI_ROLE);
@@ -1776,7 +1777,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateAvailableSuccess)
   // Construct an offer operation for the framework's allocation.
   Resources unreserved = Resources::parse("cpus:25;mem:50").get();
   Resources dynamicallyReserved =
-    unreserved.flatten("role1", createReservationInfo("ops")).get();
+    unreserved.pushReservation(createDynamicReservationInfo("role1", "ops"));
 
   Offer::Operation reserve = RESERVE(dynamicallyReserved);
 
@@ -1829,7 +1830,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateAvailableFail)
   // Construct an offer operation for the framework's allocation.
   Resources unreserved = Resources::parse("cpus:25;mem:50").get();
   Resources dynamicallyReserved =
-    unreserved.flatten("role1", createReservationInfo("ops")).get();
+    unreserved.pushReservation(createDynamicReservationInfo("role1", "ops"));
 
   Offer::Operation reserve = RESERVE(dynamicallyReserved);
 
@@ -1871,7 +1872,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveOversubscribedResources)
 
   // Update the slave with 10 oversubscribed cpus.
   Resources oversubscribed = createRevocableResources("cpus", "10");
-  allocator->updateSlave(slave.id(), oversubscribed);
+  allocator->updateSlave(slave.id(), slave.resources() + oversubscribed);
 
   // The next allocation should be for 10 oversubscribed resources.
   expected = Allocation(
@@ -1882,7 +1883,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveOversubscribedResources)
 
   // Update the slave again with 12 oversubscribed cpus.
   Resources oversubscribed2 = createRevocableResources("cpus", "12");
-  allocator->updateSlave(slave.id(), oversubscribed2);
+  allocator->updateSlave(slave.id(), slave.resources() + oversubscribed2);
 
   // The next allocation should be for 2 oversubscribed cpus.
   expected = Allocation(
@@ -1893,7 +1894,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveOversubscribedResources)
 
   // Update the slave again with 5 oversubscribed cpus.
   Resources oversubscribed3 = createRevocableResources("cpus", "5");
-  allocator->updateSlave(slave.id(), oversubscribed3);
+  allocator->updateSlave(slave.id(), slave.resources() + oversubscribed3);
 
   // Since there are no more available oversubscribed resources there
   // shouldn't be an allocation.
@@ -1901,6 +1902,93 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveOversubscribedResources)
 
   Future<Allocation> allocation = allocations.get();
   EXPECT_TRUE(allocation.isPending());
+}
+
+
+// This test ensures that we can update the total of an agent. We
+// check that we can expand and shrink the resources available on an
+// agent. Agents can be overallocated, meaning the amount of allocated
+// resources can exceed the total available resources.
+TEST_F(HierarchicalAllocatorTest, UpdateSlaveTotalResources)
+{
+  // Pause clock to disable batch allocation.
+  Clock::pause();
+
+  initialize();
+
+  // Create an agent and a framework. This triggers allocation
+  // of the agent's resources to the framework.
+  const SlaveInfo agent = createSlaveInfo("cpus:100;mem:100;disk:100");
+
+  allocator->addSlave(
+      agent.id(),
+      agent,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent.resources(),
+      {});
+
+  const FrameworkInfo framework = createFrameworkInfo({"role1"});
+  allocator->addFramework(framework.id(), framework, {}, true, {});
+
+  const Allocation expected1 = Allocation(
+      framework.id(),
+      {{"role1", {{agent.id(), agent.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected1, allocations.get());
+
+  // Increase the agent's total. The additional
+  // resources will be offered to the framework.
+  const Resources addedResources = Resources::parse("cpus:12").get();
+
+  allocator->updateSlave(
+      agent.id(),
+      agent.resources() + addedResources);
+
+  const Allocation expected2 = Allocation(
+      framework.id(),
+      {{"role1", {{agent.id(), addedResources}}}});
+
+  Future<Allocation> allocation = allocations.get();
+  AWAIT_EXPECT_EQ(expected2, allocation);
+
+  // Decrease the agent's total to half its original value. The allocated now
+  // exceeds to total; nothing will be offered due to this operation.
+  const Resources agentResources2 =
+    Resources::parse("cpus:50;mem:50;disk:50").get();
+
+  allocator->updateSlave(agent.id(), agentResources2);
+
+  // Recover all agent resources allocated to the framework in the last two
+  // allocations. We will subsequently be offered the complete agent which has
+  // `agentResources2` resources.
+  allocator->recoverResources(
+      framework.id(),
+      agent.id(),
+      expected1.resources.at("role1").at(agent.id()) +
+        expected2.resources.at("role1").at(agent.id()),
+      None());
+
+  // Advance the clock to trigger allocation of
+  // the available `agentResources2` resources.
+  Clock::advance(flags.allocation_interval);
+
+  const Allocation expected3 = Allocation(
+      framework.id(),
+      {{"role1", {{agent.id(), agentResources2}}}});
+
+  AWAIT_EXPECT_EQ(expected3, allocations.get());
+
+  // Set the agent's total resources to its original value. This will trigger
+  // allocation of the newly added `agentResources2` resources now available on
+  // the agent.
+  allocator->updateSlave(agent.id(), agent.resources());
+
+  const Allocation expected4 = Allocation(
+      framework.id(),
+      {{"role1", {{agent.id(), agentResources2}}}});
+
+  AWAIT_EXPECT_EQ(expected4, allocations.get());
 }
 
 
@@ -1938,6 +2026,7 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveCapabilities)
   ASSERT_TRUE(allocation.isPending());
 
   // Update the agent to be MULTI_ROLE capable.
+
   allocator->updateSlave(agent.id(), None(), AGENT_CAPABILITIES());
 
   Clock::settle();
@@ -1982,7 +2071,7 @@ TEST_F(HierarchicalAllocatorTest, OversubscribedNotAllocated)
 
   // Update the slave with 10 oversubscribed cpus.
   Resources oversubscribed = createRevocableResources("cpus", "10");
-  allocator->updateSlave(slave.id(), oversubscribed);
+  allocator->updateSlave(slave.id(), slave.resources() + oversubscribed);
 
   // No allocation should be made for oversubscribed resources because
   // the framework has not opted in for them.
@@ -2026,7 +2115,7 @@ TEST_F(HierarchicalAllocatorTest, RecoverOversubscribedResources)
 
   // Update the slave with 10 oversubscribed cpus.
   Resources oversubscribed = createRevocableResources("cpus", "10");
-  allocator->updateSlave(slave.id(), oversubscribed);
+  allocator->updateSlave(slave.id(), slave.resources() + oversubscribed);
 
   // The next allocation should be for 10 oversubscribed cpus.
   expected = Allocation(
@@ -3215,8 +3304,8 @@ TEST_F(HierarchicalAllocatorTest, QuotaSetAsideReservedResources)
 
   // Reserve 4 CPUs and 512MB of memory on `agent2` for non-quota'ed role.
   Resources unreserved = Resources::parse("cpus:4;mem:512").get();
-  Resources dynamicallyReserved =
-    unreserved.flatten(NO_QUOTA_ROLE, createReservationInfo("ops")).get();
+  Resources dynamicallyReserved = unreserved.pushReservation(
+      createDynamicReservationInfo(NO_QUOTA_ROLE, "ops"));
 
   Offer::Operation reserve = RESERVE(dynamicallyReserved);
 
@@ -4498,6 +4587,69 @@ TEST_F(HierarchicalAllocatorTest, DisproportionateQuotaVsAllocation)
 }
 
 
+// This test ensures that resources reserved to ancestor roles can be offered
+// to their descendants. Since both quota and fair-share stages perform
+// reservation allocations, we use a quota'd role to test both cases.
+TEST_F(HierarchicalAllocatorTest, OfferAncestorReservationsToDescendantChild)
+{
+  // Pausing the clock is not necessary, but ensures that the test
+  // doesn't rely on the batch allocation in the allocator, which
+  // would slow down the test.
+  Clock::pause();
+
+  const string ROLE{"a/b/c"};
+
+  initialize();
+
+  const Quota quota = createQuota(ROLE, "cpus:1;mem:512");
+  allocator->setQuota(ROLE, quota);
+
+  FrameworkInfo framework = createFrameworkInfo({ROLE});
+  allocator->addFramework(framework.id(), framework, {}, true, {});
+
+  SlaveInfo agent1 = createSlaveInfo("cpus(a):1;mem(a):512;disk(a):0;");
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  {
+    // All the resources of agent1 are offered, and this
+    // should satisfy the quota of ROLE.
+    Allocation expected = Allocation(
+        framework.id(),
+        {{ROLE, {{agent1.id(), agent1.resources()}}}});
+
+    AWAIT_EXPECT_EQ(expected, allocations.get());
+  }
+
+
+  SlaveInfo agent2 = createSlaveInfo(
+      "cpus:2;mem:1024;disk:0;"
+      "cpus(a/b):4;mem(a/b):2048;disk(a/b):0");
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  {
+    // Since quota of ROLE is already satisfied by agent1,
+    // we expect only reserved resource of agent2 is offered.
+    Allocation expected = Allocation(
+        framework.id(),
+        {{ROLE, {{agent2.id(), Resources(agent2.resources()).reserved()}}}});
+
+    AWAIT_EXPECT_EQ(expected, allocations.get());
+  }
+}
+
+
 // This test checks that quota guarantees work as expected when a
 // nested role is created as a child of an existing quota'd role.
 TEST_F(HierarchicalAllocatorTest, NestedRoleQuota)
@@ -5004,7 +5156,7 @@ TEST_P(HierarchicalAllocator_BENCHMARK_Test, AddAndUpdateSlave)
   watch.start(); // Reset.
 
   foreach (const SlaveInfo& slave, slaves) {
-    allocator->updateSlave(slave.id(), oversubscribed);
+    allocator->updateSlave(slave.id(), slave.resources() + oversubscribed);
   }
 
   // Wait for all the `updateSlave` operations to be processed.
@@ -5278,14 +5430,18 @@ TEST_P(HierarchicalAllocator_BENCHMARK_Test, ResourceLabels)
     labels1.add_labels()->CopyFrom(
         createLabel("unique_key_2", "value_" + stringify(i)));
 
-    Resources reserved1 =
-      createReservedResource("cpus", "8", "role1",
-                             createReservationInfo("principal1", labels1));
+    Resources reserved1 = createReservedResource(
+        "cpus",
+        "8",
+        createDynamicReservationInfo("role1", "principal1", labels1));
+
     reserved1.allocate("role1");
 
-    Resources reserved2 =
-      createReservedResource("cpus", "8", "role1",
-                             createReservationInfo("principal1", labels2));
+    Resources reserved2 = createReservedResource(
+        "cpus",
+        "8",
+        createDynamicReservationInfo("role1", "principal1", labels2));
+
     reserved2.allocate("role1");
 
     Resources _allocation = allocation + reserved1 + reserved2;

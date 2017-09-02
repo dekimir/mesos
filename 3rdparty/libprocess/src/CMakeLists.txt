@@ -22,12 +22,12 @@ if (WIN32)
     ${PROCESS_SRC}
     subprocess_windows.cpp
     )
-else (WIN32)
+else ()
   set(PROCESS_SRC
     ${PROCESS_SRC}
     subprocess_posix.cpp
     )
-endif (WIN32)
+endif ()
 
 set(PROCESS_SRC
   ${PROCESS_SRC}
@@ -39,6 +39,7 @@ set(PROCESS_SRC
   decoder.hpp
   encoder.hpp
   event_loop.hpp
+  event_queue.hpp
   firewall.cpp
   gate.hpp
   help.cpp
@@ -55,6 +56,8 @@ set(PROCESS_SRC
   process.cpp
   process_reference.hpp
   reap.cpp
+  run_queue.hpp
+  semaphore.hpp
   socket.cpp
   subprocess.cpp
   time.cpp
@@ -68,14 +71,14 @@ if (ENABLE_LIBEVENT)
     libevent.cpp
     libevent_poll.cpp
     )
-else (ENABLE_LIBEVENT)
+else ()
   set(PROCESS_SRC
     ${PROCESS_SRC}
     libev.hpp
     libev.cpp
     libev_poll.cpp
     )
-endif (ENABLE_LIBEVENT)
+endif ()
 
 if (ENABLE_SSL)
   set(PROCESS_SRC
@@ -91,8 +94,8 @@ if (ENABLE_SSL)
       ${PROCESS_SRC}
       libevent_ssl_socket.cpp
       )
-  endif (ENABLE_LIBEVENT)
-endif (ENABLE_SSL)
+  endif ()
+endif ()
 
 # INCLUDE DIRECTIVES FOR PROCESS LIBRARY (generates, e.g., -I/path/to/thing
 # on Linux).
@@ -109,14 +112,14 @@ link_directories(${PROCESS_LIB_DIRS})
 #######################################################################
 if (WIN32)
   add_library(${PROCESS_TARGET} STATIC ${PROCESS_SRC})
-else (WIN32)
+else ()
   add_library(${PROCESS_TARGET} SHARED ${PROCESS_SRC})
 
   set_target_properties(
     ${PROCESS_TARGET} PROPERTIES
     POSITION_INDEPENDENT_CODE TRUE
     )
-endif (WIN32)
+endif ()
 
 GROUP_STOUT_HEADERS()
 GROUP_PROCESS_HEADERS()
@@ -138,3 +141,15 @@ add_dependencies(${PROCESS_TARGET} ${PROCESS_DEPENDENCIES})
 # ADD LINKER FLAGS (generates, e.g., -lglog on Linux).
 ######################################################
 target_link_libraries(${PROCESS_TARGET} ${PROCESS_LIBS})
+
+if (ENABLE_LOCK_FREE_RUN_QUEUE)
+  target_compile_definitions(${PROCESS_TARGET} PRIVATE LOCK_FREE_RUN_QUEUE)
+endif ()
+
+if (ENABLE_LOCK_FREE_EVENT_QUEUE)
+  target_compile_definitions(${PROCESS_TARGET} PRIVATE LOCK_FREE_EVENT_QUEUE)
+endif ()
+
+if (ENABLE_LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE)
+  target_compile_definitions(${PROCESS_TARGET} PRIVATE LAST_IN_FIRST_OUT_FIXED_SIZE_SEMAPHORE)
+endif ()

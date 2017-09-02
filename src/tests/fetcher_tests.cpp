@@ -70,7 +70,30 @@ namespace mesos {
 namespace internal {
 namespace tests {
 
-class FetcherTest : public TemporaryDirectoryTest {};
+class FetcherTest : public TemporaryDirectoryTest
+{
+public:
+  static void verifyMetrics(unsigned successCount, unsigned errorCount)
+  {
+    JSON::Object metrics = Metrics();
+
+    // First verify that each metric is present.
+    ASSERT_EQ(
+        1u,
+        metrics.values.count("containerizer/fetcher/task_fetches_succeeded"));
+    ASSERT_EQ(
+        1u,
+        metrics.values.count("containerizer/fetcher/task_fetches_failed"));
+
+    // Next verify the actual values.
+    EXPECT_SOME_EQ(
+      successCount,
+      metrics.at<JSON::Number>("containerizer/fetcher/task_fetches_succeeded"));
+    EXPECT_SOME_EQ(
+      errorCount,
+      metrics.at<JSON::Number>("containerizer/fetcher/task_fetches_failed"));
+  }
+};
 
 
 TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, FileURI)
@@ -100,6 +123,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, FileURI)
   AWAIT_READY(fetch);
 
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -168,6 +193,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, CustomOutputFileSubdirectory)
   AWAIT_READY(fetch);
 
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -203,6 +230,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, AbsoluteCustomSubdirectoryFails)
   AWAIT_FAILED(fetch);
 
   EXPECT_FALSE(os::exists(localFile));
+
+  verifyMetrics(0, 1);
 }
 
 
@@ -243,6 +272,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, InvalidUser)
   EXPECT_TRUE(strings::contains(fetch.failure(), "chown"));
 
   EXPECT_FALSE(os::exists(localFile));
+
+  verifyMetrics(0, 1);
 }
 
 
@@ -273,6 +304,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, NonExistingFile)
 
   // See FetcherProcess::run().
   EXPECT_TRUE(strings::contains(fetch.failure(), "Failed to fetch"));
+
+  verifyMetrics(0, 1);
 }
 
 
@@ -298,6 +331,8 @@ TEST_F(FetcherTest, MalformedURI)
 
   // See Fetcher::basename().
   EXPECT_TRUE(strings::contains(fetch.failure(), "Malformed"));
+
+  verifyMetrics(0, 1);
 }
 
 
@@ -328,6 +363,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, AbsoluteFilePath)
   AWAIT_READY(fetch);
 
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -351,25 +388,37 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, RelativeFilePath)
   CommandInfo::URI* uri = commandInfo.add_uris();
   uri->set_value("test");
 
-  Fetcher badFetcher(flags);
+  // NOTE: The nested scopes below ensure that we have only 1 Fetcher
+  // object at a time, which ensures that they can successfully register
+  // their metrics.
 
-  // The first run must fail, because we have not set frameworks_home yet.
+  {
+    Fetcher badFetcher(flags);
 
-  Future<Nothing> fetch1 = badFetcher.fetch(
-      containerId, commandInfo, os::getcwd(), None());
-  AWAIT_FAILED(fetch1);
+    // The first run must fail, because we have not set frameworks_home yet.
 
-  EXPECT_FALSE(os::exists(localFile));
+    Future<Nothing> fetch1 = badFetcher.fetch(
+        containerId, commandInfo, os::getcwd(), None());
+    AWAIT_FAILED(fetch1);
 
-  // The next run must succeed due to this flag.
-  flags.frameworks_home = fromDir;
-  Fetcher goodFetcher(flags);
+    EXPECT_FALSE(os::exists(localFile));
 
-  Future<Nothing> fetch2 = goodFetcher.fetch(
-      containerId, commandInfo, os::getcwd(), None());
-  AWAIT_READY(fetch2);
+    verifyMetrics(0, 1);
+  }
 
-  EXPECT_TRUE(os::exists(localFile));
+  {
+    // The next run must succeed due to this flag.
+    flags.frameworks_home = fromDir;
+    Fetcher goodFetcher(flags);
+
+    Future<Nothing> fetch2 = goodFetcher.fetch(
+        containerId, commandInfo, os::getcwd(), None());
+    AWAIT_READY(fetch2);
+
+    EXPECT_TRUE(os::exists(localFile));
+
+    verifyMetrics(1, 0);
+  }
 }
 
 
@@ -443,6 +492,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, OSNetUriTest)
   AWAIT_READY(fetch);
 
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -490,6 +541,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, OSNetUriSpaceTest)
   AWAIT_READY(fetch);
 
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -520,6 +573,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, FileLocalhostURI)
   AWAIT_READY(fetch);
 
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -558,6 +613,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, NoExtractNotExecutable)
   EXPECT_FALSE(permissions->owner.x);
   EXPECT_FALSE(permissions->group.x);
   EXPECT_FALSE(permissions->others.x);
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -597,10 +654,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, NoExtractExecutable)
   EXPECT_TRUE(permissions->owner.x);
   EXPECT_TRUE(permissions->group.x);
   EXPECT_TRUE(permissions->others.x);
+
+  verifyMetrics(1, 0);
 }
 
 
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, ExtractNotExecutable)
+// NOTE: This is disabled on Windows because `os::shell()` is deleted.
+#ifndef __WINDOWS__
+TEST_F(FetcherTest, ExtractNotExecutable)
 {
   // First construct a temporary file that can be fetched and archived with tar
   // gzip.
@@ -649,11 +710,16 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, ExtractNotExecutable)
   EXPECT_FALSE(permissions->owner.x);
   EXPECT_FALSE(permissions->group.x);
   EXPECT_FALSE(permissions->others.x);
+
+  verifyMetrics(1, 0);
 }
+#endif // __WINDOWS__
 
 
 // Tests extracting tar file with extension .tar.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, ExtractTar)
+// NOTE: This is disabled on Windows because `os::shell()` is deleted.
+#ifndef __WINDOWS__
+TEST_F(FetcherTest, ExtractTar)
 {
   // First construct a temporary file that can be fetched and archived with
   // tar.
@@ -693,10 +759,15 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, ExtractTar)
   ASSERT_TRUE(os::exists(path::join(os::getcwd(), path.get())));
 
   ASSERT_SOME_EQ("hello tar", os::read(path::join(os::getcwd(), path.get())));
+
+  verifyMetrics(1, 0);
 }
+#endif // __WINDOWS__
 
 
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, ExtractGzipFile)
+// NOTE: This is disabled on Windows because `os::shell()` is deleted.
+#ifndef __WINDOWS__
+TEST_F(FetcherTest, ExtractGzipFile)
 {
   // First construct a temporary file that can be fetched and archived with
   // gzip.
@@ -731,7 +802,10 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, ExtractGzipFile)
   ASSERT_TRUE(os::exists(extractedFile));
 
   ASSERT_SOME_EQ("hello world", os::read(extractedFile));
+
+  verifyMetrics(1, 0);
 }
+#endif // __WINDOWS__
 
 
 TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, UNZIP_ExtractFile)
@@ -781,6 +855,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, UNZIP_ExtractFile)
   ASSERT_TRUE(os::exists(extractedFile));
 
   ASSERT_SOME_EQ("hello world\n", os::read(extractedFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -832,6 +908,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, UNZIP_ExtractInvalidFile)
   ASSERT_TRUE(os::exists(extractedFile));
 
   ASSERT_SOME_EQ("hello hello\n", os::read(extractedFile));
+
+  verifyMetrics(0, 1);
 }
 
 
@@ -887,6 +965,8 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   ASSERT_TRUE(os::exists(extractedFile));
 
   ASSERT_SOME_EQ("2", os::read(extractedFile));
+
+  verifyMetrics(1, 0);
 }
 
 
@@ -925,9 +1005,13 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, UseCustomOutputFile)
 
   ASSERT_SOME_EQ(
       "hello renamed file", os::read(path::join(".", customOutputFile)));
+
+  verifyMetrics(1, 0);
 }
 
 
+// NOTE: This is disabled on Windows because `os::shell()` is deleted.
+#ifndef __WINDOWS__
 TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, CustomGzipOutputFile)
 {
   // First construct a temporary file that can be fetched.
@@ -964,7 +1048,10 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, CustomGzipOutputFile)
   ASSERT_TRUE(os::exists(extractFile));
 
   ASSERT_SOME_EQ("hello renamed gzip file", os::read(extractFile));
+
+  verifyMetrics(1, 0);
 }
+#endif // __WINDOWS__
 
 
 // TODO(hausdorff): `os::chmod` does not exist on Windows.
@@ -1055,6 +1142,8 @@ TEST_F(FetcherTest, HdfsURI)
 
   // Proof that hdfs fetching worked.
   EXPECT_TRUE(os::exists(localFile));
+
+  verifyMetrics(1, 0);
 }
 #endif // __WINDOWS__
 
@@ -1063,7 +1152,10 @@ TEST_F(FetcherTest, HdfsURI)
 // agent towards the fetcher. By supplying an invalid SSL setup, we
 // force the fetcher to fail if the parent process does not filter
 // them out.
-TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, SSLEnvironmentSpillover)
+//
+// NOTE: This is disabled on Windows because `os::shell()` is deleted.
+#ifndef __WINDOWS__
+TEST_F(FetcherTest, SSLEnvironmentSpillover)
 {
   // Patch some critical libprocess environment variables into the
   // parent process of the mesos-fetcher. We expect this test to fail
@@ -1117,6 +1209,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(FetcherTest, SSLEnvironmentSpillover)
     os::setenv("LIBPROCESS_SSL_KEY_FILE", key);
   }
 }
+#endif // __WINDOWS__
 
 } // namespace tests {
 } // namespace internal {
