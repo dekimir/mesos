@@ -73,30 +73,28 @@ const EnumValueDescriptor* makeEnumVal(gen& g)
 namespace ramfuzz {
 
 harness<Descriptor>::harness(runtime::gen& g)
-  : g(g), obj(*const_cast<Descriptor*>(makeDesc(g)))
+  : g(g), obj(const_cast<Descriptor*>(makeDesc(g)))
 {
 }
 
 harness<FieldDescriptor>::harness(runtime::gen& g)
-  : g(g), obj(*const_cast<FieldDescriptor*>(makeField(g)))
+  : g(g), obj(const_cast<FieldDescriptor*>(makeField(g)))
 {
 }
 
 harness<OneofDescriptor>::harness(runtime::gen& g)
-  : g(g), obj(*const_cast<OneofDescriptor*>(makeOneof(g)))
+  : g(g), obj(const_cast<OneofDescriptor*>(makeOneof(g)))
 {
 }
 
 harness<EnumValueDescriptor>::harness(runtime::gen& g)
-  : g(g), obj(*const_cast<EnumValueDescriptor*>(makeEnumVal(g)))
+  : g(g), obj(const_cast<EnumValueDescriptor*>(makeEnumVal(g)))
 {
 }
 
 harness<FileDescriptor>::harness(runtime::gen& g)
-  : g(g), obj(*const_cast<FileDescriptor*>(makeFileDesc(g)))
+  : g(g), obj(const_cast<FileDescriptor*>(makeFileDesc(g)))
 {
 }
-
-unsigned runtime::spinlimit = 10;
 
 } // namespace ramfuzz
