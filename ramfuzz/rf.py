@@ -59,6 +59,7 @@ def read_data(files, poscount, locidx):
 
 
 dense_count = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 500
 gl = glob.glob(os.path.join('train', '*.[sf]'))
 poscount, locidx = count_locpos(gl)
 # Model:
@@ -75,4 +76,4 @@ mult = multiply(dense_list)
 ml = Model(inputs=[in_locs, in_vals], outputs=mult)
 ml.compile(Adam(lr=0.01), metrics=['acc'], loss=mse)
 locs, vals, labels = read_data(gl, poscount, locidx)
-ml.fit([locs, vals], labels, batch_size=500, epochs=10)
+ml.fit([locs, vals], labels, batch_size=batch_size, epochs=10)
