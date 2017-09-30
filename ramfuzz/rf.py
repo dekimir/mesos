@@ -1,4 +1,4 @@
-#!/Users/dejan2/anaconda2/bin/python
+#!/usr/bin/env python
 from keras.layers import BatchNormalization, Dense, Embedding, Flatten, Input
 from keras.layers.merge import concatenate, multiply
 from keras.metrics import mse

@@ -12,7 +12,7 @@ PJ=$MB/3rdparty/picojson-1.3.0
 STO=~/src/mesos/3rdparty/stout/include
 INC="-I$MI -I$MBI -I$PB -I$BOO -I$STO -I$GL -I$PJ"
 
-~/src/lb/bin/ramfuzz \
+ramfuzz \
     $GP/arena.h \
     $GP/descriptor.h \
     $GP/descriptor.pb.h \
