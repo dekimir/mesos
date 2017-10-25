@@ -1,0 +1,14 @@
+--- a/repeated_field.h	2017-10-25 14:22:15.000000000 -0400
++++ b/repeated_field.h	2017-10-25 14:22:18.000000000 -0400
+@@ -606,6 +606,11 @@
+   typedef GenericType Type;
+ #if LANG_CXX11
+   static const bool Moveable = false;
++  static inline GenericType* New(Arena* arena, GenericType&& value) {
++    GenericType* r = New(arena);
++    *r = value;
++    return r;
++  }
+ #endif
+ 
+   static inline GenericType* New(Arena* arena) {
