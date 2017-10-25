@@ -215,6 +215,11 @@ AC_ARG_ENABLE([port-mapping-isolator],
                              [enable port mapping network isolator]),
               [], [enable_port_mapping_isolator=no])
 
+AC_ARG_ENABLE([network-ports-isolator],
+              AS_HELP_STRING([--enable-network-ports-isolator],
+                             [enable network ports isolator]),
+              [], [enable_network_ports_isolator=no])
+
 AC_ARG_ENABLE([java],
               AS_HELP_STRING([--disable-java],
                              [don't build Java bindings]),
@@ -230,6 +235,16 @@ AC_ARG_ENABLE([install-module-dependencies],
                              [Install third-party bundled dependencies required
                               for module development]),
               [], [enable_install_module_dependencies=no])
+
+AC_ARG_ENABLE([libtool-wrappers],
+              AS_HELP_STRING([--disable-libtool-wrappers],
+                             [Directly create binaries instead of libtool
+                              wrapper scripts to prevent relinking when first
+                              executing binaries from the build directory. This
+                              flag leads to binaries with the build directory
+                              encoded in the executables' RPATH which makes them
+                              in general unfit for installation.
+                              USE WITH CARE.]))
 
 AC_ARG_ENABLE([optimize],
               AS_HELP_STRING([--enable-optimize],
@@ -652,6 +667,9 @@ case "${target_os}" in
   *)
     AC_MSG_ERROR("Mesos is currently unsupported on your platform.")
 esac
+
+AM_CONDITIONAL([DISABLE_LIBTOOL_WRAPPERS],
+               [test x"$enable_libtool_wrappers" = "xno"])
 
 # Used for conditionally including source files.
 AM_CONDITIONAL([OS_LINUX], [test "x$OS_NAME" = "xlinux"])
@@ -1377,6 +1395,32 @@ fi
 
 AM_CONDITIONAL([ENABLE_PORT_MAPPING_ISOLATOR],
                [test "x$enable_port_mapping_isolator" = "xyes"])
+
+
+if test "x$enable_network_ports_isolator" = "xyes"; then
+
+  AS_IF([test "$OS_NAME" = "linux"],
+        [],
+        [AC_MSG_ERROR([cannot build network/ports isolator
+-------------------------------------------------------------------
+The network/ports isolator is only supported on Linux
+-------------------------------------------------------------------
+  ])])
+
+  MESOS_HAVE_LIBNL3([], [
+    MESOS_MSG_LIBNL3_ERROR([libnl-3 is required for building the network/ports isolator])
+  ])
+
+  AC_DEFINE([ENABLE_NETWORK_PORTS_ISOLATOR])
+fi
+
+AM_CONDITIONAL([ENABLE_NETWORK_PORTS_ISOLATOR],
+               [test "x$enable_network_ports_isolator" = "xyes"])
+
+
+AM_CONDITIONAL(
+  [ENABLE_LINUX_ROUTING],
+  [test "x$enable_network_ports_isolator" = "xyes" -o "x$enable_port_mapping_isolator" = "xyes"])
 
 
 # If the user has asked not to include the bundled NVML headers for

@@ -77,6 +77,7 @@ using testing::WithParamInterface;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::MesosContainerizer;
+using mesos::internal::slave::Slave;
 
 using mesos::slave::ContainerTermination;
 
@@ -136,16 +137,8 @@ TEST_P(DefaultExecutorTest, TaskRunning)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -159,14 +152,10 @@ TEST_P(DefaultExecutorTest, TaskRunning)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -174,53 +163,45 @@ TEST_P(DefaultExecutorTest, TaskRunning)
   v1::Resources resources =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(resources);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
 
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(
+        FutureArg<1>(&startingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(FutureArg<1>(&runningUpdate))
+    .WillRepeatedly(Return());
+
   v1::TaskInfo taskInfo =
     v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
-  v1::TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(taskInfo);
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
 
-  Future<v1::scheduler::Event::Update> update;
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update));
+  AWAIT_READY(startingUpdate);
 
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
+  ASSERT_EQ(TASK_STARTING, startingUpdate->status().state());
+  EXPECT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+  EXPECT_TRUE(startingUpdate->status().has_timestamp());
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer.id());
-
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
-
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-    mesos.send(call);
-  }
-
-  AWAIT_READY(update);
-
-  ASSERT_EQ(TASK_RUNNING, update->status().state());
-  EXPECT_EQ(taskInfo.task_id(), update->status().task_id());
-  EXPECT_TRUE(update->status().has_timestamp());
+  AWAIT_READY(runningUpdate);
 
   // Ensure that the task sandbox symbolic link is created.
   EXPECT_TRUE(os::exists(path::join(
@@ -270,16 +251,8 @@ TEST_P(DefaultExecutorTest, KillTask)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -292,14 +265,10 @@ TEST_P(DefaultExecutorTest, KillTask)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -307,14 +276,15 @@ TEST_P(DefaultExecutorTest, KillTask)
   v1::Resources resources =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(resources);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->offers().empty());
+  ASSERT_FALSE(offers1->offers().empty());
 
   const v1::Offer& offer1 = offers1->offers(0);
   const v1::AgentID& agentId = offer1.agent_id();
@@ -325,17 +295,29 @@ TEST_P(DefaultExecutorTest, KillTask)
   v1::TaskInfo taskInfo2 =
     v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
-  v1::TaskGroupInfo taskGroup1;
-  taskGroup1.add_tasks()->CopyFrom(taskInfo1);
-  taskGroup1.add_tasks()->CopyFrom(taskInfo2);
-
   const hashset<v1::TaskID> tasks1{taskInfo1.task_id(), taskInfo2.task_id()};
 
+  Future<v1::scheduler::Event::Update> startingUpdate1;
+  Future<v1::scheduler::Event::Update> startingOrRunningUpdate1;
+  Future<v1::scheduler::Event::Update> startingOrRunningUpdate2;
   Future<v1::scheduler::Event::Update> runningUpdate1;
-  Future<v1::scheduler::Event::Update> runningUpdate2;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&runningUpdate1))
-    .WillOnce(FutureArg<1>(&runningUpdate2));
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingOrRunningUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingOrRunningUpdate2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
   Future<v1::scheduler::Event::Offers> offers2;
   EXPECT_CALL(*scheduler, offers(_, _))
@@ -343,40 +325,31 @@ TEST_P(DefaultExecutorTest, KillTask)
     .WillRepeatedly(Return());
 
   {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
-
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer1.id());
-
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
+    v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
+        executorInfo,
+        v1::createTaskGroupInfo({taskInfo1, taskInfo2}));
+    Call call = v1::createCallAccept(frameworkId, offer1, {launchGroup});
 
     // Set a 0s filter to immediately get another offer to launch
     // the second task group.
-    accept->mutable_filters()->set_refuse_seconds(0);
-
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup1);
+    call.mutable_accept()->mutable_filters()->set_refuse_seconds(0);
 
     mesos.send(call);
   }
 
+  AWAIT_READY(startingUpdate1);
+  ASSERT_EQ(TASK_STARTING, startingUpdate1->status().state());
+
   AWAIT_READY(runningUpdate1);
   ASSERT_EQ(TASK_RUNNING, runningUpdate1->status().state());
-
-  AWAIT_READY(runningUpdate2);
-  ASSERT_EQ(TASK_RUNNING, runningUpdate2->status().state());
 
   // When running a task, TASK_RUNNING updates for the tasks in a
   // task group can be received in any order.
   const hashset<v1::TaskID> tasksRunning{
-    runningUpdate1->status().task_id(),
-    runningUpdate2->status().task_id()};
+    startingUpdate1->status().task_id(),
+    startingOrRunningUpdate1->status().task_id(),
+    startingOrRunningUpdate2->status().task_id(),
+    runningUpdate1->status().task_id()};
 
   ASSERT_EQ(tasks1, tasksRunning);
 
@@ -386,87 +359,33 @@ TEST_P(DefaultExecutorTest, KillTask)
   v1::TaskInfo taskInfo3 =
     v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
-  v1::TaskGroupInfo taskGroup2;
-  taskGroup2.add_tasks()->CopyFrom(taskInfo3);
-
+  Future<v1::scheduler::Event::Update> startingUpdate3;
   Future<v1::scheduler::Event::Update> runningUpdate3;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&runningUpdate3));
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, offer2.agent_id())))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate3),
+            v1::scheduler::SendAcknowledge(frameworkId, offer2.agent_id())));
 
   // Launch the second task group.
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer2,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo3}))}));
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer2.id());
-
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
-
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup2);
-
-    mesos.send(call);
-  }
+  AWAIT_READY(startingUpdate3);
+  ASSERT_EQ(TASK_STARTING, startingUpdate3->status().state());
+  ASSERT_EQ(taskInfo3.task_id(), startingUpdate3->status().task_id());
 
   AWAIT_READY(runningUpdate3);
   ASSERT_EQ(TASK_RUNNING, runningUpdate3->status().state());
   ASSERT_EQ(taskInfo3.task_id(), runningUpdate3->status().task_id());
-
-  // Acknowledge the TASK_RUNNING updates to receive the next updates.
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate1->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer1.agent_id());
-    acknowledge->set_uuid(runningUpdate1->status().uuid());
-
-    mesos.send(call);
-  }
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate2->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer1.agent_id());
-    acknowledge->set_uuid(runningUpdate2->status().uuid());
-
-    mesos.send(call);
-  }
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate3->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer2.agent_id());
-    acknowledge->set_uuid(runningUpdate3->status().uuid());
-
-    mesos.send(call);
-  }
 
   Future<v1::scheduler::Event::Update> killedUpdate1;
   Future<v1::scheduler::Event::Update> killedUpdate2;
@@ -479,16 +398,7 @@ TEST_P(DefaultExecutorTest, KillTask)
     .WillOnce(FutureArg<1>(&executorFailure));
 
   // Now kill a task in the first task group.
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::KILL);
-
-    Call::Kill* kill = call.mutable_kill();
-    kill->mutable_task_id()->CopyFrom(taskInfo1.task_id());
-
-    mesos.send(call);
-  }
+  mesos.send(v1::createCallKill(frameworkId, taskInfo1.task_id()));
 
   // All the tasks in the first task group should be killed.
 
@@ -515,16 +425,7 @@ TEST_P(DefaultExecutorTest, KillTask)
     .WillOnce(FutureArg<1>(&killedUpdate3));
 
   // Now kill the only task present in the second task group.
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::KILL);
-
-    Call::Kill* kill = call.mutable_kill();
-    kill->mutable_task_id()->CopyFrom(taskInfo3.task_id());
-
-    mesos.send(call);
-  }
+  mesos.send(v1::createCallKill(frameworkId, taskInfo3.task_id()));
 
   AWAIT_READY(killedUpdate3);
   ASSERT_EQ(TASK_KILLED, killedUpdate3->status().state());
@@ -556,16 +457,8 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -579,14 +472,10 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -594,14 +483,15 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
   v1::Resources resources =
       v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(resources);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
@@ -614,35 +504,33 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
 
   const hashset<v1::TaskID> tasks{taskInfo1.task_id(), taskInfo2.task_id()};
 
-  v1::TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(taskInfo1);
-  taskGroup.add_tasks()->CopyFrom(taskInfo2);
-
+  Future<v1::scheduler::Event::Update> startingUpdate1;
+  Future<v1::scheduler::Event::Update> startingUpdate2;
   Future<v1::scheduler::Event::Update> runningUpdate1;
   Future<v1::scheduler::Event::Update> runningUpdate2;
   EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&startingUpdate1))
+    .WillOnce(FutureArg<1>(&startingUpdate2))
     .WillOnce(FutureArg<1>(&runningUpdate1))
     .WillOnce(FutureArg<1>(&runningUpdate2));
 
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo1, taskInfo2}))}));
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer.id());
+  AWAIT_READY(startingUpdate1);
+  ASSERT_EQ(TASK_STARTING, startingUpdate1->status().state());
 
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
+  AWAIT_READY(startingUpdate2);
+  ASSERT_EQ(TASK_STARTING, startingUpdate2->status().state());
 
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-    mesos.send(call);
-  }
+  mesos.send(
+      v1::createCallAcknowledge(frameworkId, agentId, startingUpdate1.get()));
+  mesos.send(
+      v1::createCallAcknowledge(frameworkId, agentId, startingUpdate2.get()));
 
   AWAIT_READY(runningUpdate1);
   ASSERT_EQ(TASK_RUNNING, runningUpdate1->status().state());
@@ -665,38 +553,10 @@ TEST_P(DefaultExecutorTest, KillTaskGroupOnTaskFailure)
     .WillOnce(FutureArg<1>(&update2));
 
   // Acknowledge the TASK_RUNNING updates to receive the next updates.
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate1->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(runningUpdate1->status().uuid());
-
-    mesos.send(call);
-  }
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate2->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(runningUpdate2->status().uuid());
-
-    mesos.send(call);
-  }
+  mesos.send(
+      v1::createCallAcknowledge(frameworkId, agentId, runningUpdate1.get()));
+  mesos.send(
+      v1::createCallAcknowledge(frameworkId, agentId, runningUpdate2.get()));
 
   // Updates for the tasks in a task group can be received in any order.
   set<pair<v1::TaskID, v1::TaskState>> taskStates;
@@ -735,16 +595,8 @@ TEST_P(DefaultExecutorTest, TaskUsesExecutor)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -758,14 +610,10 @@ TEST_P(DefaultExecutorTest, TaskUsesExecutor)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -773,53 +621,40 @@ TEST_P(DefaultExecutorTest, TaskUsesExecutor)
   v1::Resources resources =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
   executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(resources);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
+
+  Future<v1::scheduler::Event::Update> update;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&update));
 
   v1::TaskInfo taskInfo =
     v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
   taskInfo.mutable_executor()->CopyFrom(executorInfo);
 
-  v1::TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(taskInfo);
-
-  Future<v1::scheduler::Event::Update> update;
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update));
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
-
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer.id());
-
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
-
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-    mesos.send(call);
-  }
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
 
   AWAIT_READY(update);
 
-  ASSERT_EQ(TASK_RUNNING, update->status().state());
+  ASSERT_EQ(TASK_STARTING, update->status().state());
   EXPECT_EQ(taskInfo.task_id(), update->status().task_id());
   EXPECT_TRUE(update->status().has_timestamp());
 }
@@ -837,23 +672,19 @@ TEST_P(DefaultExecutorTest, ROOT_ContainerStatusForTask)
   flags.containerizers = GetParam();
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
   ASSERT_SOME(slave);
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(
-        v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO),
-        FutureSatisfy(&connected)));
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
-  Future<Event::Subscribed> subscribed;
+  Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
     .WillOnce(FutureArg<1>(&subscribed));
 
-  Future<Event::Offers> offers;
+  Future<v1::scheduler::Event::Offers> offers;
   EXPECT_CALL(*scheduler, offers(_, _))
     .WillOnce(FutureArg<1>(&offers))
     .WillRepeatedly(Return());
@@ -866,65 +697,82 @@ TEST_P(DefaultExecutorTest, ROOT_ContainerStatusForTask)
       ContentType::PROTOBUF,
       scheduler);
 
-  AWAIT_READY(connected);
-
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
-  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      "test_default_executor",
-      None(),
-      "cpus:0.1;mem:32;disk:32",
-      v1::ExecutorInfo::DEFAULT);
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
 
-  v1::TaskInfo task1 = v1::createTask(
-      offer.agent_id(),
-      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
-      v1::createCommandInfo(SLEEP_COMMAND(1000)));
+  v1::TaskInfo task1 = v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
-  v1::TaskInfo task2 = v1::createTask(
-      offer.agent_id(),
-      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
-      v1::createCommandInfo(SLEEP_COMMAND(1000)));
+  v1::TaskInfo task2 = v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
-  v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
-      executorInfo,
-      v1::createTaskGroupInfo({task1, task2}));
-
-  Future<Event::Update> updateRunning1;
+  Future<Event::Update> updateStarting1;
+  Future<Event::Update> updateStartingOrRunning1;
+  Future<Event::Update> updateStartingOrRunning2;
   Future<Event::Update> updateRunning2;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(DoAll(
-        FutureArg<1>(&updateRunning1),
-        v1::scheduler::SendAcknowledge(
-            frameworkId,
-            offer.agent_id())))
-    .WillOnce(DoAll(
-        FutureArg<1>(&updateRunning2),
-        v1::scheduler::SendAcknowledge(
-            frameworkId,
-            offer.agent_id())));
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateStarting1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateStartingOrRunning1),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateStartingOrRunning2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateRunning2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
-  mesos.send(v1::createCallAccept(frameworkId, offer, {launchGroup}));
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({task1, task2}))}));
 
-  AWAIT_READY(updateRunning1);
+
+  AWAIT_READY(updateStarting1);
+  AWAIT_READY(updateStartingOrRunning1);
+  AWAIT_READY(updateStartingOrRunning2);
   AWAIT_READY(updateRunning2);
 
-  ASSERT_EQ(TASK_RUNNING, updateRunning1->status().state());
+  ASSERT_EQ(TASK_STARTING, updateStarting1->status().state());
   ASSERT_EQ(TASK_RUNNING, updateRunning2->status().state());
 
-  ASSERT_TRUE(updateRunning1->status().has_container_status());
-  ASSERT_TRUE(updateRunning2->status().has_container_status());
+  // Select the two TASK_RUNNING updates from the first four updates
+  Event::Update update1 = updateStartingOrRunning1.get();
+  if (update1.status().state() == v1::TASK_STARTING) {
+    update1 = updateStartingOrRunning2.get();
+  }
+  Event::Update update2 = updateRunning2.get();
 
-  v1::ContainerStatus status1 = updateRunning1->status().container_status();
-  v1::ContainerStatus status2 = updateRunning2->status().container_status();
+  ASSERT_EQ(TASK_RUNNING, update1.status().state());
+  ASSERT_EQ(TASK_RUNNING, update2.status().state());
+
+  ASSERT_TRUE(update1.status().has_container_status());
+  ASSERT_TRUE(update2.status().has_container_status());
+
+  v1::ContainerStatus status1 = update1.status().container_status();
+  v1::ContainerStatus status2 = update2.status().container_status();
 
   ASSERT_TRUE(status1.has_container_id());
   ASSERT_TRUE(status2.has_container_id());
@@ -952,16 +800,8 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnTaskFailure)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -975,14 +815,10 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnTaskFailure)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -990,74 +826,52 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnTaskFailure)
   v1::Resources resources =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
-  executorInfo.mutable_resources()->CopyFrom(resources);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
 
   // The task exits with a non-zero status code.
-  v1::TaskInfo taskInfo1 = v1::createTask(agentId, resources, "exit 1");
+  v1::TaskInfo taskInfo = v1::createTask(agentId, resources, "exit 1");
 
-  v1::TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(taskInfo1);
-
+  Future<v1::scheduler::Event::Update> startingUpdate;
   Future<v1::scheduler::Event::Update> runningUpdate;
   Future<v1::scheduler::Event::Update> failedUpdate;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&runningUpdate))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
     .WillOnce(FutureArg<1>(&failedUpdate));
 
   Future<v1::scheduler::Event::Failure> executorFailure;
   EXPECT_CALL(*scheduler, failure(_, _))
     .WillOnce(FutureArg<1>(&executorFailure));
 
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer.id());
-
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
-
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-    mesos.send(call);
-  }
+  AWAIT_READY(startingUpdate);
+  ASSERT_EQ(TASK_STARTING, startingUpdate->status().state());
 
   AWAIT_READY(runningUpdate);
   ASSERT_EQ(TASK_RUNNING, runningUpdate->status().state());
-
-  // Acknowledge the TASK_RUNNING update to receive the next update.
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(runningUpdate->status().uuid());
-
-    mesos.send(call);
-  }
 
   AWAIT_READY(failedUpdate);
   ASSERT_EQ(TASK_FAILED, failedUpdate->status().state());
@@ -1088,16 +902,8 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -1111,14 +917,10 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(v1::DEFAULT_FRAMEWORK_INFO);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -1126,14 +928,15 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   v1::Resources resources =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(resources);
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
@@ -1141,126 +944,110 @@ TEST_P(DefaultExecutorTest, CommitSuicideOnKillTask)
   // The first task finishes successfully while the second
   // task is explicitly killed later.
 
-  v1::TaskInfo taskInfo1 = v1::createTask(agentId, resources, "exit 0");
+  v1::TaskInfo task1 = v1::createTask(agentId, resources, "exit 0");
 
-  v1::TaskInfo taskInfo2 =
-    v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
+  v1::TaskInfo task2 = v1::createTask(agentId, resources, SLEEP_COMMAND(1000));
 
-  v1::TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(taskInfo1);
-  taskGroup.add_tasks()->CopyFrom(taskInfo2);
+  const hashset<v1::TaskID> taskIds{task1.task_id(), task2.task_id()};
 
-  const hashset<v1::TaskID> tasks{taskInfo1.task_id(), taskInfo2.task_id()};
+  // We expect two TASK_STARTING, two TASK_RUNNING, and one TASK_FINISHED
+  // updates.
+  vector<Future<v1::scheduler::Event::Update>> updates(5);
 
-  Future<v1::scheduler::Event::Update> runningUpdate1;
-  Future<v1::scheduler::Event::Update> runningUpdate2;
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&runningUpdate1))
-    .WillOnce(FutureArg<1>(&runningUpdate2));
+  {
+    // This variable doesn't have to be used explicitly. We need it so that the
+    // futures are satisfied in the order in which the updates are received.
+    testing::InSequence inSequence;
+
+    foreach (Future<v1::scheduler::Event::Update>& update, updates) {
+      EXPECT_CALL(*scheduler, update(_, _))
+        .WillOnce(
+            DoAll(
+                FutureArg<1>(&update),
+                v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+    }
+  }
 
   Future<v1::scheduler::Event::Failure> executorFailure;
   EXPECT_CALL(*scheduler, failure(_, _))
     .WillOnce(FutureArg<1>(&executorFailure));
 
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({task1, task2}))}));
+
+  enum class Stage
   {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
+    INITIAL,
+    STARTING,
+    RUNNING,
+    FINISHED
+  };
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer.id());
+  hashmap<v1::TaskID, Stage> taskStages;
+  taskStages[task1.task_id()] = Stage::INITIAL;
+  taskStages[task2.task_id()] = Stage::INITIAL;
 
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
+  foreach (Future<v1::scheduler::Event::Update>& update, updates) {
+    AWAIT_READY(update);
 
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
+    const v1::TaskStatus& taskStatus = update->status();
 
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
+    Option<Stage> taskStage = taskStages.get(taskStatus.task_id());
+    ASSERT_SOME(taskStage);
 
-    mesos.send(call);
+    switch (taskStage.get()) {
+      case Stage::INITIAL: {
+        ASSERT_EQ(TASK_STARTING, taskStatus.state());
+
+        taskStages[taskStatus.task_id()] = Stage::STARTING;
+
+        break;
+      }
+      case Stage::STARTING: {
+        ASSERT_EQ(TASK_RUNNING, taskStatus.state());
+
+        taskStages[taskStatus.task_id()] = Stage::RUNNING;
+
+        break;
+      }
+      case Stage::RUNNING: {
+        ASSERT_EQ(TASK_FINISHED, taskStatus.state());
+
+        taskStages[taskStatus.task_id()] = Stage::FINISHED;
+
+        break;
+      }
+      case Stage::FINISHED: {
+        FAIL() << "Unexpected task update: " << update->DebugString();
+        break;
+      }
+    }
   }
 
-  AWAIT_READY(runningUpdate1);
-  ASSERT_EQ(TASK_RUNNING, runningUpdate1->status().state());
+  // `task1` should have finished, `task2` should still be running.
+  ASSERT_EQ(Stage::FINISHED, taskStages[task1.task_id()]);
+  ASSERT_EQ(Stage::RUNNING, taskStages[task2.task_id()]);
 
-  AWAIT_READY(runningUpdate2);
-  ASSERT_EQ(TASK_RUNNING, runningUpdate2->status().state());
-
-  // When running a task, TASK_RUNNING updates for the tasks in a
-  // task group can be received in any order.
-  const hashset<v1::TaskID> tasksRunning{
-    runningUpdate1->status().task_id(),
-    runningUpdate2->status().task_id()};
-
-  ASSERT_EQ(tasks, tasksRunning);
-
-  Future<v1::scheduler::Event::Update> finishedUpdate;
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&finishedUpdate));
-
-  // Acknowledge the TASK_RUNNING updates to receive the next updates.
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate1->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(runningUpdate1->status().uuid());
-
-    mesos.send(call);
-  }
-
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-
-    acknowledge->mutable_task_id()->CopyFrom(
-        runningUpdate2->status().task_id());
-
-    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(runningUpdate2->status().uuid());
-
-    mesos.send(call);
-  }
-
-  AWAIT_READY(finishedUpdate);
-  ASSERT_EQ(TASK_FINISHED, finishedUpdate->status().state());
-  ASSERT_EQ(taskInfo1.task_id(), finishedUpdate->status().task_id());
-
-  // The executor should still be alive after the task
-  // has finished successfully.
+  // The executor should still be alive after task1 has finished successfully.
   ASSERT_TRUE(executorFailure.isPending());
 
   Future<v1::scheduler::Event::Update> killedUpdate;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&killedUpdate));
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&killedUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
   // Now kill the second task in the task group.
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::KILL);
-
-    Call::Kill* kill = call.mutable_kill();
-    kill->mutable_task_id()->CopyFrom(taskInfo2.task_id());
-
-    mesos.send(call);
-  }
+  mesos.send(v1::createCallKill(frameworkId, task2.task_id()));
 
   AWAIT_READY(killedUpdate);
   ASSERT_EQ(TASK_KILLED, killedUpdate->status().state());
-  ASSERT_EQ(taskInfo2.task_id(), killedUpdate->status().task_id());
+  ASSERT_EQ(task2.task_id(), killedUpdate->status().task_id());
 
   // The executor should commit suicide after the task is killed.
   AWAIT_READY(executorFailure);
@@ -1286,19 +1073,11 @@ TEST_P(DefaultExecutorTest, ReservedResources)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
-  EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
-
   v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("role");
+  frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -1306,22 +1085,25 @@ TEST_P(DefaultExecutorTest, ReservedResources)
 
   Future<v1::scheduler::Event::Offers> offers;
   EXPECT_CALL(*scheduler, offers(_, _))
-    .WillOnce(FutureArg<1>(&offers));
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
 
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
-  {
-    Call call;
-    call.set_type(Call::SUBSCRIBE);
-    Call::Subscribe* subscribe = call.mutable_subscribe();
-    subscribe->mutable_framework_info()->CopyFrom(frameworkInfo);
-
-    mesos.send(call);
-  }
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
 
   v1::Resources unreserved =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
@@ -1331,54 +1113,30 @@ TEST_P(DefaultExecutorTest, ReservedResources)
     unreserved.pushReservation(v1::createDynamicReservationInfo(
         frameworkInfo.role(), frameworkInfo.principal()));
 
-  v1::ExecutorInfo executorInfo;
-  executorInfo.set_type(v1::ExecutorInfo::DEFAULT);
-  executorInfo.mutable_executor_id()->CopyFrom(v1::DEFAULT_EXECUTOR_ID);
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(reserved);
-
-  AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
-
-  const v1::Offer& offer = offers->offers(0);
-  const v1::AgentID& agentId = offer.agent_id();
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      reserved,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   // Launch the task using unreserved resources.
   v1::TaskInfo taskInfo =
     v1::createTask(agentId, unreserved, SLEEP_COMMAND(1000));
 
-  v1::TaskGroupInfo taskGroup;
-  taskGroup.add_tasks()->CopyFrom(taskInfo);
+  v1::Offer::Operation reserve = v1::RESERVE(reserved);
+  v1::Offer::Operation launchGroup =
+    v1::LAUNCH_GROUP(executorInfo, v1::createTaskGroupInfo({taskInfo}));
 
-  Future<v1::scheduler::Event::Update> runningUpdate;
+  Future<v1::scheduler::Event::Update> startingUpdate;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&runningUpdate));
+    .WillOnce(FutureArg<1>(&startingUpdate));
 
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACCEPT);
+  mesos.send(v1::createCallAccept(frameworkId, offer, {reserve, launchGroup}));
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(offer.id());
-
-    accept->add_operations()->CopyFrom(v1::RESERVE(reserved));
-
-    v1::Offer::Operation* operation = accept->add_operations();
-    operation->set_type(v1::Offer::Operation::LAUNCH_GROUP);
-
-    v1::Offer::Operation::LaunchGroup* launchGroup =
-      operation->mutable_launch_group();
-
-    launchGroup->mutable_executor()->CopyFrom(executorInfo);
-    launchGroup->mutable_task_group()->CopyFrom(taskGroup);
-
-    mesos.send(call);
-  }
-
-  AWAIT_READY(runningUpdate);
-  ASSERT_EQ(TASK_RUNNING, runningUpdate->status().state());
-  ASSERT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+  AWAIT_READY(startingUpdate);
+  ASSERT_EQ(TASK_STARTING, startingUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
 }
 
 
@@ -1415,17 +1173,8 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO),
-                    FutureSatisfy(&connected)));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -1438,17 +1187,20 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
   AWAIT_READY(subscribed);
 
   v1::FrameworkID frameworkId(subscribed->framework_id());
   v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      "test_default_executor",
+      v1::DEFAULT_EXECUTOR_ID,
       None(),
       "cpus:0.1;mem:32;disk:32",
-      v1::ExecutorInfo::DEFAULT);
-
-  // Update `executorInfo` with the subscribed `frameworkId`.
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->offers().empty());
@@ -1461,9 +1213,16 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
       v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
       "sleep 1000");
 
-  Future<v1::scheduler::Event::Update> update;
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update));
+    .WillOnce(DoAll(
+        FutureArg<1>(&startingUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(DoAll(
+        FutureArg<1>(&runningUpdate),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillRepeatedly(Return());
 
   v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
       executorInfo,
@@ -1471,14 +1230,19 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
 
   mesos.send(v1::createCallAccept(frameworkId, offer, {launchGroup}));
 
-  AWAIT_READY(update);
+  AWAIT_READY(startingUpdate);
 
-  ASSERT_EQ(TASK_RUNNING, update->status().state());
-  EXPECT_EQ(taskInfo.task_id(), update->status().task_id());
-  EXPECT_TRUE(update->status().has_timestamp());
-  ASSERT_TRUE(update->status().has_container_status());
+  ASSERT_EQ(TASK_STARTING, startingUpdate->status().state());
+  EXPECT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
 
-  v1::ContainerStatus status = update->status().container_status();
+  AWAIT_READY(runningUpdate);
+
+  ASSERT_EQ(TASK_RUNNING, runningUpdate->status().state());
+  EXPECT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+  EXPECT_TRUE(runningUpdate->status().has_timestamp());
+  ASSERT_TRUE(runningUpdate->status().has_container_status());
+
+  v1::ContainerStatus status = runningUpdate->status().container_status();
 
   ASSERT_TRUE(status.has_container_id());
   EXPECT_TRUE(status.container_id().has_parent());
@@ -1496,10 +1260,11 @@ TEST_P(DefaultExecutorTest, SigkillExecutor)
 
   ASSERT_SOME(os::killtree(executorStatus->executor_pid(), SIGKILL));
 
+  // In this test we do not care about the exact value of the returned status
+  // code, but ensure that `wait` future enters the ready state.
   AWAIT_READY(wait);
   ASSERT_SOME(wait.get());
   ASSERT_TRUE(wait.get()->has_status());
-  EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
 }
 
 
@@ -1522,19 +1287,8 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
 
   auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
 
-  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
-
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(v1::scheduler::SendSubscribe(frameworkInfo),
-                    FutureSatisfy(&connected)));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
 
   Future<v1::scheduler::Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -1547,20 +1301,23 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
   AWAIT_READY(subscribed);
 
   v1::FrameworkID frameworkId(subscribed->framework_id());
   v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      "test_default_executor",
+      v1::DEFAULT_EXECUTOR_ID,
       None(),
       "cpus:0.1;mem:32;disk:32",
-      v1::ExecutorInfo::DEFAULT);
-
-  // Update `executorInfo` with the subscribed `frameworkId`.
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->offers().empty());
+  ASSERT_FALSE(offers1->offers().empty());
 
   const v1::Offer& offer1 = offers1->offers(0);
   const v1::AgentID& agentId = offer1.agent_id();
@@ -1575,8 +1332,13 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
   containerInfo->set_type(mesos::v1::ContainerInfo::MESOS);
   containerInfo->mutable_linux_info()->set_share_pid_namespace(true);
 
+  Future<v1::scheduler::Event::Update> update0;
   Future<v1::scheduler::Event::Update> update1;
   EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&update0),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
     .WillOnce(FutureArg<1>(&update1));
 
   Future<v1::scheduler::Event::Offers> offers2;
@@ -1598,7 +1360,7 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
   EXPECT_TRUE(update1->status().has_timestamp());
 
   AWAIT_READY(offers2);
-  EXPECT_FALSE(offers2->offers().empty());
+  ASSERT_FALSE(offers2->offers().empty());
 
   const v1::Offer& offer2 = offers2->offers(0);
 
@@ -1613,8 +1375,13 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
   containerInfo->mutable_linux_info()->set_share_pid_namespace(true);
 
   Future<v1::scheduler::Event::Update> update2;
+  Future<v1::scheduler::Event::Update> update3;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update2));
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&update2),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(FutureArg<1>(&update3));
 
   // Launch the second task group.
   launchGroup = v1::LAUNCH_GROUP(
@@ -1625,9 +1392,14 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
 
   AWAIT_READY(update2);
 
-  ASSERT_EQ(TASK_RUNNING, update2->status().state());
+  ASSERT_EQ(TASK_STARTING, update2->status().state());
   EXPECT_EQ(taskInfo2.task_id(), update2->status().task_id());
-  EXPECT_TRUE(update2->status().has_timestamp());
+
+  AWAIT_READY(update3);
+
+  ASSERT_EQ(TASK_RUNNING, update3->status().state());
+  EXPECT_EQ(taskInfo2.task_id(), update3->status().task_id());
+  EXPECT_TRUE(update3->status().has_timestamp());
 
   string executorSandbox = slave::paths::getExecutorLatestRunPath(
       flags.work_dir,
@@ -1675,6 +1447,127 @@ TEST_P(DefaultExecutorTest, ROOT_MultiTaskgroupSharePidNamespace)
 #endif // __linux__
 
 
+// This test verifies that a resource limitation incurred on a nested
+// container is propagated all the way up to the scheduler.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(
+    DefaultExecutorTest, ResourceLimitation)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.containerizers = GetParam();
+  flags.enforce_container_disk_quota = true;
+  flags.container_disk_watch_interval = Milliseconds(1);
+  flags.isolation = "disk/du";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources resources =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:10").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      resources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  Future<v1::scheduler::Event::Update> starting;
+  Future<v1::scheduler::Event::Update> running;
+  Future<v1::scheduler::Event::Update> failed;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&starting),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&running),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&failed),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  // Since we requested 10MB each for the task and the executor,
+  // writing 30MB will violate our disk resource limit.
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId,
+      resources,
+      "dd if=/dev/zero of=dd.out bs=1048576 count=30; sleep 1000");
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
+
+  AWAIT_READY(starting);
+
+  EXPECT_EQ(TASK_STARTING, starting->status().state());
+  EXPECT_EQ(taskInfo.task_id(), starting->status().task_id());
+
+  AWAIT_READY(running);
+
+  EXPECT_EQ(TASK_RUNNING, running->status().state());
+  EXPECT_EQ(taskInfo.task_id(), running->status().task_id());
+
+  AWAIT_READY(failed);
+
+  // We expect the failure to be a disk limitation that tells us something
+  // about the disk resources.
+  EXPECT_EQ(TASK_FAILED, failed->status().state());
+  EXPECT_EQ(
+      TaskStatus::REASON_CONTAINER_LIMITATION_DISK,
+      failed->status().reason());
+
+  EXPECT_EQ(taskInfo.task_id(), failed->status().task_id());
+  ASSERT_TRUE(failed->status().has_limitation());
+  EXPECT_GT(failed->status().limitation().resources().size(), 0);
+
+  foreach (const v1::Resource& resource,
+           failed->status().limitation().resources()) {
+    EXPECT_EQ("disk", resource.name());
+    EXPECT_EQ(mesos::v1::Value::SCALAR, resource.type());
+  }
+}
+
+
 struct LauncherAndIsolationParam
 {
   LauncherAndIsolationParam(const string& _launcher, const string& _isolation)
@@ -1683,6 +1576,239 @@ struct LauncherAndIsolationParam
   const string launcher;
   const string isolation;
 };
+
+
+// This test verifies that URIs set on tasks are fetched and made available to
+// them when started by the DefaultExecutor.
+//
+// TODO(josephw): Reenable this test once URIs are constructed without using
+// the `path` helpers. This should be fixed along with MESOS-6705.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(DefaultExecutorTest, TaskWithFileURI)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.containerizers = GetParam();
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      "cpus:0.1;mem:32;disk:32",
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  // Create a task that will check if a file called 'testFile'
+  // contains the text 'pizza'.
+
+  // Create the file that should be fetched for the task
+  string fromPath = path::join(os::getcwd(), "fromPath");
+  ASSERT_SOME(os::mkdir(fromPath));
+  string testFilePath = path::join(fromPath, "testFile");
+  EXPECT_SOME(os::write(testFilePath, "pizza"));
+
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
+      "test `cat testFile` = pizza");
+
+  taskInfo.mutable_command()->add_uris()->set_value("file://" + testFilePath);
+
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  Future<v1::scheduler::Event::Update> finishedUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&finishedUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
+
+  AWAIT_READY(startingUpdate);
+  ASSERT_EQ(TASK_STARTING, startingUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+
+  AWAIT_READY(runningUpdate);
+  ASSERT_EQ(TASK_RUNNING, runningUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+
+  AWAIT_READY(finishedUpdate);
+  ASSERT_EQ(TASK_FINISHED, finishedUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), finishedUpdate->status().task_id());
+}
+
+
+// This test verifies that URIs set on Docker tasks are fetched and made
+// available to them when started by the DefaultExecutor.
+//
+// TODO(josephw): Reenable this test once URIs are constructed without using
+// the `path` helpers. This should be fixed along with MESOS-6705.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(
+    DefaultExecutorTest, ROOT_INTERNET_CURL_DockerTaskWithFileURI)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.containerizers = GetParam();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+
+  // Image pulling time may be long, depending on the location of
+  // the registry server.
+  flags.executor_registration_timeout = Minutes(10);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(v1::DEFAULT_FRAMEWORK_INFO));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<v1::scheduler::Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+  const v1::AgentID& agentId = offer.agent_id();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      "cpus:0.1;mem:32;disk:32",
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  // Create a task that will check if a file called 'testFile'
+  // contains the text 'pizza'.
+
+  // Create the file that should be fetched for the task
+  string fromPath = path::join(os::getcwd(), "fromPath");
+  ASSERT_SOME(os::mkdir(fromPath));
+  string testFilePath = path::join(fromPath, "testFile");
+  EXPECT_SOME(os::write(testFilePath, "pizza"));
+
+  v1::TaskInfo taskInfo = v1::createTask(
+      agentId,
+      v1::Resources::parse("cpus:0.1;mem:32;disk:32").get(),
+      "test `cat testFile` = pizza");
+
+  taskInfo.mutable_command()->add_uris()->set_value("file://" + testFilePath);
+
+  mesos::v1::Image image;
+  image.set_type(mesos::v1::Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  mesos::v1::ContainerInfo* container = taskInfo.mutable_container();
+  container->set_type(mesos::v1::ContainerInfo::MESOS);
+  container->mutable_mesos()->mutable_image()->CopyFrom(image);
+
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
+  Future<v1::scheduler::Event::Update> finishedUpdate;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&startingUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&runningUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&finishedUpdate),
+            v1::scheduler::SendAcknowledge(frameworkId, agentId)));
+
+  mesos.send(
+      v1::createCallAccept(
+          frameworkId,
+          offer,
+          {v1::LAUNCH_GROUP(
+              executorInfo, v1::createTaskGroupInfo({taskInfo}))}));
+
+  AWAIT_READY(startingUpdate);
+  ASSERT_EQ(TASK_STARTING, startingUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+
+  AWAIT_READY(runningUpdate);
+  ASSERT_EQ(TASK_RUNNING, runningUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+
+  AWAIT_READY(finishedUpdate);
+  ASSERT_EQ(TASK_FINISHED, finishedUpdate->status().state());
+  ASSERT_EQ(taskInfo.task_id(), finishedUpdate->status().task_id());
+}
 
 
 class PersistentVolumeDefaultExecutor
@@ -1744,17 +1870,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_role(DEFAULT_TEST_ROLE);
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(v1::scheduler::SendSubscribe(frameworkInfo),
-                    FutureSatisfy(&connected)));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
 
   Future<Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -1767,6 +1884,11 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -1790,16 +1912,14 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   v1::Resources executorResources = reserved.apply(v1::CREATE(volume)).get();
 
   v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      v1::DEFAULT_EXECUTOR_ID.value(),
+      v1::DEFAULT_EXECUTOR_ID,
       None(),
-      None(),
-      v1::ExecutorInfo::DEFAULT);
-
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(executorResources);
+      executorResources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
 
@@ -1833,9 +1953,14 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       executorInfo,
       v1::createTaskGroupInfo({taskInfo}));
 
+  Future<Event::Update> updateStarting;
   Future<Event::Update> updateRunning;
   Future<Event::Update> updateFinished;
   EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(FutureArg<1>(&updateStarting),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())))
     .WillOnce(DoAll(FutureArg<1>(&updateRunning),
                     v1::scheduler::SendAcknowledge(
                         frameworkId,
@@ -1846,6 +1971,10 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       frameworkId,
       offer,
       {reserve, create, launchGroup}));
+
+  AWAIT_READY(updateStarting);
+  ASSERT_EQ(TASK_STARTING, updateStarting->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateStarting->status().task_id());
 
   AWAIT_READY(updateRunning);
   ASSERT_EQ(TASK_RUNNING, updateRunning->status().state());
@@ -1887,17 +2016,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_role(DEFAULT_TEST_ROLE);
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(v1::scheduler::SendSubscribe(frameworkInfo),
-                    FutureSatisfy(&connected)));
-
-  v1::scheduler::TestMesos mesos(
-      master.get()->pid,
-      ContentType::PROTOBUF,
-      scheduler);
-
-  AWAIT_READY(connected);
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
 
   Future<Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -1911,6 +2031,11 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   EXPECT_CALL(*scheduler, heartbeat(_))
     .WillRepeatedly(Return()); // Ignore heartbeats.
 
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
@@ -1918,16 +2043,14 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
   v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      v1::DEFAULT_EXECUTOR_ID.value(),
+      v1::DEFAULT_EXECUTOR_ID,
       None(),
-      None(),
-      v1::ExecutorInfo::DEFAULT);
-
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(unreserved);
+      unreserved,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
 
@@ -1957,9 +2080,14 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       executorInfo,
       v1::createTaskGroupInfo({taskInfo}));
 
+  Future<Event::Update> updateStarting;
   Future<Event::Update> updateRunning;
   Future<Event::Update> updateFinished;
   EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(DoAll(FutureArg<1>(&updateStarting),
+                    v1::scheduler::SendAcknowledge(
+                        frameworkId,
+                        offer.agent_id())))
     .WillOnce(DoAll(FutureArg<1>(&updateRunning),
                     v1::scheduler::SendAcknowledge(
                         frameworkId,
@@ -1970,6 +2098,10 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       frameworkId,
       offer,
       {reserve, create, launchGroup}));
+
+  AWAIT_READY(updateStarting);
+  ASSERT_EQ(TASK_STARTING, updateStarting->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateStarting->status().task_id());
 
   AWAIT_READY(updateRunning);
   ASSERT_EQ(TASK_RUNNING, updateRunning->status().state());
@@ -2011,10 +2143,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_role(DEFAULT_TEST_ROLE);
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(v1::scheduler::SendSubscribe(frameworkInfo),
-                    FutureSatisfy(&connected)));
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
 
   Future<Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -2032,8 +2162,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       master.get()->pid,
       ContentType::PROTOBUF,
       scheduler);
-
-  AWAIT_READY(connected);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -2063,13 +2191,11 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     individualResources.apply(v1::CREATE(executorVolume)).get();
 
   v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      v1::DEFAULT_EXECUTOR_ID.value(),
+      v1::DEFAULT_EXECUTOR_ID,
       None(),
-      None(),
-      v1::ExecutorInfo::DEFAULT);
-
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(executorResources);
+      executorResources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->offers().empty());
@@ -2125,7 +2251,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       "consumer");
   consumerInfo.mutable_container()->CopyFrom(containerInfo);
 
-  vector<Future<v1::scheduler::Event::Update>> updates(4);
+  vector<Future<v1::scheduler::Event::Update>> updates(6);
 
   {
     // This variable doesn't have to be used explicitly. We need it so that the
@@ -2157,6 +2283,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   enum class Stage
   {
     INITIAL,
+    STARTING,
     RUNNING,
     FINISHED
   };
@@ -2175,6 +2302,13 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
     switch (taskStage.get()) {
       case Stage::INITIAL: {
+        ASSERT_EQ(TASK_STARTING, taskStatus.state());
+
+        taskStages[taskStatus.task_id()] = Stage::STARTING;
+
+        break;
+      }
+      case Stage::STARTING: {
         ASSERT_EQ(TASK_RUNNING, taskStatus.state());
 
         taskStages[taskStatus.task_id()] = Stage::RUNNING;
@@ -2226,10 +2360,8 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_role(DEFAULT_TEST_ROLE);
 
-  Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(DoAll(v1::scheduler::SendSubscribe(frameworkInfo),
-                    FutureSatisfy(&connected)));
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
 
   Future<Event::Subscribed> subscribed;
   EXPECT_CALL(*scheduler, subscribed(_, _))
@@ -2247,8 +2379,6 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       master.get()->pid,
       ContentType::PROTOBUF,
       scheduler);
-
-  AWAIT_READY(connected);
 
   AWAIT_READY(subscribed);
   v1::FrameworkID frameworkId(subscribed->framework_id());
@@ -2278,13 +2408,11 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
     individualResources.apply(v1::CREATE(executorVolume)).get();
 
   v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
-      v1::DEFAULT_EXECUTOR_ID.value(),
+      v1::DEFAULT_EXECUTOR_ID,
       None(),
-      None(),
-      v1::ExecutorInfo::DEFAULT);
-
-  executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
-  executorInfo.mutable_resources()->CopyFrom(executorResources);
+      executorResources,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
 
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->offers().empty());
@@ -2340,7 +2468,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
       "consumer");
   consumerInfo.mutable_container()->CopyFrom(containerInfo);
 
-  vector<Future<v1::scheduler::Event::Update>> updates(4);
+  vector<Future<v1::scheduler::Event::Update>> updates(6);
 
   {
     // This variable doesn't have to be used explicitly. We need it so that the
@@ -2375,6 +2503,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   enum class Stage
   {
     INITIAL,
+    STARTING,
     RUNNING,
     FINISHED
   };
@@ -2393,6 +2522,13 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
     switch (taskStage.get()) {
       case Stage::INITIAL: {
+        ASSERT_EQ(TASK_STARTING, taskStatus.state());
+
+        taskStages[taskStatus.task_id()] = Stage::STARTING;
+
+        break;
+      }
+      case Stage::STARTING: {
         ASSERT_EQ(TASK_RUNNING, taskStatus.state());
 
         taskStages[taskStatus.task_id()] = Stage::RUNNING;
@@ -2415,6 +2551,163 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
 
   string volumePath = slave::paths::getPersistentVolumePath(
       flags.work_dir, devolve(executorVolume));
+
+  string filePath = path::join(volumePath, "file");
+
+  // Ensure that the task was able to write to the persistent volume.
+  EXPECT_SOME_EQ("abc\n", os::read(filePath));
+}
+
+
+// This test verifies that the command health checks initiated by the default
+// executor are able to read files in a persistent volume.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(
+    PersistentVolumeDefaultExecutor, ROOT_HealthCheckUsingPersistentVolume)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.launcher = param.launcher;
+  flags.isolation = param.isolation;
+
+  Fetcher fetcher(flags);
+
+  // We have to explicitly create a `Containerizer` in non-local mode,
+  // because `LaunchNestedContainerSession` (used by command health
+  // checks) tries to start a IO switchboard, which doesn't work in
+  // local mode yet.
+  Try<MesosContainerizer*> _containerizer =
+    MesosContainerizer::create(flags, false, &fetcher);
+  ASSERT_SOME(_containerizer);
+
+  Owned<slave::Containerizer> containerizer(_containerizer.get());
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), containerizer.get(), flags);
+  ASSERT_SOME(slave);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(DEFAULT_TEST_ROLE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  Future<Event::Offers> offers;
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  v1::Resources unreserved =
+    v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
+
+  v1::ExecutorInfo executorInfo = v1::createExecutorInfo(
+      v1::DEFAULT_EXECUTOR_ID,
+      None(),
+      unreserved,
+      v1::ExecutorInfo::DEFAULT,
+      frameworkId);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  v1::Resource volume = v1::createPersistentVolume(
+      Megabytes(1),
+      frameworkInfo.role(),
+      "id1",
+      "task_volume_path",
+      frameworkInfo.principal(),
+      None(),
+      frameworkInfo.principal());
+
+  v1::Resources reserved =
+    unreserved.pushReservation(v1::createDynamicReservationInfo(
+        frameworkInfo.role(), frameworkInfo.principal()));
+
+  // Launch a task that expects the persistent volume to be
+  // mounted in its sandbox.
+  v1::TaskInfo taskInfo = v1::createTask(
+      offer.agent_id(),
+      reserved.apply(v1::CREATE(volume)).get(),
+      "echo abc > task_volume_path/file && sleep 31337");
+
+  // Create a health check that will only pass if it is able to read
+  // from the task's persistent volume.
+  v1::HealthCheck healthCheck;
+  healthCheck.set_type(v1::HealthCheck::COMMAND);
+  healthCheck.mutable_command()->set_value("cat task_volume_path/file");
+  healthCheck.set_delay_seconds(0);
+  healthCheck.set_interval_seconds(0);
+  healthCheck.set_grace_period_seconds(10);
+
+  taskInfo.mutable_health_check()->CopyFrom(healthCheck);
+
+  v1::Offer::Operation reserve = v1::RESERVE(reserved);
+  v1::Offer::Operation create = v1::CREATE(volume);
+  v1::Offer::Operation launchGroup = v1::LAUNCH_GROUP(
+      executorInfo,
+      v1::createTaskGroupInfo({taskInfo}));
+
+  Future<Event::Update> updateStarting;
+  Future<Event::Update> updateRunning;
+  Future<Event::Update> updateHealthy;
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateStarting),
+            v1::scheduler::SendAcknowledge(frameworkId, offer.agent_id())))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateRunning),
+            v1::scheduler::SendAcknowledge(frameworkId, offer.agent_id())))
+    .WillOnce(
+        DoAll(
+            FutureArg<1>(&updateHealthy),
+            v1::scheduler::SendAcknowledge(frameworkId, offer.agent_id())));
+
+  mesos.send(v1::createCallAccept(
+      frameworkId,
+      offer,
+      {reserve, create, launchGroup}));
+
+  AWAIT_READY(updateStarting);
+  ASSERT_EQ(TASK_STARTING, updateStarting->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateStarting->status().task_id());
+
+  AWAIT_READY(updateRunning);
+  ASSERT_EQ(TASK_RUNNING, updateRunning->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateRunning->status().task_id());
+
+  AWAIT_READY(updateHealthy);
+  EXPECT_EQ(TASK_RUNNING, updateHealthy->status().state());
+  EXPECT_EQ(
+      TaskStatus::REASON_TASK_HEALTH_CHECK_STATUS_UPDATED,
+      updateHealthy->status().reason());
+  EXPECT_TRUE(updateHealthy->status().has_healthy());
+  EXPECT_TRUE(updateHealthy->status().healthy());
+
+  string volumePath = slave::paths::getPersistentVolumePath(
+      flags.work_dir,
+      devolve(volume));
 
   string filePath = path::join(volumePath, "file");
 

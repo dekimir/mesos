@@ -325,19 +325,24 @@ TEST_F(HealthCheckTest, HealthyTask)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   vector<TaskInfo> tasks =
     populateTasks(SLEEP_COMMAND(120), "exit 0", offers.get()[0]);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -400,7 +405,7 @@ TEST_F(HealthCheckTest, HealthyTask)
     ASSERT_SOME(parse);
 
     Result<JSON::Value> find = parse->find<JSON::Value>(
-        "frameworks[0].tasks[0].statuses[0].healthy");
+        "frameworks[0].tasks[0].statuses[1].healthy");
     EXPECT_SOME_TRUE(find);
   }
 
@@ -418,7 +423,7 @@ TEST_F(HealthCheckTest, HealthyTask)
     ASSERT_SOME(parse);
 
     Result<JSON::Value> find = parse->find<JSON::Value>(
-        "frameworks[0].executors[0].tasks[0].statuses[0].healthy");
+        "frameworks[0].executors[0].tasks[0].statuses[1].healthy");
     EXPECT_SOME_TRUE(find);
   }
 
@@ -468,7 +473,7 @@ TEST_F(HealthCheckTest, ROOT_HealthyTaskWithContainerImage)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Make use of 'populateTasks()' to avoid duplicate code.
   vector<TaskInfo> tasks =
@@ -488,14 +493,19 @@ TEST_F(HealthCheckTest, ROOT_HealthyTaskWithContainerImage)
   health->set_type(HealthCheck::COMMAND);
   health->mutable_command()->set_value("exit 0");
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy));
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -522,7 +532,7 @@ TEST_F(HealthCheckTest, ROOT_HealthyTaskWithContainerImage)
     ASSERT_SOME(parse);
 
     Result<JSON::Value> find = parse->find<JSON::Value>(
-        "frameworks[0].tasks[0].statuses[0].healthy");
+        "frameworks[0].tasks[0].statuses[1].healthy");
     EXPECT_SOME_TRUE(find);
   }
 
@@ -540,7 +550,7 @@ TEST_F(HealthCheckTest, ROOT_HealthyTaskWithContainerImage)
     ASSERT_SOME(parse);
 
     Result<JSON::Value> find = parse->find<JSON::Value>(
-        "frameworks[0].executors[0].tasks[0].statuses[0].healthy");
+        "frameworks[0].executors[0].tasks[0].statuses[1].healthy");
     EXPECT_SOME_TRUE(find);
   }
 
@@ -603,7 +613,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, ROOT_DOCKER_DockerHealthyTask)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   ContainerInfo containerInfo;
   containerInfo.set_type(ContainerInfo::DOCKER);
@@ -628,16 +638,21 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, ROOT_DOCKER_DockerHealthyTask)
                     Invoke(&containerizer,
                            &MockDockerContainerizer::_launch)));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
 
   AWAIT_READY(containerId);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -698,7 +713,7 @@ TEST_F(HealthCheckTest, HealthyTaskNonShell)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   CommandInfo command;
   command.set_shell(false);
@@ -715,14 +730,19 @@ TEST_F(HealthCheckTest, HealthyTaskNonShell)
   vector<TaskInfo> tasks =
     populateTasks(SLEEP_COMMAND(120), command, offers.get()[0]);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -764,7 +784,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthStatusChange)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Create a temporary file.
   Try<string> temporaryPath = os::mktemp(path::join(os::getcwd(), "XXXXXX"));
@@ -778,12 +798,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthStatusChange)
       0,
       3);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
   Future<TaskStatus> statusUnhealthy;
   Future<TaskStatus> statusHealthyAgain;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillOnce(FutureArg<1>(&statusUnhealthy))
@@ -791,6 +813,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthStatusChange)
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -876,7 +901,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   ContainerInfo containerInfo;
   containerInfo.set_type(ContainerInfo::DOCKER);
@@ -920,12 +945,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
                     Invoke(&containerizer,
                            &MockDockerContainerizer::_launch)));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusUnhealthy;
   Future<TaskStatus> statusHealthy;
   Future<TaskStatus> statusUnhealthyAgain;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusUnhealthy))
     .WillOnce(FutureArg<1>(&statusHealthy))
@@ -933,6 +960,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1012,12 +1042,13 @@ TEST_F(HealthCheckTest, ConsecutiveFailures)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   vector<TaskInfo> tasks = populateTasks(
     SLEEP_COMMAND(120), "exit 1", offers.get()[0], 0, 4);
 
   // Expecting four unhealthy updates and one final kill update.
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
@@ -1026,6 +1057,7 @@ TEST_F(HealthCheckTest, ConsecutiveFailures)
   Future<TaskStatus> statusKilled;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
@@ -1034,6 +1066,9 @@ TEST_F(HealthCheckTest, ConsecutiveFailures)
     .WillOnce(FutureArg<1>(&statusKilled));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1101,7 +1136,7 @@ TEST_F(HealthCheckTest, EnvironmentSetup)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   map<string, string> env;
   env["STATUS"] = "0";
@@ -1109,14 +1144,19 @@ TEST_F(HealthCheckTest, EnvironmentSetup)
   vector<TaskInfo> tasks = populateTasks(
     SLEEP_COMMAND(120), "exit $STATUS", offers.get()[0], 0, None(), env);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+  .WillOnce(FutureArg<1>(&statusStarting))
   .WillOnce(FutureArg<1>(&statusRunning))
   .WillOnce(FutureArg<1>(&statusHealthy));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1157,7 +1197,7 @@ TEST_F(HealthCheckTest, GracePeriod)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
 #ifndef __WINDOWS__
   const string falseCommand = "false";
@@ -1170,10 +1210,12 @@ TEST_F(HealthCheckTest, GracePeriod)
   vector<TaskInfo> tasks = populateTasks(
     SLEEP_COMMAND(2), falseCommand, offers.get()[0], 9999);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished))
     .WillRepeatedly(Return());
@@ -1219,7 +1261,7 @@ TEST_F(HealthCheckTest, CheckCommandTimeout)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   vector<TaskInfo> tasks = populateTasks(
       SLEEP_COMMAND(120),
@@ -1232,16 +1274,21 @@ TEST_F(HealthCheckTest, CheckCommandTimeout)
       1);
 
   // Expecting one unhealthy update and one final kill update.
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusUnhealthy;
   Future<TaskStatus> statusKilled;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusUnhealthy))
     .WillOnce(FutureArg<1>(&statusKilled));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1291,7 +1338,7 @@ TEST_F(HealthCheckTest, HealthyToUnhealthyTransitionWithinGracePeriod)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Create a temporary file.
   const string tmpPath = path::join(os::getcwd(), "healthyToUnhealthy");
@@ -1303,17 +1350,22 @@ TEST_F(HealthCheckTest, HealthyToUnhealthyTransitionWithinGracePeriod)
       9999,
       0);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
   Future<TaskStatus> statusUnhealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillOnce(FutureArg<1>(&statusUnhealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1369,7 +1421,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTP)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1395,15 +1447,20 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTP)
 
   task.mutable_health_check()->CopyFrom(healthCheck);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1458,7 +1515,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTPWithoutType)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1483,15 +1540,20 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(HealthCheckTest, HealthyTaskViaHTTPWithoutType)
 
   task.mutable_health_check()->CopyFrom(healthCheck);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1538,7 +1600,7 @@ TEST_F(HealthCheckTest, HealthyTaskViaTCP)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1563,15 +1625,20 @@ TEST_F(HealthCheckTest, HealthyTaskViaTCP)
 
   task.mutable_health_check()->CopyFrom(healthCheck);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1621,7 +1688,7 @@ TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaHTTPWithContainerImage)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1651,15 +1718,20 @@ TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaHTTPWithContainerImage)
 
   task.mutable_health_check()->CopyFrom(healthCheck);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1709,7 +1781,7 @@ TEST_F(HealthCheckTest,
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1741,15 +1813,20 @@ TEST_F(HealthCheckTest,
 
   task.mutable_health_check()->CopyFrom(healthCheck);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   // Increase time here to wait for pulling image finish.
   AWAIT_READY_FOR(statusRunning, Seconds(60));
@@ -1804,7 +1881,7 @@ TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaTCPWithContainerImage)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1834,15 +1911,20 @@ TEST_F(HealthCheckTest, ROOT_INTERNET_CURL_HealthyTaskViaTCPWithContainerImage)
 
   task.mutable_health_check()->CopyFrom(healthCheck);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1904,7 +1986,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -1943,10 +2025,12 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
                     Invoke(&containerizer,
                            &MockDockerContainerizer::_launch)));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
@@ -1954,6 +2038,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(containerId);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -2035,7 +2122,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -2076,10 +2163,12 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
                     Invoke(&containerizer,
                            &MockDockerContainerizer::_launch)));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
@@ -2087,6 +2176,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(containerId);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   // Increase time here to wait for pulling image finish.
   AWAIT_READY_FOR(statusRunning, Seconds(60));
@@ -2171,7 +2263,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const uint16_t testPort = getFreePort().get();
 
@@ -2210,10 +2302,12 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
                     Invoke(&containerizer,
                            &MockDockerContainerizer::_launch)));
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
@@ -2221,6 +2315,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(containerId);
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -2315,12 +2412,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy));
 
@@ -2358,6 +2457,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
 
   driver.acceptOffers(
       {offers->front().id()}, {LAUNCH_GROUP(executor, taskGroup)});
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_STARTING, statusStarting.get().state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
@@ -2444,12 +2546,14 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers.get().size());
+  ASSERT_FALSE(offers->empty());
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusHealthy;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusHealthy));
 
@@ -2494,6 +2598,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
 
   driver.acceptOffers(
       {offers->front().id()}, {LAUNCH_GROUP(executor, taskGroup)});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting.get().state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());

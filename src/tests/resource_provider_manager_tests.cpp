@@ -16,23 +16,43 @@
 
 #include <string>
 
+#include <gtest/gtest.h>
+
+#include <mesos/http.hpp>
+#include <mesos/resources.hpp>
+
+#include <mesos/state/in_memory.hpp>
+#include <mesos/state/state.hpp>
+
+#include <mesos/v1/mesos.hpp>
+
 #include <mesos/v1/resource_provider/resource_provider.hpp>
 
 #include <process/clock.hpp>
 #include <process/gmock.hpp>
+#include <process/gtest.hpp>
 #include <process/http.hpp>
 
+#include <stout/duration.hpp>
+#include <stout/error.hpp>
+#include <stout/gtest.hpp>
 #include <stout/lambda.hpp>
+#include <stout/option.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/recordio.hpp>
+#include <stout/result.hpp>
 #include <stout/stringify.hpp>
+#include <stout/try.hpp>
 
 #include "common/http.hpp"
 #include "common/recordio.hpp"
 
-#include "slave/slave.hpp"
+#include "internal/devolve.hpp"
 
 #include "resource_provider/manager.hpp"
+#include "resource_provider/registrar.hpp"
+
+#include "slave/slave.hpp"
 
 #include "tests/mesos.hpp"
 
@@ -42,12 +62,20 @@ using mesos::internal::slave::Slave;
 
 using mesos::master::detector::MasterDetector;
 
+using mesos::state::InMemoryStorage;
+using mesos::state::State;
+
+using mesos::resource_provider::AdmitResourceProvider;
+using mesos::resource_provider::Registrar;
+using mesos::resource_provider::RemoveResourceProvider;
+
 using mesos::v1::resource_provider::Call;
 using mesos::v1::resource_provider::Event;
 
 using process::Clock;
 using process::Future;
 using process::Owned;
+using process::PID;
 
 using process::http::BadRequest;
 using process::http::OK;
@@ -178,8 +206,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, UnsupportedContentMediaType)
 
   Future<http::Response> response = manager.api(request, None());
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(UnsupportedMediaType().status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(UnsupportedMediaType().status, response);
 }
 
 
@@ -189,6 +216,9 @@ TEST_P(ResourceProviderManagerHttpApiTest, Subscribe)
   call.set_type(Call::SUBSCRIBE);
 
   Call::Subscribe* subscribe = call.mutable_subscribe();
+
+  const v1::Resources resources = v1::Resources::parse("disk:4").get();
+  subscribe->mutable_resources()->CopyFrom(resources);
 
   mesos::v1::ResourceProviderInfo* info =
     subscribe->mutable_resource_provider_info();
@@ -209,7 +239,7 @@ TEST_P(ResourceProviderManagerHttpApiTest, Subscribe)
 
   Future<http::Response> response = manager.api(request, None());
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response) << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   ASSERT_EQ(http::Response::PIPE, response->type);
 
   Option<http::Pipe::Reader> reader = response->reader;
@@ -226,7 +256,32 @@ TEST_P(ResourceProviderManagerHttpApiTest, Subscribe)
 
   // Check event type is subscribed and the resource provider id is set.
   ASSERT_EQ(Event::SUBSCRIBED, event->get().type());
-  ASSERT_NE("", event->get().subscribed().provider_id().value());
+
+  mesos::v1::ResourceProviderID resourceProviderId =
+    event->get().subscribed().provider_id();
+
+  EXPECT_FALSE(resourceProviderId.value().empty());
+
+  // The manager will send out a message informing its subscriber
+  // about the newly added resources.
+  Future<ResourceProviderMessage> message = manager.messages().get();
+
+  AWAIT_READY(message);
+
+  EXPECT_EQ(
+      ResourceProviderMessage::Type::UPDATE_TOTAL_RESOURCES,
+      message->type);
+
+  // We expect `ResourceProviderID`s to be set for all subscribed resources.
+  // Inject them into the test expectation.
+  Resources expectedResources;
+  foreach (v1::Resource resource, resources) {
+    resource.mutable_provider_id()->CopyFrom(resourceProviderId);
+    expectedResources += devolve(resource);
+  }
+
+  EXPECT_EQ(devolve(resourceProviderId), message->updateTotalResources->id);
+  EXPECT_EQ(expectedResources, message->updateTotalResources->total);
 }
 
 
@@ -290,8 +345,91 @@ TEST_P(ResourceProviderManagerHttpApiTest, AgentEndpoint)
   ASSERT_SOME(event.get());
 
   // Check event type is subscribed and the resource provider id is set.
-  ASSERT_EQ(Event::SUBSCRIBED, event->get().type());
-  ASSERT_NE("", event->get().subscribed().provider_id().value());
+  EXPECT_EQ(Event::SUBSCRIBED, event->get().type());
+  EXPECT_FALSE(event->get().subscribed().provider_id().value().empty());
+}
+
+
+class ResourceProviderRegistrarTest : public tests::MesosTest {};
+
+
+// Test that the agent resource provider registrar works as expected.
+TEST_F(ResourceProviderRegistrarTest, AgentRegistrar)
+{
+  ResourceProviderID resourceProviderId;
+  resourceProviderId.set_value("foo");
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  const slave::Flags flags = CreateSlaveFlags();
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // The agent will send `UpdateSlaveMessage` after it has created its
+  // meta directories. Await the message to make sure the agent
+  // registrar can create its store in the meta hierarchy.
+  AWAIT_READY(updateSlaveMessage);
+
+  Try<Owned<Registrar>> registrar =
+    Registrar::create(flags, slaveRegisteredMessage->slave_id());
+
+  ASSERT_SOME(registrar);
+  ASSERT_NE(nullptr, registrar->get());
+
+  // Applying operations on a not yet recovered registrar fails.
+  AWAIT_FAILED(registrar.get()->apply(Owned<Registrar::Operation>(
+      new AdmitResourceProvider(resourceProviderId))));
+
+  AWAIT_READY(registrar.get()->recover());
+
+  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
+      new AdmitResourceProvider(resourceProviderId))));
+
+  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
+      new RemoveResourceProvider(resourceProviderId))));
+}
+
+
+// Test that the master resource provider registrar works as expected.
+TEST_F(ResourceProviderRegistrarTest, MasterRegistrar)
+{
+  ResourceProviderID resourceProviderId;
+  resourceProviderId.set_value("foo");
+
+  InMemoryStorage storage;
+  State state(&storage);
+  master::Registrar masterRegistrar(CreateMasterFlags(), &state);
+
+  const MasterInfo masterInfo = protobuf::createMasterInfo({});
+
+  Try<Owned<Registrar>> registrar = Registrar::create(&masterRegistrar);
+
+  ASSERT_SOME(registrar);
+  ASSERT_NE(nullptr, registrar->get());
+
+  // Applying operations on a not yet recovered registrar fails.
+  AWAIT_FAILED(registrar.get()->apply(Owned<Registrar::Operation>(
+      new AdmitResourceProvider(resourceProviderId))));
+
+  AWAIT_READY(masterRegistrar.recover(masterInfo));
+
+  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
+      new AdmitResourceProvider(resourceProviderId))));
+
+  AWAIT_READY(registrar.get()->apply(Owned<Registrar::Operation>(
+      new RemoveResourceProvider(resourceProviderId))));
 }
 
 } // namespace tests {

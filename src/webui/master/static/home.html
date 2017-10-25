@@ -162,6 +162,7 @@
           <th data-key="name">Task Name</th>
           <th data-key="role">Role</th>
           <th data-key="state">State</th>
+          <th data-key="healthy">Health</th>
           <th data-key="start_time" data-sort>Started</th>
           <th data-key="host">Host</th>
           <th></th>
@@ -169,13 +170,20 @@
       </thead>
       <tbody>
         <tr data-ng-if="active_tasks.length === 0">
-          <td colspan="7">No active tasks.</td>
+          <td colspan="8">No active tasks.</td>
         </tr>
         <tr ng-repeat="task in $data">
           <td>
             <a href="#/frameworks/{{task.framework_id}}/">
-              {{task.framework_id}}
+              {{task.framework_id | truncateMesosID}}
             </a>
+            <button class="btn btn-xs btn-toggle btn-default"
+                    clipboard
+                    data-clipboard-text="{{task.framework_id}}"
+                    tooltip="Copy ID"
+                    tooltip-placement="right"
+                    tooltip-trigger="clipboardhover">
+            </button>
           </td>
           <td>
             <a href="#/agents/{{task.slave_id}}/frameworks/{{task.framework_id}}/executors/{{task.executor_id}}">
@@ -185,6 +193,7 @@
           <td>{{task.name}}</td>
           <td>{{task.role}}</td>
           <td>{{task.state | truncateMesosState}}</td>
+          <td class="task-{{task.healthy | taskHealth}}">{{task.healthy | taskHealth}}</td>
           <td>
             <m-timestamp value="{{task.start_time}}"></m-timestamp>
           </td>
@@ -227,8 +236,15 @@
         <tr ng-repeat="task in $data">
           <td>
             <a href="#/frameworks/{{task.framework_id}}/">
-              {{task.framework_id}}
+              {{task.framework_id | truncateMesosID}}
             </a>
+            <button class="btn btn-xs btn-toggle btn-default"
+                    clipboard
+                    data-clipboard-text="{{task.framework_id}}"
+                    tooltip="Copy ID"
+                    tooltip-placement="right"
+                    tooltip-trigger="clipboardhover">
+            </button>
           </td>
           <td>{{task.id}}</td>
           <td>{{task.name}}</td>
@@ -261,7 +277,18 @@
           <td colspan="8">No completed tasks.</td>
         </tr>
         <tr ng-repeat="task in $data">
-          <td>{{task.framework_id}}</td>
+         <td>
+            <a href="#/frameworks/{{task.framework_id}}/">
+              {{task.framework_id | truncateMesosID}}
+            </a>
+            <button class="btn btn-xs btn-toggle btn-default"
+                    clipboard
+                    data-clipboard-text="{{task.framework_id}}"
+                    tooltip="Copy ID"
+                    tooltip-placement="right"
+                    tooltip-trigger="clipboardhover">
+            </button>
+          </td>
           <td>{{task.id}}</td>
           <td>{{task.name}}</td>
           <td>{{task.role}}</td>

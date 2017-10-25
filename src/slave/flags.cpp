@@ -166,10 +166,11 @@ mesos::internal::slave::Flags::Flags()
 
   add(&Flags::docker_registry,
       "docker_registry",
-      "The default url for pulling Docker images. It could either be a Docker\n"
-      "registry server url (i.e: `https://registry.docker.io`), or a local\n"
-      "path (i.e: `/tmp/docker/images`) in which Docker image archives\n"
-      "(result of `docker save`) are stored.",
+      "The default url for Mesos containerizer to pull Docker images. It\n"
+      "could either be a Docker registry server url (i.e: `https://registry.docker.io`),\n" // NOLINT(whitespace/line_length)
+      "or a local path (i.e: `/tmp/docker/images`) in which Docker image\n"
+      "archives (result of `docker save`) are stored. Note that this option\n"
+      "won't change the default registry server for Docker containerizer.",
       "https://registry-1.docker.io");
 
   add(&Flags::docker_store_dir,
@@ -1001,6 +1002,22 @@ mesos::internal::slave::Flags::Flags()
       false);
 
 #endif // ENABLE_PORT_MAPPING_ISOLATOR
+
+#ifdef ENABLE_NETWORK_PORTS_ISOLATOR
+  add(&Flags::container_ports_watch_interval,
+      "container_ports_watch_interval",
+      "Interval at which the `network/ports` isolator should check for\n"
+      "containers listening on ports they don't have resources for.",
+      Seconds(30));
+
+  add(&Flags::check_agent_port_range_only,
+      "check_agent_port_range_only",
+      "When this is true, the `network/ports` isolator allows tasks to\n"
+      "listen on additional ports provided they fall outside the range\n"
+      "published by the agent's resources. Otherwise tasks are restricted\n"
+      "to only listen on ports for which they have been assigned resources.",
+      false);
+#endif // ENABLE_NETWORK_PORTS_ISOLATOR
 
   add(&Flags::network_cni_plugins_dir,
       "network_cni_plugins_dir",

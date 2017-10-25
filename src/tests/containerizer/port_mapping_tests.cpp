@@ -1552,7 +1552,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_SmallEgressLimit)
            << " bytes of data under egress rate limit " << rate.bytes()
            << "Bytes/s...';";
 
-  command2 << "{ time -p echo " << data  << " | nc localhost "
+  command2 << "{ time -p echo " << data << " | nc localhost "
            << invalidPort << " ; } 2> " << transmissionTime << " && ";
 
   // Touch the guard file.
@@ -1716,7 +1716,7 @@ TEST_F(PortMappingIsolatorTest, ROOT_NC_PortMappingStatistics)
            << " bytes of data under egress rate limit " << rate.bytes()
            << "Bytes/s...';";
 
-  command2 << "{ time -p echo " << data  << " | nc " << hostIP << " "
+  command2 << "{ time -p echo " << data << " | nc " << hostIP << " "
            << invalidPort << " ; } 2> " << transmissionTime << " && ";
 
   // Touch the guard file.
@@ -1915,7 +1915,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   Offer offer1 = offers1.get()[0];
 
@@ -1972,7 +1972,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedContainers)
   Clock::resume();
 
   AWAIT_READY(offers2);
-  EXPECT_FALSE(offers2->empty());
+  ASSERT_FALSE(offers2->empty());
 
   Offer offer2 = offers2.get()[0];
 
@@ -2084,7 +2084,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_CleanUpOrphan)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Start a long running task using network islator.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
@@ -2205,19 +2205,25 @@ TEST_F(PortMappingMesosTest, ROOT_NetworkNamespaceHandleSymlink)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Start a long running task using network islator.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
+  Future<TaskStatus> status0;
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status0))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status0);
+  EXPECT_EQ(task.task_id(), status0->task_id());
+  EXPECT_EQ(TASK_STARTING, status0->state());
 
   AWAIT_READY(status1);
   EXPECT_EQ(task.task_id(), status1->task_id());
@@ -2298,7 +2304,7 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Offer offer = offers.get()[0];
 
@@ -2314,17 +2320,23 @@ TEST_F(PortMappingMesosTest, CGROUPS_ROOT_RecoverMixedKnownAndUnKnownOrphans)
 
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
+  Future<TaskStatus> status3;
+  Future<TaskStatus> status4;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2))
+    .WillOnce(FutureArg<1>(&status3))
+    .WillOnce(FutureArg<1>(&status4))
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   driver.launchTasks(offers.get()[0].id(), {task1, task2});
 
+  // Only check the first and the last status, as the other two might
+  // be interleaved between TASK_STARTING and TASK_RUNNING.
   AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1->state());
+  ASSERT_EQ(TASK_STARTING, status1->state());
 
-  AWAIT_READY(status2);
+  AWAIT_READY(status4);
   ASSERT_EQ(TASK_RUNNING, status2->state());
 
   // Obtain the container IDs.

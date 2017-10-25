@@ -101,11 +101,18 @@ TYPED_TEST_CASE(SlaveAuthorizerTest, AuthorizerTypes);
 
 // This test verifies that authorization based endpoint filtering
 // works correctly on the /state endpoint.
-// Both default users are allowed to to view high level frameworks, but only
+// Both default users are allowed to view high level frameworks, but only
 // one is allowed to view the tasks.
+// After launching a single task per each framework, one for role "superhero"
+// and the other for role "muggle", this test verifies that each of two
+// default users can view resource allocations and resource reservations for
+// corresponding allowed roles only.
 TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
 {
   ACLs acls;
+
+  const string roleSuperhero = "superhero";
+  const string roleMuggle = "muggle";
 
   {
     // Default principal can see all frameworks.
@@ -156,6 +163,28 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
     acl->mutable_users()->set_type(ACL::Entity::NONE);
   }
 
+  {
+    // Default principal can view "superhero" role only.
+    ACL::ViewRole* acl = acls.add_view_roles();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_roles()->add_values(roleSuperhero);
+
+    acl = acls.add_view_roles();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  {
+    // Second default principal can view "muggle" role only.
+    ACL::ViewRole* acl = acls.add_view_roles();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
+    acl->mutable_roles()->add_values(roleMuggle);
+
+    acl = acls.add_view_roles();
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
+    acl->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  }
+
   // Create an `Authorizer` with the ACLs.
   Try<Authorizer*> create = TypeParam::create(parameterize(acls));
   ASSERT_SOME(create);
@@ -164,69 +193,146 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
   Try<Owned<cluster::Master>> master = this->StartMaster(authorizer.get());
   ASSERT_SOME(master);
 
-  // Register framework with user "bar".
-  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
-  frameworkInfo.set_role("role");
-  frameworkInfo.set_user("bar");
+  // Register framework with user "bar" and role "superhero".
+  FrameworkInfo frameworkSuperhero = DEFAULT_FRAMEWORK_INFO;
+  frameworkSuperhero.set_name("framework-" + roleSuperhero);
+  frameworkSuperhero.set_role(roleSuperhero);
+  frameworkSuperhero.set_user("bar");
 
   // Create an executor with user "bar".
-  ExecutorInfo executor = createExecutorInfo("test-executor", "sleep 2");
-  executor.mutable_command()->set_user("bar");
+  ExecutorInfo executorSuperhero =
+    createExecutorInfo("test-executor-" + roleSuperhero, "sleep 2");
+  executorSuperhero.mutable_command()->set_user("bar");
+  MockExecutor execSuperhero(executorSuperhero.executor_id());
 
-  MockExecutor exec(executor.executor_id());
-  TestContainerizer containerizer(&exec);
+  // Register framework with user "foo" and role "muggle".
+  FrameworkInfo frameworkMuggle = DEFAULT_FRAMEWORK_INFO;
+  frameworkMuggle.set_name("framework-" + roleMuggle);
+  frameworkMuggle.set_principal(DEFAULT_CREDENTIAL_2.principal());
+  frameworkMuggle.set_role(roleMuggle);
+  frameworkMuggle.set_user("foo");
+
+  // Create an executor with user "foo".
+  ExecutorInfo executorMuggle =
+    createExecutorInfo("test-executor-" + roleMuggle, "sleep 2");
+  executorMuggle.mutable_command()->set_user("foo");
+  MockExecutor execMuggle(executorMuggle.executor_id());
+
+  TestContainerizer containerizer(
+      {{executorSuperhero.executor_id(), &execSuperhero},
+       {executorMuggle.executor_id(), &execMuggle}});
+
+  slave::Flags flags = this->CreateSlaveFlags();
+  // Statically reserve resources for each role.
+  flags.resources = "cpus(" + roleSuperhero + "):2;" + "cpus(" + roleMuggle +
+    "):3;mem(" + roleSuperhero + "):512;" + "mem(" + roleMuggle + "):1024;";
 
   Owned<MasterDetector> detector = master.get()->createDetector();
-  Try<Owned<cluster::Slave>> slave =
-      this->StartSlave(detector.get(), &containerizer, authorizer.get());
+  Try<Owned<cluster::Slave>> slave = this->StartSlave(
+      detector.get(), &containerizer, authorizer.get(), flags);
 
   ASSERT_SOME(slave);
 
-  MockScheduler sched;
-  MesosSchedulerDriver driver(
-      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+  MockScheduler schedSuperhero;
+  MesosSchedulerDriver driverSuperhero(
+      &schedSuperhero,
+      frameworkSuperhero,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
 
-  EXPECT_CALL(exec, registered(_, _, _, _))
+  EXPECT_CALL(execSuperhero, registered(_, _, _, _))
     .Times(AtMost(1));
 
-  Future<Nothing> registered;
-  EXPECT_CALL(sched, registered(&driver, _, _))
-    .WillOnce(FutureSatisfy(&registered))
-    .WillRepeatedly(Return());
+  Future<FrameworkID> frameworkIdSuperhero;
+  EXPECT_CALL(schedSuperhero, registered(&driverSuperhero, _, _))
+    .WillOnce(FutureArg<1>(&frameworkIdSuperhero));
 
-  Future<vector<Offer>> offers;
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers))
+  Future<vector<Offer>> offersSuperhero;
+  EXPECT_CALL(schedSuperhero, resourceOffers(&driverSuperhero, _))
+    .WillOnce(FutureArg<1>(&offersSuperhero))
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
-  driver.start();
+  driverSuperhero.start();
 
-  AWAIT_READY(registered);
+  AWAIT_READY(frameworkIdSuperhero);
 
-  AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  AWAIT_READY(offersSuperhero);
+  ASSERT_FALSE(offersSuperhero->empty());
 
-  TaskInfo task;
-  task.set_name("test");
-  task.mutable_task_id()->set_value("1");
-  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
-  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
-  task.mutable_executor()->MergeFrom(executor);
+  // Define a task which will run on executorSuperhero of frameworkSuperhero.
+  TaskInfo taskSuperhero;
+  taskSuperhero.set_name("test-" + roleSuperhero);
+  taskSuperhero.mutable_task_id()->set_value("1");
+  taskSuperhero.mutable_slave_id()->MergeFrom(
+      offersSuperhero.get()[0].slave_id());
+  taskSuperhero.mutable_resources()->MergeFrom(
+      offersSuperhero.get()[0].resources());
+  taskSuperhero.mutable_executor()->MergeFrom(executorSuperhero);
 
-  EXPECT_CALL(exec, launchTask(_, _))
+  EXPECT_CALL(execSuperhero, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING))
     .WillRepeatedly(Return());
 
-  Future<TaskStatus> status;
-  EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
+  Future<TaskStatus> statusSuperhero;
+  EXPECT_CALL(schedSuperhero, statusUpdate(&driverSuperhero, _))
+    .WillOnce(FutureArg<1>(&statusSuperhero));
 
-  driver.launchTasks(offers.get()[0].id(), {task});
+  driverSuperhero.launchTasks(offersSuperhero.get()[0].id(), {taskSuperhero});
 
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  AWAIT_READY(statusSuperhero);
+  EXPECT_EQ(TASK_RUNNING, statusSuperhero->state());
 
-  // Retrieve endpoint with the user allowed to view the framework.
+  MockScheduler schedMuggle;
+  MesosSchedulerDriver driverMuggle(
+      &schedMuggle,
+      frameworkMuggle,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL_2);
+
+  EXPECT_CALL(execMuggle, registered(_, _, _, _))
+    .Times(AtMost(1));
+
+  Future<FrameworkID> frameworkIdMuggle;
+  EXPECT_CALL(schedMuggle, registered(&driverMuggle, _, _))
+    .WillOnce(FutureArg<1>(&frameworkIdMuggle));
+
+  Future<vector<Offer>> offersMuggle;
+  EXPECT_CALL(schedMuggle, resourceOffers(&driverMuggle, _))
+    .WillOnce(FutureArg<1>(&offersMuggle))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driverMuggle.start();
+
+  AWAIT_READY(frameworkIdMuggle);
+
+  AWAIT_READY(offersMuggle);
+  ASSERT_FALSE(offersMuggle->empty());
+
+  // Define a task which will run on executorMuggle of frameworkMuggle.
+  TaskInfo taskMuggle;
+  taskMuggle.set_name("test-" + roleMuggle);
+  taskMuggle.mutable_task_id()->set_value("2");
+  taskMuggle.mutable_slave_id()->MergeFrom(
+      offersMuggle.get()[0].slave_id());
+  taskMuggle.mutable_resources()->MergeFrom(
+      offersMuggle.get()[0].resources());
+  taskMuggle.mutable_executor()->MergeFrom(executorMuggle);
+
+  EXPECT_CALL(execMuggle, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING))
+    .WillRepeatedly(Return());
+
+  Future<TaskStatus> statusMuggle;
+  EXPECT_CALL(schedMuggle, statusUpdate(&driverMuggle, _))
+    .WillOnce(FutureArg<1>(&statusMuggle));
+
+  driverMuggle.launchTasks(offersMuggle.get()[0].id(), {taskMuggle});
+
+  AWAIT_READY(statusMuggle);
+  ASSERT_EQ(TASK_RUNNING, statusMuggle->state());
+
+  // Retrieve endpoint with the user allowed to view the frameworks.
+  // The default user allowed to view role "superhero" only.
   {
     Future<Response> response = http::get(
         slave.get()->pid,
@@ -234,8 +340,7 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response->body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
     Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
@@ -245,20 +350,50 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
     ASSERT_TRUE(state.values["frameworks"].is<JSON::Array>());
 
     JSON::Array frameworks = state.values["frameworks"].as<JSON::Array>();
-    EXPECT_EQ(1u, frameworks.values.size());
+    EXPECT_EQ(2u, frameworks.values.size());
 
-    JSON::Object framework = frameworks.values.front().as<JSON::Object>();
-    ASSERT_TRUE(framework.values["executors"].is<JSON::Array>());
+    foreach (const JSON::Value& value, frameworks.values) {
+      JSON::Object framework = value.as<JSON::Object>();
+      EXPECT_FALSE(framework.values.empty());
+      ASSERT_TRUE(framework.values["executors"].is<JSON::Array>());
 
-    JSON::Array executors = framework.values["executors"].as<JSON::Array>();
-    EXPECT_EQ(1u, executors.values.size());
+      JSON::Array executors = framework.values["executors"].as<JSON::Array>();
+      EXPECT_EQ(1u, executors.values.size());
 
-    JSON::Object executor = executors.values.front().as<JSON::Object>();
-    EXPECT_EQ(1u, executor.values["tasks"].as<JSON::Array>().values.size());
+      JSON::Object executor = executors.values.front().as<JSON::Object>();
+      EXPECT_EQ(1u, executor.values["tasks"].as<JSON::Array>().values.size());
+    }
+
+    ASSERT_TRUE(state.values["reserved_resources"].is<JSON::Object>());
+
+    JSON::Object reserved_resources =
+      state.values["reserved_resources"].as<JSON::Object>();
+    EXPECT_TRUE(reserved_resources.values[roleSuperhero].is<JSON::Object>());
+    EXPECT_FALSE(reserved_resources.values[roleMuggle].is<JSON::Object>());
+
+    ASSERT_TRUE(
+        state.values["reserved_resources_allocated"].is<JSON::Object>());
+
+    JSON::Object reserved_resources_allocated =
+      state.values["reserved_resources_allocated"].as<JSON::Object>();
+    EXPECT_TRUE(
+        reserved_resources_allocated.values[roleSuperhero].is<JSON::Object>());
+    EXPECT_FALSE(
+        reserved_resources_allocated.values[roleMuggle].is<JSON::Object>());
+
+    ASSERT_TRUE(state.values["reserved_resources_full"].is<JSON::Object>());
+
+    JSON::Object reserved_resources_full =
+      state.values["reserved_resources_full"].as<JSON::Object>();
+    EXPECT_TRUE(
+        reserved_resources_full.values[roleSuperhero].is<JSON::Array>());
+    EXPECT_FALSE(
+        reserved_resources_full.values[roleMuggle].is<JSON::Array>());
   }
 
-  // Retrieve endpoint with the user allowed to view the framework,
-  // but not the executor.
+  // Retrieve endpoint with the user allowed to view the frameworks,
+  // but not the executors.
+  // The second default user allowed to view role "muggle" only.
   {
     Future<Response> response = http::get(
         slave.get()->pid,
@@ -266,8 +401,7 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-      << response->body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
     Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
@@ -276,17 +410,53 @@ TYPED_TEST(SlaveAuthorizerTest, FilterStateEndpoint)
     ASSERT_TRUE(state.values["frameworks"].is<JSON::Array>());
 
     JSON::Array frameworks = state.values["frameworks"].as<JSON::Array>();
-    EXPECT_EQ(1u, frameworks.values.size());
+    EXPECT_EQ(2u, frameworks.values.size());
 
-    JSON::Object framework = frameworks.values.front().as<JSON::Object>();
-    EXPECT_TRUE(framework.values["executors"].as<JSON::Array>().values.empty());
+    foreach (const JSON::Value& value, frameworks.values) {
+      JSON::Object framework = value.as<JSON::Object>();
+      EXPECT_FALSE(framework.values.empty());
+      EXPECT_TRUE(
+          framework.values["executors"].as<JSON::Array>().values.empty());
     }
 
-  EXPECT_CALL(exec, shutdown(_))
+    ASSERT_TRUE(state.values["reserved_resources"].is<JSON::Object>());
+
+    JSON::Object reserved_resources =
+      state.values["reserved_resources"].as<JSON::Object>();
+    EXPECT_TRUE(reserved_resources.values[roleMuggle].is<JSON::Object>());
+    EXPECT_FALSE(reserved_resources.values[roleSuperhero].is<JSON::Object>());
+
+    ASSERT_TRUE(
+        state.values["reserved_resources_allocated"].is<JSON::Object>());
+
+    JSON::Object reserved_resources_allocated =
+      state.values["reserved_resources_allocated"].as<JSON::Object>();
+    EXPECT_TRUE(
+        reserved_resources_allocated.values[roleMuggle].is<JSON::Object>());
+    EXPECT_FALSE(
+        reserved_resources_allocated.values[roleSuperhero].is<JSON::Object>());
+
+    ASSERT_TRUE(state.values["reserved_resources_full"].is<JSON::Object>());
+
+    JSON::Object reserved_resources_full =
+      state.values["reserved_resources_full"].as<JSON::Object>();
+    EXPECT_TRUE(
+        reserved_resources_full.values[roleMuggle].is<JSON::Array>());
+    EXPECT_FALSE(
+        reserved_resources_full.values[roleSuperhero].is<JSON::Array>());
+  }
+
+  EXPECT_CALL(execSuperhero, shutdown(_))
     .Times(AtMost(1));
 
-  driver.stop();
-  driver.join();
+  EXPECT_CALL(execMuggle, shutdown(_))
+    .Times(AtMost(1));
+
+  driverSuperhero.stop();
+  driverSuperhero.join();
+
+  driverMuggle.stop();
+  driverMuggle.join();
 }
 
 
@@ -337,8 +507,7 @@ TYPED_TEST(SlaveAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-        << response->body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
     response = http::get(
         agent.get()->pid,
@@ -346,8 +515,7 @@ TYPED_TEST(SlaveAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-        << response->body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
     Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
@@ -366,8 +534,7 @@ TYPED_TEST(SlaveAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response)
-        << response->body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response);
 
     response = http::get(
         agent.get()->pid,
@@ -375,8 +542,7 @@ TYPED_TEST(SlaveAuthorizerTest, ViewFlags)
         None(),
         createBasicAuthHeaders(DEFAULT_CREDENTIAL_2));
 
-    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-        << response->body;
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
     Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
     ASSERT_SOME(parse);
@@ -440,7 +606,7 @@ TYPED_TEST(SlaveAuthorizerTest, AuthorizeRunTaskOnAgent)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers.get().empty());
+  ASSERT_FALSE(offers.get().empty());
 
   Offer offer = offers.get()[0];
 
@@ -461,10 +627,12 @@ TYPED_TEST(SlaveAuthorizerTest, AuthorizeRunTaskOnAgent)
   // The first task should fail since the task user `foo` is not an
   // authorized user that can launch a task. However, the second task
   // should succeed.
+  Future<TaskStatus> status0;
   Future<TaskStatus> status1;
   Future<TaskStatus> status2;
 
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status0))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2));
 
@@ -472,16 +640,19 @@ TYPED_TEST(SlaveAuthorizerTest, AuthorizeRunTaskOnAgent)
       {offer.id()},
       {LAUNCH({task1, task2})});
 
-  // Wait for TASK_FAILED for 1st task, and TASK_RUNNING for 2nd task.
+  // Wait for TASK_ERROR for 1st task, and TASK_STARTING followed by
+  // TASK_RUNNING for 2nd task.
+  AWAIT_READY(status0);
   AWAIT_READY(status1);
   AWAIT_READY(status2);
 
   // Validate both the statuses. Note that the order of receiving the
-  // status updates for the 2 tasks is not deterministic.
-  hashmap<TaskID, TaskStatus> statuses {
-    {status1->task_id(), status1.get()},
-    {status2->task_id(), status2.get()}
-  };
+  // status updates for the 2 tasks is not deterministic, but we know
+  // that task2's TASK_RUNNING arrives after TASK_STARTING.
+  hashmap<TaskID, TaskStatus> statuses;
+  statuses[status0->task_id()] = status0.get();
+  statuses[status1->task_id()] = status1.get();
+  statuses[status2->task_id()] = status2.get();
 
   ASSERT_TRUE(statuses.contains(task1.task_id()));
   EXPECT_EQ(TASK_ERROR, statuses.at(task1.task_id()).state());
@@ -544,7 +715,7 @@ TEST_F(ExecutorAuthorizationTest, RunTaskGroup)
   AWAIT_READY(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers.get().empty());
+  ASSERT_FALSE(offers.get().empty());
 
   Offer offer = offers.get()[0];
 
@@ -575,7 +746,7 @@ TEST_F(ExecutorAuthorizationTest, RunTaskGroup)
   AWAIT_READY(status);
 
   ASSERT_EQ(task.task_id(), status->task_id());
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   driver.stop();
   driver.join();
@@ -666,7 +837,7 @@ TEST_F(ExecutorAuthorizationTest, FailedSubscribe)
   executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   Future<v1::executor::Mesos*> executorLib;
   EXPECT_CALL(*executor, connected(_))
@@ -825,7 +996,7 @@ TEST_F(ExecutorAuthorizationTest, FailedApiCalls)
   executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   Future<v1::executor::Mesos*> executorLib;
   EXPECT_CALL(*executor, connected(_))
@@ -1139,8 +1310,7 @@ TEST_P(SlaveEndpointTest, AuthorizedRequest)
 
   EXPECT_EQ("/" + endpoint, request->object().value());
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 }
 
 
@@ -1174,8 +1344,7 @@ TEST_P(SlaveEndpointTest, UnauthorizedRequest)
       None(),
       createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response);
 }
 
 
@@ -1205,8 +1374,7 @@ TEST_P(SlaveEndpointTest, NoAuthorizer)
       None(),
       createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 }
 
 } // namespace tests {

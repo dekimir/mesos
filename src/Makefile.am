@@ -82,6 +82,15 @@ LDADD =
 
 AM_LDFLAGS =
 
+if DISABLE_LIBTOOL_WRAPPERS
+# This is used to force libtool to generate executables instead of wrapper
+# scripts. A wrapper script might trigger relinking, which takes quite a while
+# on slow machines, thus causing failure of tests.
+# NOTE: Disabling libtool wrapper should only be used when building a mesos to
+# be tested within the build tree, see `info libtool` for details.
+AM_LDFLAGS += -no-install
+endif
+
 # Use -Wl,--as-needed to AM_LDFLAGS since we link against all the
 # libraries programs may depend upon, not the exact one. --as-needed
 # causes the linker to only link to the ones a program actually uses,
@@ -231,8 +240,6 @@ LIB_ZOOKEEPER = -lzookeeper_mt
 LDADD += -lzookeeper_mt
 endif
 
-MESOS_CPPFLAGS += -DHAS_AUTHENTICATION=1
-
 # Set up include paths for the protocol buffer compiler.
 PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir)
 if ENABLE_GRPC
@@ -357,6 +364,8 @@ CXX_PROTOS +=								\
   messages/flags.pb.h							\
   messages/messages.pb.cc						\
   messages/messages.pb.h						\
+  resource_provider/registry.pb.cc					\
+  resource_provider/registry.pb.h					\
   slave/containerizer/mesos/provisioner/docker/message.pb.cc		\
   slave/containerizer/mesos/provisioner/docker/message.pb.h		\
   slave/containerizer/mesos/isolators/docker/volume/state.pb.cc		\
@@ -618,12 +627,17 @@ authentication_HEADERS =						\
   $(top_srcdir)/include/mesos/authentication/authentication.hpp		\
   $(top_srcdir)/include/mesos/authentication/authentication.proto	\
   $(top_srcdir)/include/mesos/authentication/authenticator.hpp		\
-  $(top_srcdir)/include/mesos/authentication/secret_generator.hpp	\
-  $(top_srcdir)/include/mesos/authentication/http/basic_authenticator_factory.hpp	\
-  $(top_srcdir)/include/mesos/authentication/http/combined_authenticator.hpp
+  $(top_srcdir)/include/mesos/authentication/secret_generator.hpp
 
 nodist_authentication_HEADERS =						\
   ../include/mesos/authentication/authentication.pb.h
+
+httpauthenticationdir = $(pkgincludedir)/authentication/http
+
+httpauthentication_HEADERS =						\
+  $(top_srcdir)/include/mesos/authentication/http/authenticatee.hpp	\
+  $(top_srcdir)/include/mesos/authentication/http/basic_authenticator_factory.hpp	\
+  $(top_srcdir)/include/mesos/authentication/http/combined_authenticator.hpp
 
 authorizerdir = $(pkgincludedir)/authorizer
 
@@ -708,6 +722,7 @@ module_HEADERS =							\
   $(top_srcdir)/include/mesos/module/detector.hpp			\
   $(top_srcdir)/include/mesos/module/hook.hpp				\
   $(top_srcdir)/include/mesos/module/hook.proto				\
+  $(top_srcdir)/include/mesos/module/http_authenticatee.hpp		\
   $(top_srcdir)/include/mesos/module/http_authenticator.hpp		\
   $(top_srcdir)/include/mesos/module/isolator.hpp			\
   $(top_srcdir)/include/mesos/module/module.hpp				\
@@ -926,6 +941,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   authentication/cram_md5/authenticatee.cpp				\
   authentication/cram_md5/authenticator.cpp				\
   authentication/cram_md5/auxprop.cpp					\
+  authentication/http/basic_authenticatee.cpp				\
   authentication/http/basic_authenticator_factory.cpp			\
   authentication/http/combined_authenticator.cpp			\
   authorizer/acls.cpp							\
@@ -988,6 +1004,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/driver.cpp						\
   resource_provider/local.cpp						\
   resource_provider/manager.cpp						\
+  resource_provider/registrar.cpp					\
   resource_provider/validation.cpp					\
   resource_provider/storage/provider.cpp				\
   sched/sched.cpp							\
@@ -1069,6 +1086,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   authentication/cram_md5/authenticatee.hpp				\
   authentication/cram_md5/authenticator.hpp				\
   authentication/cram_md5/auxprop.hpp					\
+  authentication/http/basic_authenticatee.hpp				\
   authorizer/local/authorizer.hpp					\
   checks/checker.hpp							\
   checks/checker_process.hpp						\
@@ -1130,6 +1148,9 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/local.hpp						\
   resource_provider/manager.hpp						\
   resource_provider/message.hpp						\
+  resource_provider/registrar.hpp					\
+  resource_provider/registry.hpp					\
+  resource_provider/registry.proto					\
   resource_provider/validation.hpp					\
   resource_provider/storage/provider.hpp				\
   sched/constants.hpp							\
@@ -1340,56 +1361,72 @@ MESOS_LINUX_FILES +=							\
   slave/containerizer/mesos/isolators/xfs/disk.hpp
 endif
 
-MESOS_NETWORK_ISOLATOR_FILES =						\
+MESOS_LINUX_ROUTING_FILES =						\
   linux/routing/handle.cpp						\
-  linux/routing/route.cpp						\
-  linux/routing/utils.cpp						\
-  linux/routing/diagnosis/diagnosis.cpp					\
-  linux/routing/filter/basic.cpp					\
-  linux/routing/filter/icmp.cpp						\
-  linux/routing/filter/ip.cpp						\
-  linux/routing/link/link.cpp						\
-  linux/routing/link/veth.cpp						\
-  linux/routing/queueing/fq_codel.cpp					\
-  linux/routing/queueing/htb.cpp					\
-  linux/routing/queueing/ingress.cpp					\
-  slave/containerizer/mesos/isolators/network/port_mapping.cpp
-
-MESOS_NETWORK_ISOLATOR_FILES +=						\
   linux/routing/handle.hpp						\
   linux/routing/internal.hpp						\
+  linux/routing/route.cpp						\
   linux/routing/route.hpp						\
+  linux/routing/utils.cpp						\
   linux/routing/utils.hpp						\
+  linux/routing/diagnosis/diagnosis.cpp					\
   linux/routing/diagnosis/diagnosis.hpp					\
   linux/routing/filter/action.hpp					\
+  linux/routing/filter/basic.cpp					\
   linux/routing/filter/basic.hpp					\
   linux/routing/filter/filter.hpp					\
   linux/routing/filter/handle.hpp					\
+  linux/routing/filter/icmp.cpp						\
   linux/routing/filter/icmp.hpp						\
   linux/routing/filter/internal.hpp					\
+  linux/routing/filter/ip.cpp						\
   linux/routing/filter/ip.hpp						\
   linux/routing/filter/priority.hpp					\
   linux/routing/link/internal.hpp					\
+  linux/routing/link/link.cpp						\
   linux/routing/link/link.hpp						\
+  linux/routing/link/veth.cpp						\
   linux/routing/link/veth.hpp						\
   linux/routing/queueing/discipline.hpp					\
+  linux/routing/queueing/fq_codel.cpp					\
   linux/routing/queueing/fq_codel.hpp					\
+  linux/routing/queueing/htb.cpp					\
   linux/routing/queueing/htb.hpp					\
+  linux/routing/queueing/ingress.cpp					\
   linux/routing/queueing/ingress.hpp					\
   linux/routing/queueing/internal.hpp					\
-  linux/routing/queueing/statistics.hpp					\
-  slave/containerizer/mesos/isolators/network/port_mapping.hpp
+  linux/routing/queueing/statistics.hpp
+
+MESOS_NETWORK_PORTS_ISOLATOR_FILES =					\
+  slave/containerizer/mesos/isolators/network/ports.cpp			\
+  slave/containerizer/mesos/isolators/network/ports.hpp
+
+MESOS_PORT_MAPPING_ISOLATOR_FILES =					\
+  slave/containerizer/mesos/isolators/network/port_mapping.hpp		\
+  slave/containerizer/mesos/isolators/network/port_mapping.cpp
+
+if ENABLE_LINUX_ROUTING
+libmesos_no_3rdparty_la_SOURCES += $(MESOS_LINUX_ROUTING_FILES)
+else
+EXTRA_DIST += $(MESOS_LINUX_ROUTING_FILES)
+endif
+
+if ENABLE_NETWORK_PORTS_ISOLATOR
+libmesos_no_3rdparty_la_SOURCES += $(MESOS_NETWORK_PORTS_ISOLATOR_FILES)
+else
+EXTRA_DIST += $(MESOS_NETWORK_PORTS_ISOLATOR_FILES)
+endif
+
+if ENABLE_PORT_MAPPING_ISOLATOR
+libmesos_no_3rdparty_la_SOURCES += $(MESOS_PORT_MAPPING_ISOLATOR_FILES)
+else
+EXTRA_DIST += $(MESOS_PORT_MAPPING_ISOLATOR_FILES)
+endif
 
 if OS_LINUX
 libmesos_no_3rdparty_la_SOURCES += $(MESOS_LINUX_FILES)
 else
 EXTRA_DIST += $(MESOS_LINUX_FILES)
-endif
-
-if ENABLE_PORT_MAPPING_ISOLATOR
-libmesos_no_3rdparty_la_SOURCES += $(MESOS_NETWORK_ISOLATOR_FILES)
-else
-EXTRA_DIST += $(MESOS_NETWORK_ISOLATOR_FILES)
 endif
 
 if ENABLE_SSL
@@ -1731,14 +1768,14 @@ nobase_dist_pkgdata_DATA +=						\
 
 # Need to distribute/install third-party javascript.
 nobase_dist_pkgdata_DATA +=						\
-  webui/master/static/js/angular-1.2.3.js				\
-  webui/master/static/js/angular-1.2.3.min.js				\
-  webui/master/static/js/angular-route-1.2.3.js				\
-  webui/master/static/js/angular-route-1.2.3.min.js			\
+  webui/master/static/js/angular-1.2.32.js				\
+  webui/master/static/js/angular-1.2.32.min.js				\
+  webui/master/static/js/angular-route-1.2.32.js			\
+  webui/master/static/js/angular-route-1.2.32.min.js			\
   webui/master/static/js/clipboard-1.5.16.js				\
   webui/master/static/js/clipboard-1.5.16.min.js			\
-  webui/master/static/js/jquery-1.7.1.js				\
-  webui/master/static/js/jquery-1.7.1.min.js				\
+  webui/master/static/js/jquery-3.2.1.js				\
+  webui/master/static/js/jquery-3.2.1.min.js				\
   webui/master/static/js/relative-date.js				\
   webui/master/static/js/ui-bootstrap-tpls-0.9.0.js			\
   webui/master/static/js/ui-bootstrap-tpls-0.9.0.min.js			\
@@ -2520,10 +2557,19 @@ mesos_tests_SOURCES +=						\
   tests/containerizer/volume_secret_isolator_tests.cpp
 endif
 
+if ENABLE_LINUX_ROUTING
+mesos_tests_SOURCES +=						\
+  tests/containerizer/routing_tests.cpp
+endif
+
 if ENABLE_PORT_MAPPING_ISOLATOR
 mesos_tests_SOURCES +=						\
-  tests/containerizer/port_mapping_tests.cpp			\
-  tests/containerizer/routing_tests.cpp
+  tests/containerizer/port_mapping_tests.cpp
+endif
+
+if ENABLE_NETWORK_PORTS_ISOLATOR
+mesos_tests_SOURCES +=						\
+  tests/containerizer/ports_isolator_tests.cpp
 endif
 
 if ENABLE_GRPC
@@ -2548,7 +2594,6 @@ mesos_tests_SOURCES +=						\
 
 mesos_tests_CPPFLAGS += $(JAVA_CPPFLAGS)
 mesos_tests_CPPFLAGS += -DZOOKEEPER_VERSION=\"$(ZOOKEEPER_VERSION)\"
-mesos_tests_LDFLAGS = $(AM_LDFLAGS)
 mesos_tests_DEPENDENCIES += $(EXAMPLES_JAR)
 
 EXAMPLESCRIPTSJAVA =						\
@@ -2680,11 +2725,6 @@ check-local: tests
 
 check-ramfuzz: ramfuzz-tests all $(check_PROGRAMS)
 	$(TEST_DRIVER) ./ramfuzz-tests
-
-# We use distclean-local to remove core file left by sefgaulting perf. This can
-# be removed once (MESOS-7160) has been fixed.
-distclean-local:
-	-rm -f core
 
 if INSTALL_TESTS
 # If we enabled test installation, we can run the tests from the

@@ -919,6 +919,8 @@ Future<Nothing> HierarchicalAllocatorProcess::updateAvailable(
   //   where A = allocate, R = reserve, U = updateAvailable
   Try<Resources> updatedAvailable = slave.available().apply(operations);
   if (updatedAvailable.isError()) {
+    VLOG(1) << "Failed to update available resources on agent " << slaveId
+            << ": " << updatedAvailable.error();
     return Failure(updatedAvailable.error());
   }
 
@@ -1442,7 +1444,7 @@ Future<Nothing> HierarchicalAllocatorProcess::allocate(
     const hashset<SlaveID>& slaveIds)
 {
   if (paused) {
-    VLOG(1) << "Skipped allocation because the allocator is paused";
+    VLOG(2) << "Skipped allocation because the allocator is paused";
 
     return Nothing();
   }
@@ -1463,7 +1465,7 @@ Nothing HierarchicalAllocatorProcess::_allocate()
   metrics.allocation_run_latency.stop();
 
   if (paused) {
-    VLOG(1) << "Skipped allocation because the allocator is paused";
+    VLOG(2) << "Skipped allocation because the allocator is paused";
 
     return Nothing();
   }
@@ -1940,7 +1942,7 @@ void HierarchicalAllocatorProcess::__allocate()
   }
 
   if (offerable.empty()) {
-    VLOG(1) << "No allocations performed";
+    VLOG(2) << "No allocations performed";
   } else {
     // Now offer the resources to each framework.
     foreachkey (const FrameworkID& frameworkId, offerable) {
@@ -2030,7 +2032,7 @@ void HierarchicalAllocatorProcess::deallocate()
   }
 
   if (offerable.empty()) {
-    VLOG(1) << "No inverse offers to send out!";
+    VLOG(2) << "No inverse offers to send out!";
   } else {
     // Now send inverse offers to each framework.
     foreachkey (const FrameworkID& frameworkId, offerable) {

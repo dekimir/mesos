@@ -113,6 +113,15 @@ class MasterAPITest
     public WithParamInterface<ContentType>
 {
 public:
+  virtual master::Flags CreateMasterFlags()
+  {
+    // Turn off periodic allocations to avoid the race between
+    // `HierarchicalAllocator::updateAvailable()` and periodic allocations.
+    master::Flags flags = MesosTest::CreateMasterFlags();
+    flags.allocation_interval = Seconds(1000);
+    return flags;
+  }
+
   // Helper function to post a request to "/api/v1" master endpoint and return
   // the response.
   Future<v1::master::Response> post(
@@ -355,7 +364,7 @@ TEST_P(MasterAPITest, GetExecutors)
   ASSERT_SOME(slave);
 
   AWAIT_READY(slaveRegisteredMessage);
-  SlaveID slaveId = slaveRegisteredMessage->slave_id();
+  const SlaveID& slaveId = slaveRegisteredMessage->slave_id();
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -371,7 +380,7 @@ TEST_P(MasterAPITest, GetExecutors)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("test");
@@ -458,7 +467,7 @@ TEST_P(MasterAPITest, GetState)
 
   driver.start();
 
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   ContentType contentType = GetParam();
 
@@ -616,7 +625,7 @@ TEST_P(MasterAPITest, GetTasks)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("test");
@@ -973,11 +982,7 @@ TEST_P(MasterAPITest, ReserveResources)
 
   EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
-  // Set a low allocation interval to speed up this test.
-  master::Flags flags = MesosTest::CreateMasterFlags();
-  flags.allocation_interval = Milliseconds(50);
-
-  Try<Owned<cluster::Master>> master = StartMaster(&allocator, flags);
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
 
   Future<SlaveID> slaveId;
@@ -1018,9 +1023,6 @@ TEST_P(MasterAPITest, ReserveResources)
   EXPECT_TRUE(Resources(offer.resources()).contains(
       allocatedResources(unreserved, frameworkInfo.role())));
 
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers));
-
   // Expect an offer to be rescinded!
   EXPECT_CALL(sched, offerRescinded(_, _));
 
@@ -1044,6 +1046,12 @@ TEST_P(MasterAPITest, ReserveResources)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Accepted().status, response);
 
+  // Summon an offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.reviveOffers();
+
   AWAIT_READY(offers);
 
   ASSERT_EQ(1u, offers->size());
@@ -1065,11 +1073,7 @@ TEST_P(MasterAPITest, UnreserveResources)
 
   EXPECT_CALL(allocator, initialize(_, _, _, _, _, _));
 
-  // Set a low allocation interval to speed up this test.
-  master::Flags flags = MesosTest::CreateMasterFlags();
-  flags.allocation_interval = Milliseconds(50);
-
-  Try<Owned<cluster::Master>> master = StartMaster(&allocator, flags);
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
   ASSERT_SOME(master);
 
   Future<SlaveID> slaveId;
@@ -1130,9 +1134,6 @@ TEST_P(MasterAPITest, UnreserveResources)
   EXPECT_TRUE(Resources(offer.resources()).contains(
       allocatedResources(dynamicallyReserved, frameworkInfo.role())));
 
-  EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers));
-
   // Expect an offer to be rescinded!
   EXPECT_CALL(sched, offerRescinded(_, _));
 
@@ -1154,6 +1155,12 @@ TEST_P(MasterAPITest, UnreserveResources)
     stringify(contentType));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Accepted().status, unreserveResponse);
+
+  // Summon an offer.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.reviveOffers();
 
   AWAIT_READY(offers);
 
@@ -1326,20 +1333,14 @@ TEST_P(MasterAPITest, GetMaintenanceStatus)
     v1UpdateScheduleCall.mutable_update_maintenance_schedule();
   maintenanceSchedule->mutable_schedule()->CopyFrom(v1Schedule);
 
-  Future<Nothing> v1UpdateScheduleResponse = http::post(
+  Future<http::Response> v1UpdateScheduleResponse = http::post(
       master.get()->pid,
       "api/v1",
       headers,
       serialize(contentType, v1UpdateScheduleCall),
-      stringify(contentType))
-    .then([](const http::Response& response) -> Future<Nothing> {
-      if (response.status != http::OK().status) {
-        return Failure("Unexpected response status " + response.status);
-      }
-      return Nothing();
-    });
+      stringify(contentType));
 
-  AWAIT_READY(v1UpdateScheduleResponse);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, v1UpdateScheduleResponse);
 
   // Query maintenance status.
   v1::master::Call v1GetStatusCall;
@@ -2053,7 +2054,7 @@ TEST_P(MasterAPITest, Subscribe)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   // Create event stream after seeing first offer but before first task is
   // launched. We should see one framework, one agent and zero task/executor.
@@ -2211,11 +2212,9 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
     acl->mutable_users()->set_type(mesos::ACL::Entity::NONE);
   }
 
-  master::Flags masterFlags = CreateMasterFlags();
   Result<Authorizer*> authorizer = Authorizer::create(acls);
 
-  Try<Owned<cluster::Master>> master =
-    StartMaster(authorizer.get(), masterFlags);
+  Try<Owned<cluster::Master>> master = StartMaster(authorizer.get());
 
   ASSERT_SOME(master);
 
@@ -2276,7 +2275,8 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
 
   Future<v1::scheduler::Event::Offers> offers1;
   EXPECT_CALL(*scheduler, offers(_, _))
-    .WillOnce(FutureArg<1>(&offers1));
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   {
     v1::scheduler::Call call;
@@ -2299,6 +2299,8 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
 
   AWAIT_READY(offers1);
   ASSERT_FALSE(offers1->offers().empty());
+
+  v1::AgentID agentId(offers1->offers()[0].agent_id());
 
   v1::master::Call v1Call;
   v1Call.set_type(v1::master::Call::SUBSCRIBE);
@@ -2352,9 +2354,11 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
   Future<Result<v1::master::Event>> event = decoder.read();
   EXPECT_TRUE(event.isPending());
 
-  Future<mesos::v1::scheduler::Event::Update> update;
+  Future<mesos::v1::scheduler::Event::Update> updateRunning1;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update));
+    .WillOnce(DoAll(
+        FutureArg<1>(&updateRunning1),
+        v1::scheduler::SendAcknowledge(frameworkId, agentId)));
 
   EXPECT_CALL(executor1, registered(_, _, _, _));
   EXPECT_CALL(executor2, registered(_, _, _, _));
@@ -2387,11 +2391,6 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
     v1::scheduler::Call::Accept* accept = call.mutable_accept();
     accept->add_offer_ids()->CopyFrom(offer1.id());
 
-    // Set 0s filter to immediately get another offer.
-    v1::Filters filters;
-    filters.set_refuse_seconds(0);
-    accept->mutable_filters()->CopyFrom(filters);
-
     v1::Offer::Operation* operation = accept->add_operations();
     operation->set_type(v1::Offer::Operation::LAUNCH);
 
@@ -2405,21 +2404,8 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
   ASSERT_EQ(v1::master::Event::TASK_ADDED, event->get().type());
   ASSERT_EQ(task1.task_id(), event->get().task_added().task().task_id());
 
-  AWAIT_READY(update);
-
-  {
-    v1::scheduler::Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(v1::scheduler::Call::ACKNOWLEDGE);
-
-    v1::scheduler::Call::Acknowledge* acknowledge =
-      call.mutable_acknowledge();
-    acknowledge->mutable_task_id()->CopyFrom(task1.task_id());
-    acknowledge->mutable_agent_id()->CopyFrom(offer1.agent_id());
-    acknowledge->set_uuid(update->status().uuid());
-
-    mesos.send(call);
-  }
+  AWAIT_READY(updateRunning1);
+  EXPECT_EQ(updateRunning1->status().state(), TASK_RUNNING);
 
   event = decoder.read();
 
@@ -2433,22 +2419,28 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
   ASSERT_EQ(task1.task_id(),
             event->get().task_updated().status().task_id());
 
+  // Summon an offer.
   Future<v1::scheduler::Event::Offers> offers2;
   EXPECT_CALL(*scheduler, offers(_, _))
     .WillOnce(FutureArg<1>(&offers2))
     .WillRepeatedly(Return()); // Ignore further offers.
 
-  Clock::pause();
-  Clock::advance(masterFlags.allocation_interval);
-  Clock::resume();
+  {
+    v1::scheduler::Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(v1::scheduler::Call::REVIVE);
+
+    mesos.send(call);
+  }
 
   AWAIT_READY(offers2);
   ASSERT_FALSE(offers2->offers().empty());
 
   const v1::Offer& offer2 = offers2->offers(0);
 
+  Future<mesos::v1::scheduler::Event::Update> updateRunning2;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update))
+    .WillOnce(FutureArg<1>(&updateRunning2))
     .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   Future<TaskInfo> execTask2;
@@ -2485,7 +2477,7 @@ TEST_P(MasterAPITest, EventAuthorizationFiltering)
     mesos.send(call);
   }
 
-  AWAIT_READY(update);
+  AWAIT_READY(updateRunning2);
 
   event = decoder.read();
   EXPECT_TRUE(event.isPending());
@@ -3012,20 +3004,16 @@ TEST_P(MasterAPITest, CreateAndDestroyVolumes)
   http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
   headers["Accept"] = stringify(contentType);
 
-  Future<Nothing> v1CreateVolumesResponse = http::post(
+  Future<http::Response> v1CreateVolumesResponse = http::post(
       master.get()->pid,
       "api/v1",
       headers,
       serialize(contentType, v1CreateVolumesCall),
-      stringify(contentType))
-    .then([](const http::Response& response) -> Future<Nothing> {
-      if (response.status != http::Accepted().status) {
-        return Failure("Unexpected response status " + response.status);
-      }
-      return Nothing();
-    });
+      stringify(contentType));
 
-  AWAIT_READY(v1CreateVolumesResponse);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      http::Accepted().status,
+      v1CreateVolumesResponse);
 
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_role("role1");
@@ -3045,7 +3033,7 @@ TEST_P(MasterAPITest, CreateAndDestroyVolumes)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   EXPECT_TRUE(Resources(offer.resources()).contains(
@@ -3084,20 +3072,16 @@ TEST_P(MasterAPITest, CreateAndDestroyVolumes)
   destroyVolumes->mutable_agent_id()->CopyFrom(evolve(slaveId));
   destroyVolumes->add_volumes()->CopyFrom(evolve(volume));
 
-  Future<Nothing> v1DestroyVolumesResponse = http::post(
+  Future<http::Response> v1DestroyVolumesResponse = http::post(
       master.get()->pid,
       "api/v1",
       headers,
       serialize(contentType, v1DestroyVolumesCall),
-      stringify(contentType))
-    .then([](const http::Response& response) -> Future<Nothing> {
-      if (response.status != http::Accepted().status) {
-        return Failure("Unexpected response status " + response.status);
-      }
-      return Nothing();
-    });
+      stringify(contentType));
 
-  AWAIT_READY(v1DestroyVolumesResponse);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      http::Accepted().status,
+      v1DestroyVolumesResponse);
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -3164,20 +3148,14 @@ TEST_P(MasterAPITest, UpdateWeights)
   http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
   headers["Accept"] = stringify(contentType);
 
-  Future<Nothing> updateResponse = http::post(
+  Future<http::Response> updateResponse = http::post(
       master.get()->pid,
       "api/v1",
       headers,
       serialize(contentType, updateCall),
-      stringify(contentType))
-    .then([](const http::Response& response) -> Future<Nothing> {
-      if (response.status != http::OK().status) {
-        return Failure("Unexpected response status " + response.status);
-      }
-      return Nothing();
-    });
+      stringify(contentType));
 
-  AWAIT_READY(updateResponse);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, updateResponse);
 
   getResponse = post(master.get()->pid, getCall, contentType);
 
@@ -3516,11 +3494,270 @@ TEST_P(MasterAPITest, Teardown)
 }
 
 
+// This test verifies that a registered agent can be marked as gone and
+// shutdown by the master subsequently. Upon restarting the agent, it
+// should not be able to reregister with the master.
+//
+// TODO(andschwa): Enable this when MESOS-7604 is fixed.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(MasterAPITest, MarkRegisteredAgentGone)
+{
+  master::Flags masterFlags = CreateMasterFlags();
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Ensure that the agent is registered successfully with the master
+  // before marking it as gone.
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Mark the agent as gone. This should result in the agent being shutdown.
+
+  Future<ShutdownMessage> shutdownMessage =
+    FUTURE_PROTOBUF(ShutdownMessage(), master.get()->pid, _);
+
+  ContentType contentType = GetParam();
+
+  v1::master::Call v1Call;
+  v1Call.set_type(v1::master::Call::MARK_AGENT_GONE);
+
+  v1::master::Call::MarkAgentGone* markAgentGone =
+    v1Call.mutable_mark_agent_gone();
+
+  markAgentGone->mutable_agent_id()->CopyFrom(
+      evolve(slaveRegisteredMessage->slave_id()));
+
+  Future<http::Response> response = http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1Call),
+      stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
+  AWAIT_READY(shutdownMessage);
+
+  // The agent should not be able to re-register with
+  // the master upon restart.
+
+  slave.get()->terminate();
+  slave->reset();
+
+  Future<ShutdownMessage> shutdownMessage2 =
+    FUTURE_PROTOBUF(ShutdownMessage(), master.get()->pid, _);
+
+  slave = StartSlave(detector.get(), slaveFlags);
+
+  AWAIT_READY(shutdownMessage2);
+}
+
+
+// This test verifies that unauthorized principals are unable to
+// mark agents as gone.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(MasterAPITest,
+                                MarkRegisteredAgentGoneUnauthorized)
+{
+  master::Flags masterFlags = CreateMasterFlags();
+
+  {
+    // Default principal is not allowed to mark agents as gone.
+    mesos::ACL::MarkAgentGone* acl =
+      masterFlags.acls.get().add_mark_agents_gone();
+
+    acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+    acl->mutable_agents()->set_type(mesos::ACL::Entity::NONE);
+  }
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Ensure that the agent is registered successfully with the master
+  // before marking it as gone.
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Mark the agent as gone. This should fail due to an authorization error.
+
+  ContentType contentType = GetParam();
+
+  v1::master::Call v1Call;
+  v1Call.set_type(v1::master::Call::MARK_AGENT_GONE);
+
+  v1::master::Call::MarkAgentGone* markAgentGone =
+    v1Call.mutable_mark_agent_gone();
+
+  markAgentGone->mutable_agent_id()->CopyFrom(
+      evolve(slaveRegisteredMessage->slave_id()));
+
+  Future<http::Response> response = http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1Call),
+      stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::Forbidden().status, response);
+}
+
+
+// This test verifies that the master correctly sends 'TASK_GONE_BY_OPERATOR'
+// status updates when an agent running the tasks is marked as gone.
+//
+// TODO(andschwa): Enable this when MESOS-7604 is fixed.
+TEST_P_TEMP_DISABLED_ON_WINDOWS(MasterAPITest, TaskUpdatesUponAgentGone)
+{
+  master::Flags masterFlags = CreateMasterFlags();
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, slaveFlags);
+
+  ASSERT_SOME(slave);
+
+  FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::PARTITION_AWARE);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, framework, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> update;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&update));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(update);
+  ASSERT_EQ(TASK_RUNNING, update->state());
+
+  Future<TaskStatus> update2;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&update2));
+
+  EXPECT_CALL(sched, slaveLost(&driver, _))
+    .Times(AtMost(1));
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  // Mark the agent as gone. This should result in the master sending
+  // a 'TASK_GONE_BY_OPERATOR' update for the running task.
+
+  ContentType contentType = GetParam();
+
+  SlaveID slaveId = offers.get()[0].slave_id();
+
+  v1::master::Call v1Call;
+  v1Call.set_type(v1::master::Call::MARK_AGENT_GONE);
+
+  v1::master::Call::MarkAgentGone* markAgentGone =
+    v1Call.mutable_mark_agent_gone();
+
+  markAgentGone->mutable_agent_id()->CopyFrom(evolve(slaveId));
+
+  Future<http::Response> response = http::post(
+      master.get()->pid,
+      "api/v1",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      serialize(contentType, v1Call),
+      stringify(contentType));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
+
+  AWAIT_READY(update2);
+
+  ASSERT_EQ(TASK_GONE_BY_OPERATOR, update2->state());
+  ASSERT_EQ(TaskStatus::REASON_SLAVE_REMOVED_BY_OPERATOR, update2->reason());
+
+  // Performing reconciliation for an unknown task on the gone agent should
+  // result in a 'TASK_GONE_BY_OPERATOR' update.
+
+  Future<TaskStatus> update3;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&update3));
+
+  vector<TaskStatus> statuses;
+
+  TaskStatus status;
+  status.mutable_slave_id()->CopyFrom(slaveId);
+  status.mutable_task_id()->set_value("dummy-task");
+
+  statuses.push_back(status);
+
+  driver.reconcileTasks(statuses);
+
+  AWAIT_READY(update3);
+  ASSERT_EQ(TASK_GONE_BY_OPERATOR, update3->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
 class AgentAPITest
   : public MesosTest,
     public WithParamInterface<ContentType>
 {
 public:
+  virtual master::Flags CreateMasterFlags()
+  {
+    // Turn off periodic allocations to avoid the race between
+    // `HierarchicalAllocator::updateAvailable()` and periodic allocations.
+    master::Flags flags = MesosTest::CreateMasterFlags();
+    flags.allocation_interval = Seconds(1000);
+    return flags;
+  }
+
   // Helper function to post a request to "/api/v1" agent endpoint and return
   // the response.
   Future<v1::agent::Response> post(
@@ -3795,20 +4032,14 @@ TEST_P(AgentAPITest, SetLoggingLevel)
   http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
   headers["Accept"] = stringify(contentType);
 
-  Future<Nothing> v1Response = http::post(
+  Future<http::Response> v1Response = http::post(
       slave.get()->pid,
       "api/v1",
       headers,
       serialize(contentType, v1Call),
-      stringify(contentType))
-    .then([](const http::Response& response) -> Future<Nothing> {
-      if (response.status != http::OK().status) {
-        return Failure("Unexpected response status " + response.status);
-      }
-      return Nothing();
-    });
+      stringify(contentType));
 
-  AWAIT_READY(v1Response);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, v1Response);
   ASSERT_EQ(toggleLevel, static_cast<uint32_t>(FLAGS_v));
 
   // Speedup the logging level revert.
@@ -3928,7 +4159,7 @@ TEST_P(AgentAPITest, GetContainers)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -3941,9 +4172,9 @@ TEST_P(AgentAPITest, GetContainers)
   EXPECT_CALL(exec, launchTask(_, _))
     .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&statusRunning));
 
   // No tasks launched, we should expect zero containers in Response.
   {
@@ -3963,8 +4194,8 @@ TEST_P(AgentAPITest, GetContainers)
 
   driver.launchTasks(offer.id(), {task});
 
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   ResourceStatistics statistics;
   statistics.set_mem_limit_bytes(2048);
@@ -4180,7 +4411,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetFrameworks)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   const Offer& offer = offers.get()[0];
 
   TaskInfo task;
@@ -4193,8 +4424,10 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetFrameworks)
   command.set_value("sleep 1000");
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   ContentType contentType = GetParam();
@@ -4215,6 +4448,9 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetFrameworks)
   }
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -4283,7 +4519,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetExecutors)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   const Offer& offer = offers.get()[0];
 
   TaskInfo task;
@@ -4296,8 +4532,10 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetExecutors)
   command.set_value("sleep 1000");
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   ContentType contentType = GetParam();
@@ -4318,6 +4556,9 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetExecutors)
   }
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -4390,7 +4631,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetTasks)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   const Offer& offer = offers.get()[0];
 
   TaskInfo task;
@@ -4403,8 +4644,10 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetTasks)
   command.set_value("sleep 1000");
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   ContentType contentType = GetParam();
@@ -4428,6 +4671,9 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetTasks)
   }
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -4553,7 +4799,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetState)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   const Offer& offer = offers.get()[0];
 
   TaskInfo task;
@@ -4566,8 +4812,10 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetState)
   command.set_value("sleep 1000");
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   ContentType contentType = GetParam();
@@ -4592,6 +4840,9 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, GetState)
   }
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -5298,18 +5549,19 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPITest, LaunchNestedContainerSession)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  ASSERT_EQ(TASK_RUNNING, status->state());
+  ASSERT_EQ(TASK_STARTING, status->state());
 
   // Launch a nested container session that runs a command
   // that writes something to stdout and stderr and exits.
@@ -5419,18 +5671,19 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  ASSERT_EQ(TASK_RUNNING, status->state());
+  ASSERT_EQ(TASK_STARTING, status->state());
 
   // Attempt to launch a nested container which does nothing.
 
@@ -5515,18 +5768,19 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  ASSERT_EQ(TASK_RUNNING, status->state());
+  ASSERT_EQ(TASK_STARTING, status->state());
 
   // Launch a nested container session that runs a command
   // that writes something to stdout and stderr and exits.
@@ -5632,18 +5886,19 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  ASSERT_EQ(TASK_RUNNING, status->state());
+  ASSERT_EQ(TASK_STARTING, status->state());
 
   // Launch a nested container session that runs `cat` so that it never exits.
 
@@ -5743,7 +5998,7 @@ TEST_P(AgentAPITest, AttachContainerOutputFailure)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   EXPECT_CALL(exec, registered(_, _, _, _));
 
@@ -5827,7 +6082,7 @@ TEST_F(AgentAPITest, AttachContainerInputFailure)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   EXPECT_CALL(exec, registered(_, _, _, _));
 
@@ -5936,18 +6191,19 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&status))
+    .WillRepeatedly(Return());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(status);
-  ASSERT_EQ(TASK_RUNNING, status->state());
+  ASSERT_EQ(TASK_STARTING, status->state());
 
   // Launch a nested container session which runs a shell.
 
@@ -6298,7 +6554,7 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(AgentAPIStreamingTest,
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -6542,20 +6798,26 @@ TEST_P_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(Return());
 
   TaskInfo taskInfo = createTask(offer, "sleep 1000");
 
   driver.acceptOffers({offer.id()}, {LAUNCH({taskInfo})});
 
-  AWAIT_READY(status);
-  ASSERT_EQ(TASK_RUNNING, status->state());
+  AWAIT_READY(statusStarting);
+  ASSERT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  ASSERT_EQ(TASK_RUNNING, statusRunning->state());
 
   Future<hashset<ContainerID>> containerIds = containerizer->containers();
   AWAIT_READY(containerIds);

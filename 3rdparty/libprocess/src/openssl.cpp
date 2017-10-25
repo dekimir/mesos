@@ -12,7 +12,9 @@
 
 #include "openssl.hpp"
 
+#ifndef __WINDOWS__
 #include <sys/param.h>
+#endif // __WINDOWS__
 
 #include <openssl/err.h>
 #include <openssl/rand.h>
@@ -30,6 +32,15 @@
 
 #include <stout/os.hpp>
 #include <stout/strings.hpp>
+
+#ifdef __WINDOWS__
+// OpenSSL on Windows requires this adapter module to be compiled as part of the
+// consuming project to deal with Windows runtime library differences. Not doing
+// so manifests itself as the "no OPENSSL_Applink" runtime error.
+//
+// https://www.openssl.org/docs/faq.html
+#include <openssl/applink.c>
+#endif // __WINDOWS__
 
 using std::map;
 using std::ostringstream;
@@ -542,7 +553,7 @@ void reinitialize()
         unsigned long error = ERR_get_error();
         EXIT(EXIT_FAILURE)
           << "Could not load CA file and/or directory (OpenSSL error #"
-          << stringify(error)  << "): "
+          << stringify(error) << "): "
           << error_string(error) << " -> "
           << (ca_file != nullptr ? (stringify("FILE: ") + ca_file) : "")
           << (ca_dir != nullptr ? (stringify("DIR: ") + ca_dir) : "");
@@ -818,7 +829,7 @@ Try<Nothing> verify(
     X509_NAME* name = X509_get_subject_name(cert);
 
     if (name != nullptr) {
-      char text[_POSIX_HOST_NAME_MAX] {};
+      char text[MAXHOSTNAMELEN] {};
 
       if (X509_NAME_get_text_by_NID(
               name,

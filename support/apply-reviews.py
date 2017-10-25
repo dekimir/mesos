@@ -165,7 +165,9 @@ def ssl_create_default_context():
     Equivalent to `ssl.create_default_context` with default arguments and
     certificate/hostname verification disabled.
     See: https://github.com/python/cpython/blob/2.7/Lib/ssl.py#L410
+    This function requires Python >= 2.7.9.
     """
+    # pylint: disable=no-member
     context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
 
     # SSLv2 considered harmful.
@@ -185,7 +187,9 @@ def ssl_create_default_context():
 
 def fetch_patch(options):
     """Fetches a patch from Review Board or GitHub."""
+    # pylint: disable=unexpected-keyword-arg
     if platform.system() == 'Windows':
+        # This call requires Python >= 2.7.9.
         response = urllib2.urlopen(
             patch_url(options),
             context=ssl_create_default_context())
@@ -206,9 +210,9 @@ def fetch_patch(options):
                 review_id=patch_id(options),
                 url=patch_url(options))
 
-        # In case of github we always need to fetch the patch to extract username
-        # and email, so we ignore the dry_run option by setting the second parameter
-        # to False.
+        # In case of GitHub we always need to fetch the patch to extract
+        # username and email, so we ignore the dry_run option by setting the
+        # second parameter to False.
         if options['github']:
             shell(cmd, False)
         else:
@@ -252,6 +256,12 @@ def commit_patch(options):
     else:
         amend = '-e'
 
+    # Check whether we should skip the commit hooks.
+    if options['skip_hooks']:
+        verify = '-n'
+    else:
+        verify = ''
+
     # NOTE: Windows does not support multi-line commit messages via the shell.
     message_file = '%s.message' % patch_id(options)
     atexit.register(
@@ -260,10 +270,14 @@ def commit_patch(options):
     with open(message_file, 'w') as message:
         message.write(data['message'])
 
-    cmd = u'git commit --author \"{author}\" {_amend} -aF \"{message}\"'.format(
-        author=quote(data['author']),
-        _amend=amend,
-        message=message_file)
+    cmd = u'git commit' \
+          u' --author \"{author}\"' \
+          u' {amend} -aF \"{message}\"' \
+          u' {verify}'.format(
+              author=quote(data['author']),
+              amend=amend,
+              message=message_file,
+              verify=verify)
 
     shell(cmd, options['dry_run'])
 
@@ -361,7 +375,9 @@ def parse_options():
     parser.add_argument('-c', '--chain',
                         action='store_true',
                         help='Recursively apply parent review chain.')
-
+    parser.add_argument('-s', '--skip-hooks',
+                        action='store_true',
+                        help='Skip the commit hooks (e.g., Mesos style check).')
     parser.add_argument('-3', '--3way',
                         dest='three_way',
                         action='store_true',
@@ -383,6 +399,7 @@ def parse_options():
     options['no_amend'] = args.no_amend
     options['github'] = args.github
     options['chain'] = args.chain
+    options['skip_hooks'] = args.skip_hooks
     options['3way'] = args.three_way
 
     return options

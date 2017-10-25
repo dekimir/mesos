@@ -108,6 +108,8 @@
 #include <slave/posix_signalhandler.hpp>
 #endif // __WINDOWS__
 
+namespace http = process::http;
+
 using google::protobuf::RepeatedPtrField;
 
 using mesos::SecretGenerator;
@@ -423,7 +425,7 @@ void Slave::initialize()
   }
 #endif
 
-  process::http::URL localResourceProviderURL(
+  http::URL localResourceProviderURL(
       scheme,
       self().address.ip,
       self().address.port,
@@ -531,6 +533,8 @@ void Slave::initialize()
 #endif // __linux__
         break;
       }
+      case Resource::DiskInfo::Source::BLOCK:
+      case Resource::DiskInfo::Source::RAW:
       case Resource::DiskInfo::Source::UNKNOWN: {
         EXIT(EXIT_FAILURE)
           << "Unsupported 'DiskInfo.Source.Type' in '" << resource << "'";
@@ -712,7 +716,7 @@ void Slave::initialize()
         // and operators/tooling to use this endpoint?
         READWRITE_HTTP_AUTHENTICATION_REALM,
         Http::API_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.api(request, principal);
@@ -722,7 +726,7 @@ void Slave::initialize()
   route("/api/v1/executor",
         EXECUTOR_HTTP_AUTHENTICATION_REALM,
         Http::EXECUTOR_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.executor(request, principal);
@@ -731,7 +735,7 @@ void Slave::initialize()
   route("/api/v1/resource_provider",
         READWRITE_HTTP_AUTHENTICATION_REALM,
         Http::RESOURCE_PROVIDER_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return resourceProviderManager.api(request, principal);
@@ -742,7 +746,7 @@ void Slave::initialize()
   route("/state.json",
         READONLY_HTTP_AUTHENTICATION_REALM,
         Http::STATE_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.state(request, principal);
@@ -750,7 +754,7 @@ void Slave::initialize()
   route("/state",
         READONLY_HTTP_AUTHENTICATION_REALM,
         Http::STATE_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.state(request, principal);
@@ -758,20 +762,20 @@ void Slave::initialize()
   route("/flags",
         READONLY_HTTP_AUTHENTICATION_REALM,
         Http::FLAGS_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.flags(request, principal);
         });
   route("/health",
         Http::HEALTH_HELP(),
-        [this](const process::http::Request& request) {
+        [this](const http::Request& request) {
           return http.health(request);
         });
   route("/monitor/statistics",
         READONLY_HTTP_AUTHENTICATION_REALM,
         Http::STATISTICS_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.statistics(request, principal);
@@ -781,7 +785,7 @@ void Slave::initialize()
   route("/monitor/statistics.json",
         READONLY_HTTP_AUTHENTICATION_REALM,
         Http::STATISTICS_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.statistics(request, principal);
@@ -789,7 +793,7 @@ void Slave::initialize()
   route("/containers",
         READONLY_HTTP_AUTHENTICATION_REALM,
         Http::CONTAINERS_HELP(),
-        [this](const process::http::Request& request,
+        [this](const http::Request& request,
                const Option<Principal>& principal) {
           logRequest(request);
           return http.containers(request, principal);
@@ -807,11 +811,13 @@ void Slave::initialize()
   // Expose the log file for the webui. Fall back to 'log_dir' if
   // an explicit file was not specified.
   if (flags.external_log_file.isSome()) {
-    files->attach(flags.external_log_file.get(), "/slave/log", authorize)
+    files->attach(
+        flags.external_log_file.get(), AGENT_LOG_VIRTUAL_PATH, authorize)
       .onAny(defer(self(),
                    &Self::fileAttached,
                    lambda::_1,
-                   flags.external_log_file.get()));
+                   flags.external_log_file.get(),
+                   AGENT_LOG_VIRTUAL_PATH));
   } else if (flags.log_dir.isSome()) {
     Try<string> log =
       logging::getLogFile(logging::getLogSeverity(flags.logging_level));
@@ -819,8 +825,12 @@ void Slave::initialize()
     if (log.isError()) {
       LOG(ERROR) << "Agent log file cannot be found: " << log.error();
     } else {
-      files->attach(log.get(), "/slave/log", authorize)
-        .onAny(defer(self(), &Self::fileAttached, lambda::_1, log.get()));
+      files->attach(log.get(), AGENT_LOG_VIRTUAL_PATH, authorize)
+        .onAny(defer(self(),
+                     &Self::fileAttached,
+                     lambda::_1,
+                     log.get(),
+                     AGENT_LOG_VIRTUAL_PATH));
     }
   }
 
@@ -876,15 +886,6 @@ void Slave::finalize()
       shutdownFramework(UPID(), frameworkId);
     }
   }
-
-  if (state == TERMINATING) {
-    // We remove the "latest" symlink in meta directory, so that the
-    // slave doesn't recover the state when it restarts and registers
-    // as a new slave with the master.
-    if (os::exists(paths::getLatestSlavePath(metaDir))) {
-      CHECK_SOME(os::rm(paths::getLatestSlavePath(metaDir)));
-    }
-  }
 }
 
 
@@ -934,12 +935,17 @@ void Slave::shutdown(const UPID& from, const string& message)
 }
 
 
-void Slave::fileAttached(const Future<Nothing>& result, const string& path)
+void Slave::fileAttached(
+    const Future<Nothing>& result,
+    const string& path,
+    const string& virtualPath)
 {
   if (result.isReady()) {
-    VLOG(1) << "Successfully attached file '" << path << "'";
+    VLOG(1) << "Successfully attached '" << path << "'"
+            << " to virtual path '" << virtualPath << "'";
   } else {
-    LOG(ERROR) << "Failed to attach file '" << path << "': "
+    LOG(ERROR) << "Failed to attach '" << path << "'"
+               << " to virtual path '" << virtualPath << "': "
                << (result.isFailed() ? result.failure() : "discarded");
   }
 }
@@ -1054,13 +1060,10 @@ void Slave::authenticate()
 
   CHECK(authenticatee == nullptr);
 
-#ifdef HAS_AUTHENTICATION
-  // On Windows CRAMMD5Authenticatee is not supported.
   if (authenticateeName == DEFAULT_AUTHENTICATEE) {
     LOG(INFO) << "Using default CRAM-MD5 authenticatee";
     authenticatee = new cram_md5::CRAMMD5Authenticatee();
   }
-#endif // HAS_AUTHENTICATION
 
   if (authenticatee == nullptr) {
     Try<Authenticatee*> module =
@@ -1261,7 +1264,7 @@ void Slave::registered(
 
     UpdateSlaveMessage message;
     message.mutable_slave_id()->CopyFrom(info.id());
-    message.set_type(UpdateSlaveMessage::OVERSUBSCRIBED);
+    message.mutable_resource_categories()->set_oversubscribed(true);
     message.mutable_oversubscribed_resources()->CopyFrom(
         oversubscribedResources.get());
 
@@ -1341,7 +1344,7 @@ void Slave::reregistered(
 
     UpdateSlaveMessage message;
     message.mutable_slave_id()->CopyFrom(info.id());
-    message.set_type(UpdateSlaveMessage::OVERSUBSCRIBED);
+    message.mutable_resource_categories()->set_oversubscribed(true);
     message.mutable_oversubscribed_resources()->CopyFrom(
         oversubscribedResources.get());
 
@@ -2490,7 +2493,7 @@ void Slave::___run(
 
       ContainerTermination termination;
       termination.set_state(taskState);
-      termination.add_reasons(TaskStatus::REASON_CONTAINER_UPDATE_FAILED);
+      termination.set_reason(TaskStatus::REASON_CONTAINER_UPDATE_FAILED);
       termination.set_message(
           "Failed to update resources for container: " +
           (future.isFailed() ? future.failure() : "discarded"));
@@ -2750,7 +2753,7 @@ void Slave::launchExecutor(
     // and perform cleanup via `executorTerminated`.
     ContainerTermination termination;
     termination.set_state(TASK_FAILED);
-    termination.add_reasons(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED);
+    termination.set_reason(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED);
     termination.set_message("Executor " + executorState);
 
     executorTerminated(frameworkId, executorId, termination);
@@ -2771,7 +2774,7 @@ void Slave::launchExecutor(
 
       ContainerTermination termination;
       termination.set_state(TASK_FAILED);
-      termination.add_reasons(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED);
+      termination.set_reason(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED);
       termination.set_message(
           "Secret generation failed: " +
           (future->isFailed() ? future->failure() : "discarded"));
@@ -4300,7 +4303,7 @@ void Slave::_reregisterExecutor(
 
       ContainerTermination termination;
       termination.set_state(taskState);
-      termination.add_reasons(TaskStatus::REASON_CONTAINER_UPDATE_FAILED);
+      termination.set_reason(TaskStatus::REASON_CONTAINER_UPDATE_FAILED);
       termination.set_message(
           "Failed to update resources for container: " +
           (future.isFailed() ? future.failure() : "discarded"));
@@ -4353,7 +4356,7 @@ void Slave::reregisterExecutorTimeout()
 
           ContainerTermination termination;
           termination.set_state(taskState);
-          termination.add_reasons(
+          termination.set_reason(
               TaskStatus::REASON_EXECUTOR_REREGISTRATION_TIMEOUT);
           termination.set_message(
               "Executor did not re-register within " +
@@ -4504,8 +4507,8 @@ void Slave::statusUpdate(StatusUpdate update, const Option<UPID>& pid)
 
   Executor* executor = framework->getExecutor(status.task_id());
   if (executor == nullptr) {
-    LOG(WARNING)  << "Could not find the executor for "
-                  << "status update " << update;
+    LOG(WARNING) << "Could not find the executor for "
+                 << "status update " << update;
     metrics.valid_status_updates++;
 
     // NOTE: We forward the update here because this update could be
@@ -4734,7 +4737,7 @@ void Slave::__statusUpdate(
 
       ContainerTermination termination;
       termination.set_state(taskState);
-      termination.add_reasons(TaskStatus::REASON_CONTAINER_UPDATE_FAILED);
+      termination.set_reason(TaskStatus::REASON_CONTAINER_UPDATE_FAILED);
       termination.set_message(
           "Failed to update resources for container: " +
           (future->isFailed() ? future->failure() : "discarded"));
@@ -4960,7 +4963,7 @@ void Slave::executorMessage(
 // within that (more generous) timeout.
 void Slave::ping(const UPID& from, bool connected)
 {
-  VLOG(1) << "Received ping from " << from;
+  VLOG(2) << "Received ping from " << from;
 
   if (!connected && state == RUNNING) {
     // This could happen if there is a one-way partition between
@@ -5296,7 +5299,7 @@ void Slave::executorLaunched(
     if (executor != nullptr) {
       ContainerTermination termination;
       termination.set_state(TASK_FAILED);
-      termination.add_reasons(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED);
+      termination.set_reason(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED);
       termination.set_message(
           "Failed to launch container: " +
           (future.isFailed() ? future.failure() : "discarded"));
@@ -5555,16 +5558,27 @@ void Slave::removeExecutor(Framework* framework, Executor* executor)
     const string path = paths::getExecutorPath(
         flags.work_dir, info.id(), framework->id(), executor->id);
 
-    // Make sure we detach the "latest" symlink.
+    // Make sure we detach both real and virtual paths for "latest"
+    // symlink. We prefer users to use the virtual paths because
+    // they do not expose the `work_dir` and agent ID, but the real
+    // paths remains for compatibility reason.
     const string latestPath = paths::getExecutorLatestRunPath(
         flags.work_dir,
         info.id(),
         framework->id(),
         executor->id);
 
+    const string virtualLatestPath = paths::getExecutorVirtualPath(
+        framework->id(),
+        executor->id);
+
     os::utime(path); // Update the modification time.
     garbageCollect(path)
-      .then(defer(self(), &Self::detachFile, latestPath));
+      .then(defer(self(), [=]() {
+        detachFile(latestPath);
+        detachFile(virtualLatestPath);
+        return Nothing();
+      }));
   }
 
   if (executor->checkpoint) {
@@ -5869,7 +5883,7 @@ void Slave::registerExecutorTimeout(
 
       ContainerTermination termination;
       termination.set_state(TASK_FAILED);
-      termination.add_reasons(TaskStatus::REASON_EXECUTOR_REGISTRATION_TIMEOUT);
+      termination.set_reason(TaskStatus::REASON_EXECUTOR_REGISTRATION_TIMEOUT);
       termination.set_message(
           "Executor did not register within " +
           stringify(flags.executor_registration_timeout));
@@ -6475,7 +6489,7 @@ Future<Nothing> Slave::garbageCollect(const string& path)
 
 void Slave::forwardOversubscribed()
 {
-  VLOG(1) << "Querying resource estimator for oversubscribable resources";
+  VLOG(2) << "Querying resource estimator for oversubscribable resources";
 
   resourceEstimator->oversubscribable()
     .onAny(defer(self(), &Self::_forwardOversubscribed, lambda::_1));
@@ -6489,7 +6503,7 @@ void Slave::_forwardOversubscribed(const Future<Resources>& oversubscribable)
                << (oversubscribable.isFailed()
                    ? oversubscribable.failure() : "future discarded");
   } else {
-    VLOG(1) << "Received oversubscribable resources "
+    VLOG(2) << "Received oversubscribable resources "
             << oversubscribable.get() << " from the resource estimator";
 
     // Oversubscribable resources must be tagged as revocable.
@@ -6528,7 +6542,7 @@ void Slave::_forwardOversubscribed(const Future<Resources>& oversubscribable)
 
       UpdateSlaveMessage message;
       message.mutable_slave_id()->CopyFrom(info.id());
-      message.set_type(UpdateSlaveMessage::OVERSUBSCRIBED);
+      message.mutable_resource_categories()->set_oversubscribed(true);
       message.mutable_oversubscribed_resources()->CopyFrom(oversubscribed);
 
       CHECK_SOME(master);
@@ -6667,7 +6681,7 @@ void Slave::_qosCorrections(const Future<list<QoSCorrection>>& future)
 
           ContainerTermination termination;
           termination.set_state(taskState);
-          termination.add_reasons(TaskStatus::REASON_CONTAINER_PREEMPTED);
+          termination.set_reason(TaskStatus::REASON_CONTAINER_PREEMPTED);
           termination.set_message("Container preempted by QoS correction");
 
           executor->pendingTermination = termination;
@@ -6876,9 +6890,10 @@ void Slave::sendExecutorTerminatedStatusUpdate(
   TaskStatus::Reason reason;
   string message;
 
+  const bool haveTermination = termination.isReady() && termination->isSome();
+
   // Determine the task state for the status update.
-  if (termination.isReady() &&
-      termination->isSome() && termination->get().has_state()) {
+  if (haveTermination && termination->get().has_state()) {
     state = termination->get().state();
   } else if (executor->pendingTermination.isSome() &&
              executor->pendingTermination->has_state()) {
@@ -6888,13 +6903,11 @@ void Slave::sendExecutorTerminatedStatusUpdate(
   }
 
   // Determine the task reason for the status update.
-  // TODO(jieyu): Handle multiple reasons (MESOS-2657).
-  if (termination.isReady() &&
-      termination->isSome() && termination->get().reasons().size() > 0) {
-    reason = termination->get().reasons(0);
+  if (haveTermination && termination->get().has_reason()) {
+    reason = termination->get().reason();
   } else if (executor->pendingTermination.isSome() &&
-             executor->pendingTermination->reasons().size() > 0) {
-    reason = executor->pendingTermination->reasons(0);
+             executor->pendingTermination->has_reason()) {
+    reason = executor->pendingTermination->reason();
   } else {
     reason = TaskStatus::REASON_EXECUTOR_TERMINATED;
   }
@@ -6923,16 +6936,29 @@ void Slave::sendExecutorTerminatedStatusUpdate(
     message = strings::join("; ", messages);
   }
 
-  statusUpdate(protobuf::createStatusUpdate(
-      frameworkId,
-      info.id(),
-      taskId,
-      state,
-      TaskStatus::SOURCE_SLAVE,
-      UUID::random(),
-      message,
-      reason,
-      executor->id),
+  Option<Resources> limitedResources;
+
+  if (haveTermination && !termination->get().limited_resources().empty()) {
+    limitedResources = termination->get().limited_resources();
+  }
+
+  statusUpdate(
+      protobuf::createStatusUpdate(
+          frameworkId,
+          info.id(),
+          taskId,
+          state,
+          TaskStatus::SOURCE_SLAVE,
+          UUID::random(),
+          message,
+          reason,
+          executor->id,
+          None(),
+          None(),
+          None(),
+          None(),
+          None(),
+          limitedResources),
       UPID());
 }
 
@@ -7274,20 +7300,55 @@ Executor* Framework::addExecutor(const ExecutorInfo& executorInfo)
           executorId);
     };
 
-  // Attach the "latest" symlink. This allows for frameworks to
-  // easily construct paths to the sandbox directory for a given task
-  // without having to know the container id.
-  string latestPath = paths::getExecutorLatestRunPath(
+  // We expose the executor's sandbox in the /files endpoints
+  // via the following paths:
+  //
+  //  (1) /agent_workdir/frameworks/FID/executors/EID/runs/CID
+  //  (2) /agent_workdir/frameworks/FID/executors/EID/runs/latest
+  //  (3) /frameworks/FID/executors/EID/runs/latest
+  //
+  // Originally we just exposed the real path (1) and later
+  // exposed the 'latest' symlink (2) since it's not easy for
+  // users to know the run's container ID. We deprecated
+  // (1) and (2) by exposing a virtual path (3) since we do not
+  // want to expose the agent's work directory and it's not
+  // something users care about in this context.
+  //
+  // TODO(zhitao): Remove (1) and (2) per MESOS-7960 once we
+  // pass 2.0. They remain now for backwards compatibility.
+  const string latestPath = paths::getExecutorLatestRunPath(
       slave->flags.work_dir,
       slave->info.id(),
       id(),
       executorInfo.executor_id());
 
+  const string virtualLatestPath = paths::getExecutorVirtualPath(
+      id(),
+      executorInfo.executor_id());
+
   slave->files->attach(executor->directory, latestPath, authorize)
-    .onAny(defer(slave, &Slave::fileAttached, lambda::_1, executor->directory));
+    .onAny(defer(
+        slave,
+        &Slave::fileAttached,
+        lambda::_1,
+        executor->directory,
+        latestPath));
+
+  slave->files->attach(executor->directory, virtualLatestPath, authorize)
+    .onAny(defer(
+        slave,
+        &Slave::fileAttached,
+        lambda::_1,
+        executor->directory,
+        virtualLatestPath));
 
   slave->files->attach(executor->directory, executor->directory, authorize)
-    .onAny(defer(slave, &Slave::fileAttached, lambda::_1, executor->directory));
+    .onAny(defer(
+        slave,
+        &Slave::fileAttached,
+        lambda::_1,
+        executor->directory,
+        executor->directory));
 
   return executor;
 }
@@ -7447,21 +7508,56 @@ void Framework::recoverExecutor(
           executorId);
     };
 
-  // Attach the "latest" symlink. This allows for frameworks to
-  // easily construct paths to the sandbox directory for a given task
-  // without having to know the container id.
-  string latestPath = paths::getExecutorLatestRunPath(
+  // We expose the executor's sandbox in the /files endpoints
+  // via the following paths:
+  //
+  //  (1) /agent_workdir/frameworks/FID/executors/EID/runs/CID
+  //  (2) /agent_workdir/frameworks/FID/executors/EID/runs/latest
+  //  (3) /frameworks/FID/executors/EID/runs/latest
+  //
+  // Originally we just exposed the real path (1) and later
+  // exposed the 'latest' symlink (2) since it's not easy for
+  // users to know the run's container ID. We deprecated
+  // (1) and (2) by exposing a virtual path (3) since we do not
+  // want to expose the agent's work directory and it's not
+  // something users care about in this context.
+  //
+  // TODO(zhitao): Remove (1) and (2) per MESOS-7960 once we
+  // pass 2.0. They remain now for backwards compatibility.
+  const string latestPath = paths::getExecutorLatestRunPath(
       slave->flags.work_dir,
       slave->info.id(),
       id(),
       state.id);
 
+  const string virtualLatestPath = paths::getExecutorVirtualPath(
+      id(),
+      state.id);
+
   slave->files->attach(executor->directory, latestPath, authorize)
-    .onAny(defer(slave, &Slave::fileAttached, lambda::_1, executor->directory));
+    .onAny(defer(
+        slave,
+        &Slave::fileAttached,
+        lambda::_1,
+        executor->directory,
+        latestPath));
+
+  slave->files->attach(executor->directory, virtualLatestPath, authorize)
+    .onAny(defer(
+        slave,
+        &Slave::fileAttached,
+        lambda::_1,
+        executor->directory,
+        virtualLatestPath));
 
   // Expose the executor's files.
   slave->files->attach(executor->directory, executor->directory, authorize)
-    .onAny(defer(slave, &Slave::fileAttached, lambda::_1, executor->directory));
+    .onAny(defer(
+        slave,
+        &Slave::fileAttached,
+        lambda::_1,
+        executor->directory,
+        executor->directory));
 
   // Add the executor to the framework.
   executors[executor->id] = executor;

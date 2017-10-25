@@ -217,7 +217,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
   UPID frameworkPid = subscribeMessage->from;
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   SlaveID slaveId = offers.get()[0].slave_id();
 
@@ -252,7 +252,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
 
   // Capture the update.
   AWAIT_READY(update);
-  EXPECT_EQ(TASK_RUNNING, update->update().status().state());
+  EXPECT_EQ(TASK_STARTING, update->update().status().state());
 
   // Wait for the ACK to be checkpointed.
   AWAIT_READY(_statusUpdateAcknowledgement);
@@ -314,7 +314,9 @@ TYPED_TEST(SlaveRecoveryTest, RecoverSlaveState)
         .info);
 
   // Check status update and ack.
-  ASSERT_EQ(
+  // (the number might be bigger than 1 because we might have
+  // received any number of additional TASK_RUNNING updates)
+  ASSERT_LE(
       1U,
       state
         .frameworks[frameworkId]
@@ -388,7 +390,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
@@ -423,7 +425,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverStatusUpdateManager)
   ASSERT_SOME(slave);
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   driver.stop();
   driver.join();
@@ -475,7 +477,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the HTTP based command executor.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
@@ -514,7 +516,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ReconnectHTTPExecutor)
 
   // Scheduler should receive the recovered update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   driver.stop();
   driver.join();
@@ -608,7 +610,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_ROOT_CGROUPS_ReconnectDefaultExecutor)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const SlaveID slaveId = devolve(offer.agent_id());
@@ -757,18 +759,18 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   // Drop the first update from the executor.
-  Future<StatusUpdateMessage> statusUpdate =
+  Future<StatusUpdateMessage> startingUpdate =
     DROP_PROTOBUF(StatusUpdateMessage(), _, _);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   // Stop the slave before the status update is received.
-  AWAIT_READY(statusUpdate);
+  AWAIT_READY(startingUpdate);
 
   slave.get()->terminate();
 
@@ -791,15 +793,15 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutor)
   // Ensure the executor re-registers.
   AWAIT_READY(reregister);
 
-  // Executor should inform about the unacknowledged update.
-  ASSERT_EQ(1, reregister->updates_size());
+  // Executor should inform about the unacknowledged updates.
+  ASSERT_LE(1, reregister->updates_size());
   const StatusUpdate& update = reregister->updates(0);
   EXPECT_EQ(task.task_id(), update.status().task_id());
-  EXPECT_EQ(TASK_RUNNING, update.status().state());
+  EXPECT_EQ(TASK_STARTING, update.status().state());
 
   // Scheduler should receive the recovered update.
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   driver.stop();
   driver.join();
@@ -846,12 +848,13 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutorRetry)
 
   Future<TaskStatus> statusUpdate;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&statusUpdate));
+    .WillOnce(FutureArg<1>(&statusUpdate))
+    .WillRepeatedly(Return()); // Ignore subsequent TASK_RUNNING updates.
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
@@ -863,7 +866,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconnectExecutorRetry)
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(statusUpdate);
-  EXPECT_EQ(TASK_RUNNING, statusUpdate->state());
+  EXPECT_EQ(TASK_STARTING, statusUpdate->state());
 
   // Ensure the acknowledgement is checkpointed.
   Clock::settle();
@@ -970,15 +973,22 @@ TYPED_TEST(SlaveRecoveryTest, PingTimeoutDuringRecovery)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
+  Future<TaskStatus> statusUpdate0;
   Future<TaskStatus> statusUpdate1;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusUpdate0))
     .WillOnce(FutureArg<1>(&statusUpdate1));
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(statusUpdate0);
+  ASSERT_EQ(TASK_STARTING, statusUpdate0->state());
+
+  driver.acknowledgeStatusUpdate(statusUpdate0.get());
 
   AWAIT_READY(statusUpdate1);
   ASSERT_EQ(TASK_RUNNING, statusUpdate1->state());
@@ -1111,7 +1121,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoverUnregisteredHTTPExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -1223,7 +1233,7 @@ TYPED_TEST(SlaveRecoveryTest, RecoverUnregisteredExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -1337,7 +1347,7 @@ TYPED_TEST(SlaveRecoveryTest, KillQueuedTaskDuringExecutorRegistration)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -1442,16 +1452,18 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedHTTPExecutor)
 
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillOnce(FutureArg<1>(&offers1));
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillRepeatedly(Return()); // Allow any number of subsequent status updates.
 
   Future<Nothing> ack =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
@@ -1583,37 +1595,55 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
 
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(_, _))
-    .WillOnce(FutureArg<1>(&offers1));
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
   Future<Message> registerExecutor =
     FUTURE_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
 
-  Future<Nothing> ack =
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillRepeatedly(Return()); // Ignore subsequent status updates.
+
+  Future<Nothing> ackRunning =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+  Future<Nothing> ackStarting =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
+
+  // Wait for the TASK_STARTING update from the executor
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  // Wait for the TASK_RUNNING update from the executor
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   // Capture the executor pid.
   AWAIT_READY(registerExecutor);
   UPID executorPid = registerExecutor->from;
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ackStarting);
+  AWAIT_READY(ackRunning);
 
   slave.get()->terminate();
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusLost;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status))
+    .WillOnce(FutureArg<1>(&statusLost))
     .WillRepeatedly(Return()); // Ignore subsequent status updates.
 
   // Now shut down the executor, when the slave is down.
@@ -1644,18 +1674,18 @@ TYPED_TEST(SlaveRecoveryTest, RecoverTerminatedExecutor)
   Clock::advance(flags.executor_reregistration_timeout);
 
   // Now advance time until the reaper reaps the executor.
-  while (status.isPending()) {
+  while (statusLost.isPending()) {
     Clock::advance(process::MAX_REAP_INTERVAL());
     Clock::settle();
   }
 
   // Scheduler should receive the TASK_LOST update.
-  AWAIT_READY(status);
+  AWAIT_READY(statusLost);
 
-  EXPECT_EQ(TASK_LOST, status->state());
-  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status->source());
+  EXPECT_EQ(TASK_LOST, statusLost->state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, statusLost->source());
   EXPECT_EQ(TaskStatus::REASON_EXECUTOR_REREGISTRATION_TIMEOUT,
-            status->reason());
+            statusLost->reason());
 
   while (offers2.isPending()) {
     Clock::advance(Seconds(1));
@@ -1719,7 +1749,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_RecoveryTimeout)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
@@ -1811,12 +1841,12 @@ TYPED_TEST(SlaveRecoveryTest, RecoverCompletedExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "exit 0");
 
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .Times(2); // TASK_RUNNING and TASK_FINISHED updates.
+    .Times(3); // TASK_STARTING, TASK_RUNNING and TASK_FINISHED updates.
 
   EXPECT_CALL(sched, offerRescinded(_, _))
     .Times(AtMost(1));
@@ -1905,7 +1935,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_CleanupHTTPExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the HTTP based command executor.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
@@ -2006,19 +2036,26 @@ TYPED_TEST(SlaveRecoveryTest, CleanupExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expect TASK_STARTING and TASK_RUNNING updates
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2)
+    .WillRepeatedly(Return()); // Ignore subsequent updates
 
-  Future<Nothing> ack =
+  Future<Nothing> ackRunning =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ackStarting =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ackStarting);
+  AWAIT_READY(ackRunning);
 
   slave.get()->terminate();
 
@@ -2107,7 +2144,7 @@ TYPED_TEST(SlaveRecoveryTest, RemoveNonCheckpointingFramework)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch 2 tasks from this offer.
   vector<TaskInfo> tasks;
@@ -2129,17 +2166,23 @@ TYPED_TEST(SlaveRecoveryTest, RemoveNonCheckpointingFramework)
         Resources(offer1.resources()) +
         Resources(offer2.resources())));
 
+  Future<Nothing> update0;
   Future<Nothing> update1;
   Future<Nothing> update2;
+  Future<Nothing> update3;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureSatisfy(&update0))
     .WillOnce(FutureSatisfy(&update1))
-    .WillOnce(FutureSatisfy(&update2));
+    .WillOnce(FutureSatisfy(&update2))
+    .WillOnce(FutureSatisfy(&update3));
 
   driver.launchTasks(offers.get()[0].id(), tasks);
 
-  // Wait for TASK_RUNNING updates from the tasks.
+  // Wait for TASK_STARTING and TASK_RUNNING updates from the tasks.
+  AWAIT_READY(update0);
   AWAIT_READY(update1);
   AWAIT_READY(update2);
+  AWAIT_READY(update3);
 
   // The master should generate TASK_LOST updates once the slave is stopped.
   Future<TaskStatus> status1;
@@ -2222,7 +2265,7 @@ TYPED_TEST(SlaveRecoveryTest, NonCheckpointingFramework)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
@@ -2320,7 +2363,7 @@ TYPED_TEST(SlaveRecoveryTest, DISABLED_KillTaskWithHTTPExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -2435,19 +2478,25 @@ TYPED_TEST(SlaveRecoveryTest, KillTask)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expect a TASK_STARTING and a TASK_RUNNING update
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> ack =
+  Future<Nothing> ack1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> ack2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(ack);
+  AWAIT_READY(ack1);
+  AWAIT_READY(ack2);
 
   slave.get()->terminate();
 
@@ -2553,7 +2602,7 @@ TYPED_TEST(SlaveRecoveryTest, Reboot)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -2927,7 +2976,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -3024,7 +3073,7 @@ TYPED_TEST(SlaveRecoveryTest, GCExecutor)
 
 
 // The slave is asked to shutdown. When it comes back up, it should
-// register as a new slave.
+// re-register as the same agent.
 TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 {
   Try<Owned<cluster::Master>> master = this->StartMaster();
@@ -3064,13 +3113,14 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
 
   AWAIT_READY(offers1);
 
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
-  Future<Nothing> statusUpdate1;
+  Future<Nothing> statusUpdate1, statusUpdate2;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureSatisfy(&statusUpdate1))
+    .WillOnce(FutureSatisfy(&statusUpdate1)) // TASK_STARTING
+    .WillOnce(FutureSatisfy(&statusUpdate2)) // TASK_RUNNING
     .WillOnce(Return());  // Ignore TASK_FAILED update.
 
   Future<Message> registerExecutor =
@@ -3082,7 +3132,7 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
   AWAIT_READY(registerExecutor);
   UPID executorPid = registerExecutor->from;
 
-  AWAIT_READY(statusUpdate1); // Wait for TASK_RUNNING update.
+  AWAIT_READY(statusUpdate2); // Wait for TASK_RUNNING update.
 
   EXPECT_CALL(sched, offerRescinded(_, _))
     .Times(AtMost(1));
@@ -3129,13 +3179,13 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlave)
   // Ensure that the slave registered with a new id.
   AWAIT_READY(offers3);
 
-  EXPECT_FALSE(offers3->empty());
+  ASSERT_FALSE(offers3->empty());
   // Make sure all slave resources are reoffered.
   EXPECT_EQ(Resources(offers1.get()[0].resources()),
             Resources(offers3.get()[0].resources()));
 
-  // Ensure the slave id is different.
-  EXPECT_NE(
+  // Ensure the slave id is same.
+  EXPECT_EQ(
       offers1.get()[0].slave_id().value(), offers3.get()[0].slave_id().value());
 
   driver.stop();
@@ -3182,22 +3232,26 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
 
   AWAIT_READY(offers);
 
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusStarting, statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
-  Future<TaskStatus> status2;
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  Future<TaskStatus> statusLost;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status2));
+    .WillOnce(FutureArg<1>(&statusLost));
 
   Future<Nothing> slaveLost;
   EXPECT_CALL(sched, slaveLost(_, _))
@@ -3223,11 +3277,11 @@ TYPED_TEST(SlaveRecoveryTest, ShutdownSlaveSIGUSR1)
   AWAIT_READY(executorTerminated);
 
   // The master should send a TASK_LOST and slaveLost.
-  AWAIT_READY(status2);
+  AWAIT_READY(statusLost);
 
-  EXPECT_EQ(TASK_LOST, status2->state());
-  EXPECT_EQ(TaskStatus::SOURCE_MASTER, status2->source());
-  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, status2->reason());
+  EXPECT_EQ(TASK_LOST, statusLost->state());
+  EXPECT_EQ(TaskStatus::SOURCE_MASTER, statusLost->source());
+  EXPECT_EQ(TaskStatus::REASON_SLAVE_REMOVED, statusLost->reason());
 
   AWAIT_READY(slaveLost);
 
@@ -3300,16 +3354,28 @@ TYPED_TEST(SlaveRecoveryTest, RegisterDisconnectedSlave)
   Future<Message> registerExecutorMessage =
     FUTURE_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
+  Future<Nothing> startingStatus;
   Future<Nothing> runningStatus;
   EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureSatisfy(&startingStatus))
     .WillOnce(FutureSatisfy(&runningStatus));
+
+  Future<Nothing> startingAck =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+  Future<Nothing> runningAck =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
   AWAIT_READY(registerExecutorMessage);
 
-  // Wait for TASK_RUNNING update.
+  // Wait for the acknowledgement of the TASK_RUNNING update
+  // to make sure the next sent status update is not a repeat
+  // of the unacknowledged TASK_RUNNING.
+  AWAIT_READY(startingStatus);
+  AWAIT_READY(startingAck);
   AWAIT_READY(runningStatus);
+  AWAIT_READY(runningAck);
 
   EXPECT_CALL(sched, slaveLost(_, _))
     .Times(AtMost(1));
@@ -3407,7 +3473,7 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
@@ -3415,16 +3481,21 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileKillTask)
   SlaveID slaveId = offers1.get()[0].slave_id();
   FrameworkID frameworkId = offers1.get()[0].framework_id();
 
-  // Expecting TASK_RUNNING status.
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expecting TASK_STARTING and TASK_RUNNING status.
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for TASK_RUNNING update to be acknowledged.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3508,23 +3579,29 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileShutdownFramework)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Capture the framework id.
   FrameworkID frameworkId = offers.get()[0].framework_id();
 
-  // Expecting TASK_RUNNING status.
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  // Expecting a TASK_STARTING and a TASK_RUNNING status.
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2)
+    .WillRepeatedly(Return());
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  // Wait for TASK_RUNNING update to be acknowledged.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  // Wait for the updates to be acknowledged.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3654,22 +3731,37 @@ TYPED_TEST(SlaveRecoveryTest, ReconcileTasksMissingFromSlave)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   // Start a task on the slave so that the master has knowledge of it.
   // We'll ensure the slave does not have this task when it
   // re-registers by wiping the relevant meta directory.
   TaskInfo task = createTask(offers1.get()[0], "sleep 10");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  Future<TaskStatus> starting;
+  Future<TaskStatus> running;
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .WillOnce(FutureArg<1>(&starting))
+    .WillOnce(FutureArg<1>(&running))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> startingAck =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> runningAck =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  AWAIT_READY(starting);
+  AWAIT_READY(startingAck);
+
+  AWAIT_READY(running);
+  AWAIT_READY(runningAck);
+
+  EXPECT_EQ(TASK_STARTING, starting->state());
+  EXPECT_EQ(TASK_RUNNING, running->state());
 
   EXPECT_CALL(allocator, deactivateSlave(_));
 
@@ -3819,20 +3911,26 @@ TYPED_TEST(SlaveRecoveryTest, SchedulerFailover)
 
   AWAIT_READY(frameworkId);
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   // Create a long running task.
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched1, statusUpdate(_, _));
+  // Expecting TASK_STARTING and TASK_RUNNING updates
+  EXPECT_CALL(sched1, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver1.launchTasks(offers1.get()[0].id(), {task});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -3971,19 +4069,24 @@ TYPED_TEST(SlaveRecoveryTest, MasterFailover)
 
   AWAIT_READY(frameworkRegisteredMessage);
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   TaskInfo task = createTask(offers1.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2); // TASK_STARTING and TASK_RUNNING
 
-  Future<Nothing> _statusUpdateAcknowledgement =
+  Future<Nothing> _statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _statusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task});
 
-  // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  // Wait for both ACKs to be checkpointed.
+  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_statusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -4106,7 +4209,7 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
   driver1.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   // Use part of the resources in the offer so that the rest can be
   // offered to framework 2.
@@ -4117,15 +4220,20 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
   // Framework 1 launches a task.
   TaskInfo task1 = createTask(offer1, "sleep 1000");
 
-  EXPECT_CALL(sched1, statusUpdate(_, _));
+  EXPECT_CALL(sched1, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement1 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement1 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
 
   driver1.launchTasks(offer1.id(), {task1});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement1);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement1);
 
   // Framework 2. Enable checkpointing.
   FrameworkInfo frameworkInfo2 = DEFAULT_FRAMEWORK_INFO;
@@ -4145,19 +4253,25 @@ TYPED_TEST(SlaveRecoveryTest, MultipleFrameworks)
   driver2.start();
 
   AWAIT_READY(offers2);
-  EXPECT_FALSE(offers2->empty());
+  ASSERT_FALSE(offers2->empty());
 
   // Framework 2 launches a task.
   TaskInfo task2 = createTask(offers2.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched2, statusUpdate(_, _));
+  EXPECT_CALL(sched2, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement2 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(_, &Slave::_statusUpdateAcknowledgement);
+
   driver2.launchTasks(offers2.get()[0].id(), {task2});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement2);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement2);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement2);
 
   slave.get()->terminate();
 
@@ -4281,15 +4395,20 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   // Launch a long running task in the first slave.
   TaskInfo task1 = createTask(offers1.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement1 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(slave1.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement1 =
     FUTURE_DISPATCH(slave1.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers1.get()[0].id(), {task1});
 
   // Wait for the ACK to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement1);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement1);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement1);
 
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
@@ -4316,15 +4435,20 @@ TYPED_TEST(SlaveRecoveryTest, MultipleSlaves)
   // Launch a long running task in each slave.
   TaskInfo task2 = createTask(offers2.get()[0], "sleep 1000");
 
-  EXPECT_CALL(sched, statusUpdate(_, _));
+  EXPECT_CALL(sched, statusUpdate(_, _))
+    .Times(2);
 
-  Future<Nothing> _statusUpdateAcknowledgement2 =
+  Future<Nothing> _startingStatusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(slave2.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> _runningStatusUpdateAcknowledgement2 =
     FUTURE_DISPATCH(slave2.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers2.get()[0].id(), {task2});
 
   // Wait for the ACKs to be checkpointed.
-  AWAIT_READY(_statusUpdateAcknowledgement2);
+  AWAIT_READY(_startingStatusUpdateAcknowledgement2);
+  AWAIT_READY(_runningStatusUpdateAcknowledgement2);
 
   slave1.get()->terminate();
   slave2.get()->terminate();
@@ -4439,7 +4563,7 @@ TYPED_TEST(SlaveRecoveryTest, RestartBeforeContainerizerLaunch)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
@@ -4541,7 +4665,7 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, ResourceStatistics)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
 
@@ -4646,7 +4770,7 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceForward)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   SlaveID slaveId = offers1.get()[0].slave_id();
 
@@ -4750,7 +4874,7 @@ TEST_F(MesosContainerizerSlaveRecoveryTest, CGROUPS_ROOT_PidNamespaceBackward)
   driver.start();
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->empty());
+  ASSERT_FALSE(offers1->empty());
 
   SlaveID slaveId = offers1.get()[0].slave_id();
 

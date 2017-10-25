@@ -228,6 +228,12 @@ Option<Error> validate(
         return Error("Expecting 'teardown' to be present");
       }
       return None();
+
+    case mesos::master::Call::MARK_AGENT_GONE:
+      if (!call.has_mark_agent_gone()) {
+        return Error("Expecting 'mark_agent_gone' to be present");
+      }
+      return None();
   }
 
   UNREACHABLE();
@@ -888,7 +894,7 @@ Option<Error> validateCompatibleExecutorInfo(
   if (executorInfo.isSome() && executor != executorInfo.get()) {
     return Error(
         "ExecutorInfo is not compatible with existing ExecutorInfo"
-        " with same ExecutorID).\n"
+        " with same ExecutorID.\n"
         "------------------------------------------------------------\n"
         "Existing ExecutorInfo:\n" +
         stringify(executorInfo.get()) + "\n"

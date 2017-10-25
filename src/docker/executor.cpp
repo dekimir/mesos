@@ -159,6 +159,14 @@ public:
 
     LOG(INFO) << "Starting task " << taskId.get();
 
+    // Send initial TASK_STARTING update.
+    // TODO(alexr): Use `protobuf::createTaskStatus()`
+    // instead of manually setting fields.
+    TaskStatus starting;
+    starting.mutable_task_id()->CopyFrom(task.task_id());
+    starting.set_state(TASK_STARTING);
+    driver->sendStatusUpdate(starting);
+
     CHECK(task.has_container());
     CHECK(task.has_command());
 
@@ -185,6 +193,8 @@ public:
       status.set_state(TASK_FAILED);
       status.set_message(
         "Failed to create docker run options: " + runOptions.error());
+
+      LOG(ERROR) << status.message();
 
       driver->sendStatusUpdate(status);
 
@@ -533,6 +543,8 @@ private:
       message = "Container " + WSTRINGIFY(status);
     }
 
+    LOG(INFO) << message;
+
     CHECK_SOME(taskId);
 
     // TODO(alexr): Use `protobuf::createTaskStatus()`
@@ -787,8 +799,6 @@ int main(int argc, char** argv)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-  process::initialize();
-
   mesos::internal::docker::Flags flags;
 
   // Load flags from environment and command line.
@@ -804,7 +814,7 @@ int main(int argc, char** argv)
     return EXIT_FAILURE;
   }
 
-  mesos::internal::logging::initialize(argv[0], flags, true); // Catch signals.
+  mesos::internal::logging::initialize(argv[0], true, flags); // Catch signals.
 
   // Log any flag warnings (after logging is initialized).
   foreach (const flags::Warning& warning, load->warnings) {
@@ -902,6 +912,8 @@ int main(int argc, char** argv)
   if (flags.launcher_dir.isNone()) {
     EXIT(EXIT_FAILURE) << flags.usage("Missing required option --launcher_dir");
   }
+
+  process::initialize();
 
   // The 2nd argument for docker create is set to false so we skip
   // validation when creating a docker abstraction, as the slave

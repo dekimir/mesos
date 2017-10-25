@@ -195,7 +195,7 @@ Operators can either specify the flag as an absolute path pointing to
 the docker config file (need to manually configure
 `.docker/config.json` or `.dockercfg` on each agent), or specify the
 flag as a JSON-formatted string. See [configuration
-documentation](configuration.md) for detail. For example:
+documentation](configuration/agent.md) for detail. For example:
 
     --docker_config=file:///home/vagrant/.docker/config.json
 
@@ -236,7 +236,7 @@ user is not specified, `root` will be used by default. The operator or
 the framework can limit the
 [capabilities](http://man7.org/linux/man-pages/man7/capabilities.7.html)
 of the container by using the
-[linux/capabilities](linux_capabilities.md) isolator.
+[linux/capabilities](isolators/linux-capabilities.md) isolator.
 
 Currently, we support `host`, `bridge` and user defined networks
 ([reference](https://docs.docker.com/engine/userguide/networking/)).

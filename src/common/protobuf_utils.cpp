@@ -110,7 +110,8 @@ StatusUpdate createStatusUpdate(
     const Option<CheckStatusInfo>& checkStatus,
     const Option<Labels>& labels,
     const Option<ContainerStatus>& containerStatus,
-    const Option<TimeInfo>& unreachableTime)
+    const Option<TimeInfo>& unreachableTime,
+    const Option<Resources>& limitedResources)
 {
   StatusUpdate update;
 
@@ -166,6 +167,20 @@ StatusUpdate createStatusUpdate(
 
   if (unreachableTime.isSome()) {
     status->mutable_unreachable_time()->CopyFrom(unreachableTime.get());
+  }
+
+  if (limitedResources.isSome()) {
+    // Check that we are only sending the `Limitation` field when the
+    // reason is a container limitation.
+    CHECK_SOME(reason);
+    CHECK(
+        reason.get() == TaskStatus::REASON_CONTAINER_LIMITATION ||
+        reason.get() == TaskStatus::REASON_CONTAINER_LIMITATION_DISK ||
+        reason.get() == TaskStatus::REASON_CONTAINER_LIMITATION_MEMORY)
+      << reason.get();
+
+    status->mutable_limitation()->mutable_resources()->CopyFrom(
+        limitedResources.get());
   }
 
   return update;
@@ -439,15 +454,25 @@ void injectAllocationInfo(
     Offer::Operation* operation,
     const Resource::AllocationInfo& allocationInfo)
 {
-  auto inject = [](
-      RepeatedPtrField<Resource>* resources,
-      const Resource::AllocationInfo& allocationInfo) {
-    foreach (Resource& resource, *resources) {
+  struct Injector
+  {
+    void operator()(
+        Resource& resource, const Resource::AllocationInfo& allocationInfo)
+    {
       if (!resource.has_allocation_info()) {
         resource.mutable_allocation_info()->CopyFrom(allocationInfo);
       }
     }
-  };
+
+    void operator()(
+        RepeatedPtrField<Resource>* resources,
+        const Resource::AllocationInfo& allocationInfo)
+    {
+      foreach (Resource& resource, *resources) {
+        operator()(resource, allocationInfo);
+      }
+    }
+  } inject;
 
   switch (operation->type()) {
     case Offer::Operation::LAUNCH: {
@@ -521,6 +546,38 @@ void injectAllocationInfo(
       break;
     }
 
+    case Offer::Operation::CREATE_VOLUME: {
+      inject(
+          *operation->mutable_create_volume()->mutable_source(),
+          allocationInfo);
+
+      break;
+    }
+
+    case Offer::Operation::DESTROY_VOLUME: {
+      inject(
+          *operation->mutable_destroy_volume()->mutable_volume(),
+          allocationInfo);
+
+      break;
+    }
+
+    case Offer::Operation::CREATE_BLOCK: {
+      inject(
+          *operation->mutable_create_block()->mutable_source(),
+          allocationInfo);
+
+      break;
+    }
+
+    case Offer::Operation::DESTROY_BLOCK: {
+      inject(
+          *operation->mutable_destroy_block()->mutable_block(),
+          allocationInfo);
+
+      break;
+    }
+
     case Offer::Operation::UNKNOWN:
       break; // No-op.
   }
@@ -529,13 +586,22 @@ void injectAllocationInfo(
 
 void stripAllocationInfo(Offer::Operation* operation)
 {
-  auto strip = [](RepeatedPtrField<Resource>* resources) {
-    foreach (Resource& resource, *resources) {
+  struct Stripper
+  {
+    void operator()(Resource& resource)
+    {
       if (resource.has_allocation_info()) {
         resource.clear_allocation_info();
       }
     }
-  };
+
+    void operator()(RepeatedPtrField<Resource>* resources)
+    {
+      foreach (Resource& resource, *resources) {
+        operator()(resource);
+      }
+    }
+  } strip;
 
   switch (operation->type()) {
     case Offer::Operation::LAUNCH: {
@@ -591,6 +657,30 @@ void stripAllocationInfo(Offer::Operation* operation)
 
     case Offer::Operation::DESTROY: {
       strip(operation->mutable_destroy()->mutable_volumes());
+
+      break;
+    }
+
+    case Offer::Operation::CREATE_VOLUME: {
+      strip(*operation->mutable_create_volume()->mutable_source());
+
+      break;
+    }
+
+    case Offer::Operation::DESTROY_VOLUME: {
+      strip(*operation->mutable_destroy_volume()->mutable_volume());
+
+      break;
+    }
+
+    case Offer::Operation::CREATE_BLOCK: {
+      strip(*operation->mutable_create_block()->mutable_source());
+
+      break;
+    }
+
+    case Offer::Operation::DESTROY_BLOCK: {
+      strip(*operation->mutable_destroy_block()->mutable_block());
 
       break;
     }

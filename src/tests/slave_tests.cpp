@@ -69,6 +69,7 @@
 #include "slave/gc_process.hpp"
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
+#include "slave/paths.hpp"
 
 #include "slave/containerizer/fetcher.hpp"
 #include "slave/containerizer/fetcher_process.hpp"
@@ -246,7 +247,7 @@ TEST_F(SlaveTest, DuplicateTerminalUpdateBeforeAck)
   Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   ExecutorDriver* execDriver;
   EXPECT_CALL(exec, registered(_, _, _, _))
@@ -360,7 +361,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ShutdownUnregisteredExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the command executor.
   TaskInfo task;
@@ -476,7 +477,7 @@ TEST_F(SlaveTest, ExecutorTimeoutCausedBySlowFetch)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the command executor.
   // The task uses a URI that needs to be fetched by the HDFS client
@@ -575,7 +576,7 @@ TEST_F(SlaveTest, RemoveUnregisteredTerminatedExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -661,7 +662,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, CommandTaskWithArguments)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the command executor.
   TaskInfo task;
@@ -679,16 +680,22 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, CommandTaskWithArguments)
 
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  // Scheduler should first receive TASK_RUNNING followed by the
-  // TASK_FINISHED from the executor.
+  // Scheduler should first receive TASK_STARTING, followed by
+  // TASK_RUNNING and TASK_FINISHED from the executor.
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusStarting->source());
+
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
   EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusRunning->source());
@@ -727,7 +734,7 @@ TEST_F(SlaveTest, CommandTaskWithKillPolicy)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   TaskInfo task;
@@ -745,11 +752,16 @@ TEST_F(SlaveTest, CommandTaskWithKillPolicy)
   task.mutable_kill_policy()->mutable_grace_period()->set_nanoseconds(
       gracePeriod.ns());
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning));
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
 
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
@@ -1025,7 +1037,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the command executor.
   TaskInfo task;
@@ -1050,16 +1062,22 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(
 
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  // Scheduler should first receive TASK_RUNNING followed by the
-  // TASK_FINISHED from the executor.
+  // Scheduler should first receive TASK_STARTING followed by
+  // TASK_RUNNING and TASK_FINISHED from the executor.
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusStarting->source());
+
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
   EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusRunning->source());
@@ -1129,7 +1147,7 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // HACK: Launch a prepare task as root to prepare the binaries.
   // This task creates the lt-mesos-executor binary in the build dir.
@@ -1181,7 +1199,7 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the command executor.
   TaskInfo task;
@@ -1257,7 +1275,7 @@ TEST_F(SlaveTest, IgnoreNonLeaderStatusUpdateAcknowledgement)
   const UPID schedulerPid = frameworkRegisteredMessage->to;
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
 
@@ -1434,7 +1452,7 @@ TEST_F(SlaveTest, MetricsSlaveLaunchErrors)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   const Offer offer = offers.get()[0];
 
   // Verify that we start with no launch failures.
@@ -1614,7 +1632,7 @@ TEST_F(SlaveTest, StateEndpoint)
   Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Resources executorResources = Resources::parse("cpus:0.1;mem:32").get();
   executorResources.allocate("*");
@@ -1771,7 +1789,7 @@ TEST_F(SlaveTest, GetStateTaskGroupPending)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const SlaveID slaveId = devolve(offer.agent_id());
@@ -2092,7 +2110,7 @@ TEST_F(SlaveTest, HTTPExecutorBadAuthentication)
   executorInfo.mutable_framework_id()->CopyFrom(frameworkId);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   Future<v1::executor::Mesos*> executorLib;
   EXPECT_CALL(*executor, connected(_))
@@ -2264,7 +2282,7 @@ TEST_F(SlaveTest, StatisticsEndpointMissingStatistics)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2370,7 +2388,7 @@ TEST_F(SlaveTest, StatisticsEndpointRunningExecutor)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -2380,15 +2398,21 @@ TEST_F(SlaveTest, StatisticsEndpointRunningExecutor)
       Resources::parse("cpus:1;mem:32").get(),
       SLEEP_COMMAND(1000));
 
-  Future<TaskStatus> status;
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&status));
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning));
 
   driver.launchTasks(offer.id(), {task});
 
-  AWAIT_READY(status);
-  EXPECT_EQ(task.task_id(), status->task_id());
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(task.task_id(), statusStarting->task_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(task.task_id(), statusRunning->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
   // Hit the statistics endpoint and expect the response contains the
   // resource statistics for the running container.
@@ -2447,8 +2471,7 @@ TEST_F(SlaveTest, StatisticsEndpointAuthentication)
           agent.get()->pid,
           statisticsEndpoint);
 
-      AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
-          << response->body;
+      AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
     }
 
     // Incorrectly authenticated requests are rejected.
@@ -2463,8 +2486,7 @@ TEST_F(SlaveTest, StatisticsEndpointAuthentication)
           None(),
           createBasicAuthHeaders(badCredential));
 
-      AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
-          << response->body;
+      AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
     }
 
     // Correctly authenticated requests succeed.
@@ -2475,8 +2497,7 @@ TEST_F(SlaveTest, StatisticsEndpointAuthentication)
           None(),
           createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-      AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-          << response->body;
+      AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
     }
   }
 }
@@ -2933,7 +2954,7 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFailsWithLost)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   // Start two tasks.
@@ -3046,7 +3067,7 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFailsWithGone)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   // Start two tasks.
@@ -4015,7 +4036,7 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -4124,7 +4145,7 @@ TEST_F(SlaveTest, KillMultiplePendingTasks)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_NE(0u, offers->size());
+  ASSERT_FALSE(offers->empty());
 
   // We only pause the clock after receiving the offer since the
   // agent uses a delay to re-register.
@@ -4256,7 +4277,7 @@ TEST_F(SlaveTest, KillQueuedTaskDuringExecutorRegistration)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -4379,7 +4400,7 @@ TEST_F(SlaveTest, KillTaskUnregisteredHTTPExecutor)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const SlaveID slaveId = devolve(offer.agent_id());
@@ -4607,7 +4628,7 @@ TEST_F(SlaveTest, ContainerizerUsageFailure)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   const Offer& offer = offers.get()[0];
 
@@ -4685,7 +4706,7 @@ TEST_F(SlaveTest, DiscoveryInfoAndPorts)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(
       offers.get()[0],
@@ -4794,7 +4815,7 @@ TEST_F(SlaveTest, ExecutorLabels)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -4886,7 +4907,7 @@ TEST_F(SlaveTest, TaskLabels)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task;
   task.set_name("");
@@ -4990,7 +5011,7 @@ TEST_F(SlaveTest, TaskStatusLabels)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(
       offers.get()[0],
@@ -5095,7 +5116,7 @@ TEST_F(SlaveTest, TaskStatusContainerStatus)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(
       offers.get()[0],
@@ -5193,7 +5214,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ExecutorEnvironmentVariables)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with the command executor.
   TaskInfo task;
@@ -5209,16 +5230,21 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ExecutorEnvironmentVariables)
 
   task.mutable_command()->MergeFrom(command);
 
+  Future<TaskStatus> statusStarting;
   Future<TaskStatus> statusRunning;
   Future<TaskStatus> statusFinished;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
     .WillOnce(FutureArg<1>(&statusRunning))
     .WillOnce(FutureArg<1>(&statusFinished));
 
   driver.launchTasks(offers.get()[0].id(), {task});
 
-  // Scheduler should first receive TASK_RUNNING followed by the
-  // TASK_FINISHED from the executor.
+  // Scheduler should first receive TASK_STARTING, followed by
+  // TASK_STARTING and TASK_FINISHED from the executor.
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning->state());
 
@@ -5530,7 +5556,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, HTTPSchedulerSlaveRestart)
     FUTURE_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   SlaveID slaveId = offers.get()[0].slave_id();
 
@@ -5564,7 +5590,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, HTTPSchedulerSlaveRestart)
   UPID executorPid = registerExecutorMessage->from;
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_RUNNING, status->state());
+  EXPECT_EQ(TASK_STARTING, status->state());
 
   // Restart the slave.
   slave.get()->terminate();
@@ -5671,12 +5697,13 @@ TEST_F(SlaveTest, ExecutorShutdownGracePeriod)
 
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
-    .WillOnce(FutureArg<1>(&offers));
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());
 
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
   Offer offer = offers.get()[0];
 
   // Customize executor shutdown grace period to be larger than the
@@ -5842,7 +5869,7 @@ TEST_F(SlaveTest, RunTaskGroup)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
@@ -6765,7 +6792,11 @@ TEST_F(SlaveTest, RunTaskGroupGenerateSecretAfterShutdown)
 // generation is enabled and HTTP executor authentication is not required will
 // be able to re-subscribe successfully when the agent is restarted with
 // required HTTP executor authentication.
-TEST_F(SlaveTest, RestartSlaveRequireExecutorAuthentication)
+//
+// TODO(andschwa): Enable this test after fixing MESOS-7604.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(
+    SlaveTest,
+    RestartSlaveRequireExecutorAuthentication)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -6826,19 +6857,34 @@ TEST_F(SlaveTest, RestartSlaveRequireExecutorAuthentication)
   AWAIT_READY(offers);
   ASSERT_FALSE(offers->offers().empty());
 
-  Future<v1::scheduler::Event::Update> update;
-
-  EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update));
-
   const v1::Offer offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
+
+  Future<v1::scheduler::Event::Update> updateStarting;
+  Future<v1::scheduler::Event::Update> updateRunning;
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(
+      DoAll(
+          FutureArg<1>(&updateStarting),
+          v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillOnce(
+      DoAll(
+          FutureArg<1>(&updateRunning),
+          v1::scheduler::SendAcknowledge(frameworkId, agentId)))
+    .WillRepeatedly(Return()); // Ignore subsequent updates.
 
   v1::Resources resources =
     v1::Resources::parse("cpus:0.1;mem:32;disk:32").get();
 
   // Create a task which should run indefinitely.
-  v1::TaskInfo taskInfo = v1::createTask(agentId, resources, "cat");
+  const string command =
+#ifdef __WINDOWS__
+    "more";
+#else
+    "cat";
+#endif // __WINDOWS__
+  v1::TaskInfo taskInfo = v1::createTask(agentId, resources, command);
 
   v1::TaskGroupInfo taskGroup;
   taskGroup.add_tasks()->CopyFrom(taskInfo);
@@ -6869,28 +6915,15 @@ TEST_F(SlaveTest, RestartSlaveRequireExecutorAuthentication)
     mesos.send(call);
   }
 
-  AWAIT_READY(update);
+  AWAIT_READY(updateStarting);
 
-  ASSERT_EQ(TASK_RUNNING, update->status().state());
-  ASSERT_EQ(taskInfo.task_id(), update->status().task_id());
+  ASSERT_EQ(TASK_STARTING, updateStarting->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateStarting->status().task_id());
 
-  Future<Nothing> _statusUpdateAcknowledgement =
-    FUTURE_DISPATCH(slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+  AWAIT_READY(updateRunning);
 
-  {
-    Call call;
-    call.mutable_framework_id()->CopyFrom(frameworkId);
-    call.set_type(Call::ACKNOWLEDGE);
-
-    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
-    acknowledge->mutable_task_id()->CopyFrom(update->status().task_id());
-    acknowledge->mutable_agent_id()->CopyFrom(offer.agent_id());
-    acknowledge->set_uuid(update->status().uuid());
-
-    mesos.send(call);
-  }
-
-  AWAIT_READY(_statusUpdateAcknowledgement);
+  ASSERT_EQ(TASK_RUNNING, updateRunning->status().state());
+  ASSERT_EQ(taskInfo.task_id(), updateRunning->status().task_id());
 
   // Restart the agent.
   slave.get()->terminate();
@@ -7008,7 +7041,7 @@ TEST_F(SlaveTest, KillTaskGroupBetweenRunTaskParts)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .Times(0);
@@ -7206,7 +7239,7 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, DefaultExecutorCommandInfo)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   Future<ContainerConfig> containerConfig;
   EXPECT_CALL(containerizer, launch(_, _, _, _))
@@ -7321,7 +7354,7 @@ TEST_F(SlaveTest, KillQueuedTaskGroup)
   executorInfo.mutable_framework_id()->CopyFrom(devolve(frameworkId));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   Future<v1::executor::Mesos*> executorLibrary;
   EXPECT_CALL(*executor, connected(_))
@@ -7639,7 +7672,7 @@ TEST_F(SlaveTest, ShutdownV0ExecutorIfItReregistersWithoutReconnect)
   Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   EXPECT_CALL(exec, registered(_, _, _, _));
 
@@ -7742,7 +7775,7 @@ TEST_F(SlaveTest, IgnoreV0ExecutorIfItReregistersWithoutReconnect)
   Clock::advance(masterFlags.allocation_interval);
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   EXPECT_CALL(exec, registered(_, _, _, _));
 
@@ -7798,6 +7831,192 @@ TEST_F(SlaveTest, IgnoreV0ExecutorIfItReregistersWithoutReconnect)
 }
 
 
+// This test verifies that an executor's latest run directory can
+// be browsed via the `/files` endpoint both while the executor is
+// still running and after the executor terminates.
+//
+// Note that we only test the recommended virtual path format:
+//   `/framework/FID/executor/EID/latest`.
+TEST_F(SlaveTest, BrowseExecutorSandboxByVirtualPath)
+{
+  master::Flags masterFlags = this->CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  slave::Flags agentFlags = this->CreateSlaveFlags();
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Future<Nothing> __recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, agentFlags);
+  ASSERT_SOME(slave);
+
+  // Ensure slave has finished recovery.
+  AWAIT_READY(__recover);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  // Advance the clock to trigger both agent registration and a batch
+  // allocation.
+  Clock::advance(agentFlags.registration_backoff_factor);
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers);
+  EXPECT_FALSE(offers->empty());
+
+  Resources executorResources = Resources::parse("cpus:0.1;mem:32").get();
+  executorResources.allocate("*");
+
+  TaskID taskId;
+  taskId.set_value("1");
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->MergeFrom(taskId);
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(
+      Resources(offers.get()[0].resources()) - executorResources);
+
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+  task.mutable_executor()->mutable_resources()->CopyFrom(executorResources);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status->state());
+
+  // Manually inject a file into the sandbox.
+  FrameworkID frameworkId = offers->front().framework_id();
+  SlaveID slaveId = offers->front().slave_id();
+
+  const string latestRunPath = paths::getExecutorLatestRunPath(
+    agentFlags.work_dir, slaveId, frameworkId, DEFAULT_EXECUTOR_ID);
+  EXPECT_TRUE(os::exists(latestRunPath));
+  ASSERT_SOME(os::write(path::join(latestRunPath, "foo.bar"), "testing"));
+
+  const string virtualPath =
+    paths::getExecutorVirtualPath(frameworkId, DEFAULT_EXECUTOR_ID);
+
+  const process::UPID files("files", slave.get()->pid.address);
+
+  {
+    const string query = string("path=") + virtualPath;
+    Future<Response> response = process::http::get(
+        files,
+        "browse",
+        query,
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_ASSERT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_ASSERT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Array> parse = JSON::parse<JSON::Array>(response->body);
+    ASSERT_SOME(parse);
+    EXPECT_NE(0, parse->values.size());
+  }
+
+  {
+    const string query =
+      string("path=") + path::join(virtualPath, "foo.bar") + "&offset=0";
+    process::UPID files("files", slave.get()->pid.address);
+    Future<Response> response = process::http::get(
+        files,
+        "read",
+        query,
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_ASSERT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    JSON::Object expected;
+    expected.values["offset"] = 0;
+    expected.values["data"] = "testing";
+
+    AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+  }
+
+  // Now destroy the executor and make sure that the sandbox is
+  // still available. We're sure that the GC won't prune the
+  // sandbox since the clock is paused.
+  Future<TaskStatus> status2;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status2));
+
+  EXPECT_CALL(sched, executorLost(_, _, _, _))
+    .Times(AtMost(1));
+
+  AWAIT_READY(containerizer.destroy(frameworkId, DEFAULT_EXECUTOR_ID));
+
+  AWAIT_READY(status2);
+  EXPECT_EQ(TASK_FAILED, status2->state());
+
+  {
+    const string query = string("path=") + virtualPath;
+    Future<Response> response = process::http::get(
+        files,
+        "browse",
+        query,
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_ASSERT_RESPONSE_STATUS_EQ(OK().status, response);
+    AWAIT_ASSERT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+    Try<JSON::Array> parse = JSON::parse<JSON::Array>(response->body);
+    ASSERT_SOME(parse);
+    EXPECT_NE(0, parse->values.size());
+  }
+
+  {
+    const string query =
+      string("path=") + path::join(virtualPath, "foo.bar") + "&offset=0";
+    process::UPID files("files", slave.get()->pid.address);
+    Future<Response> response = process::http::get(
+        files,
+        "read",
+        query,
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+    AWAIT_ASSERT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    JSON::Object expected;
+    expected.values["offset"] = 0;
+    expected.values["data"] = "testing";
+
+    AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+  }
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
 // This test verifies that a disconnected PID-based executor will drop
 // RunTaskMessages.
 TEST_F(SlaveTest, DisconnectedExecutorDropsMessages)
@@ -7844,7 +8063,7 @@ TEST_F(SlaveTest, DisconnectedExecutorDropsMessages)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   FrameworkID frameworkId = offers->front().framework_id();
 
@@ -7978,15 +8197,22 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ExecutorReregistrationTimeoutFlag)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   TaskInfo task = createTask(offers->front(), "sleep 1000");
 
+  Future<TaskStatus> statusUpdate0;
   Future<TaskStatus> statusUpdate1;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusUpdate0))
     .WillOnce(FutureArg<1>(&statusUpdate1));
 
   driver.launchTasks(offers->front().id(), {task});
+
+  AWAIT_READY(statusUpdate0);
+  ASSERT_EQ(TASK_STARTING, statusUpdate0->state());
+
+  driver.acknowledgeStatusUpdate(statusUpdate0.get());
 
   AWAIT_READY(statusUpdate1);
   ASSERT_EQ(TASK_RUNNING, statusUpdate1->state());
@@ -8067,7 +8293,9 @@ TEST_F_TEMP_DISABLED_ON_WINDOWS(SlaveTest, ExecutorReregistrationTimeoutFlag)
 // successfully. Note that shutting down the agent gracefully (killing
 // all tasks) is necessary, because changing the agent's domain is an
 // incompatible change to its SlaveInfo.
-TEST_F(SlaveTest, ChangeDomain)
+//
+// TODO(anand): Re-enable this test when fault domain upgrade is supported.
+TEST_F(SlaveTest, DISABLED_ChangeDomain)
 {
   Clock::pause();
 

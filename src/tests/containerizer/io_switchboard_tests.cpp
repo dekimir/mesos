@@ -900,9 +900,9 @@ TEST_F(IOSwitchboardTest, KillSwitchboardContainerDestroyed)
   ASSERT_TRUE(wait.get()->has_status());
   EXPECT_WTERMSIG_EQ(SIGKILL, wait.get()->status());
 
-  ASSERT_TRUE(wait.get()->reasons().size() == 1);
+  ASSERT_TRUE(wait.get()->has_reason());
   ASSERT_EQ(TaskStatus::REASON_IO_SWITCHBOARD_EXITED,
-            wait.get()->reasons().Get(0));
+            wait.get()->reason());
 
   wait = containerizer->wait(containerId);
 
@@ -965,7 +965,7 @@ TEST_F(IOSwitchboardTest, DISABLED_RecoverThenKillSwitchboardContainerDestroyed)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   // Launch a task with tty to start the switchboard server.
   TaskInfo task = createTask(offers.get()[0], "sleep 1000");
@@ -1085,7 +1085,7 @@ TEST_F(IOSwitchboardTest, ContainerAttachAfterSlaveRestart)
   driver.start();
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->empty());
+  ASSERT_FALSE(offers->empty());
 
   Future<TaskStatus> statusRunning;
   EXPECT_CALL(sched, statusUpdate(_, _))

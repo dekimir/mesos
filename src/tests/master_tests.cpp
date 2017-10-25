@@ -2786,22 +2786,34 @@ TEST_F(MasterTest, UnreachableTaskAfterFailover)
 
   TaskInfo task = createTask(offers.get()[0], "sleep 100");
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
-    .WillOnce(FutureArg<1>(&runningStatus));
+    .WillOnce(FutureArg<1>(&startingStatus))
+    .WillOnce(FutureArg<1>(&runningStatus))
+    .WillRepeatedly(Return());
 
-  Future<Nothing> statusUpdateAck = FUTURE_DISPATCH(
+  Future<Nothing> statusUpdateAck1 = FUTURE_DISPATCH(
+      slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> statusUpdateAck2 = FUTURE_DISPATCH(
       slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
+
+  const SlaveID slaveId = startingStatus->slave_id();
+
+  AWAIT_READY(statusUpdateAck1);
 
   AWAIT_READY(runningStatus);
   EXPECT_EQ(TASK_RUNNING, runningStatus->state());
   EXPECT_EQ(task.task_id(), runningStatus->task_id());
 
-  const SlaveID slaveId = runningStatus->slave_id();
-
-  AWAIT_READY(statusUpdateAck);
+  AWAIT_READY(statusUpdateAck2);
 
   // Step 4: Simulate master failover. We leave the slave without a
   // master so it does not attempt to re-register.
@@ -4928,8 +4940,7 @@ TEST_F(MasterTest, RecoveredSlaves)
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
-    AWAIT_EXPECT_RESPONSE_HEADER_EQ(
-        APPLICATION_JSON, "Content-Type", response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
 
     Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
 
@@ -4952,8 +4963,7 @@ TEST_F(MasterTest, RecoveredSlaves)
         createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);;
-    AWAIT_EXPECT_RESPONSE_HEADER_EQ(
-        APPLICATION_JSON, "Content-Type", response);
+    AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
 
     Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
 
@@ -6830,20 +6840,31 @@ TEST_F(MasterTest, FailoverAgentReregisterFirst)
 
   TaskInfo task = createTask(offers.get()[0], "sleep 100");
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&startingStatus))
     .WillOnce(FutureArg<1>(&runningStatus));
 
-  Future<Nothing> statusUpdateAck = FUTURE_DISPATCH(
+  Future<Nothing> statusUpdateAck1 = FUTURE_DISPATCH(
+      slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> statusUpdateAck2 = FUTURE_DISPATCH(
       slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
+
+  AWAIT_READY(statusUpdateAck1);
 
   AWAIT_READY(runningStatus);
   EXPECT_EQ(TASK_RUNNING, runningStatus->state());
   EXPECT_EQ(task.task_id(), runningStatus->task_id());
 
-  AWAIT_READY(statusUpdateAck);
+  AWAIT_READY(statusUpdateAck2);
 
   // Simulate master failover. We leave the scheduler without a master
   // so it does not attempt to re-register yet.
@@ -7050,14 +7071,25 @@ TEST_F(MasterTest, AgentRestartNoReregister)
 
   TaskInfo task = createTask(offer, "sleep 100");
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&startingStatus))
     .WillOnce(FutureArg<1>(&runningStatus));
 
-  Future<Nothing> statusUpdateAck = FUTURE_DISPATCH(
-      slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+  Future<Nothing> statusUpdateAck1 = FUTURE_DISPATCH(
+    slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> statusUpdateAck2 = FUTURE_DISPATCH(
+    slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
+
+  AWAIT_READY(statusUpdateAck1);
 
   AWAIT_READY(runningStatus);
   EXPECT_EQ(TASK_RUNNING, runningStatus->state());
@@ -7065,7 +7097,7 @@ TEST_F(MasterTest, AgentRestartNoReregister)
 
   const SlaveID slaveId = runningStatus->slave_id();
 
-  AWAIT_READY(statusUpdateAck);
+  AWAIT_READY(statusUpdateAck2);
 
   Clock::pause();
 
@@ -7418,11 +7450,17 @@ TEST_F(MasterTest, TaskWithTinyResources)
       Resources::parse("cpus:0.00001;mem:1").get(),
       SLEEP_COMMAND(1000));
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&startingStatus))
     .WillOnce(FutureArg<1>(&runningStatus));
 
   driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
 
   AWAIT_READY(runningStatus);
   EXPECT_EQ(TASK_RUNNING, runningStatus->state());
@@ -7508,11 +7546,17 @@ TEST_F(MasterTest, MultiRoleSchedulerUnsubscribeFromRole)
 
   TaskInfo task = createTask(offer.slave_id(), resources, "sleep 60");
 
+  Future<TaskStatus> startingStatus;
   Future<TaskStatus> runningStatus;
   EXPECT_CALL(sched1, statusUpdate(&driver1, _))
+    .WillOnce(FutureArg<1>(&startingStatus))
     .WillOnce(FutureArg<1>(&runningStatus));
 
   driver1.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(startingStatus);
+  EXPECT_EQ(TASK_STARTING, startingStatus->state());
+  EXPECT_EQ(task.task_id(), startingStatus->task_id());
 
   AWAIT_READY(runningStatus);
   EXPECT_EQ(TASK_RUNNING, runningStatus->state());
@@ -7810,11 +7854,17 @@ TEST_F(MasterTest, AgentDomainDifferentRegion)
     // Check that we can launch a task in a remote region.
     TaskInfo task = createTask(offer, "sleep 60");
 
+    Future<TaskStatus> startingStatus;
     Future<TaskStatus> runningStatus;
     EXPECT_CALL(sched, statusUpdate(&driver, _))
+      .WillOnce(FutureArg<1>(&startingStatus))
       .WillOnce(FutureArg<1>(&runningStatus));
 
     driver.launchTasks(offer.id(), {task});
+
+    AWAIT_READY(startingStatus);
+    EXPECT_EQ(TASK_STARTING, startingStatus->state());
+    EXPECT_EQ(task.task_id(), startingStatus->task_id());
 
     AWAIT_READY(runningStatus);
     EXPECT_EQ(TASK_RUNNING, runningStatus->state());
@@ -8018,10 +8068,15 @@ TEST_F(MasterTest, IgnoreOldAgentReregistration)
   Future<SlaveRegisteredMessage> slaveRegisteredMessage =
     FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
 
+  Clock::pause();
+
   StandaloneMasterDetector detector(master.get()->pid);
   slave::Flags slaveFlags = CreateSlaveFlags();
   Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
   ASSERT_SOME(slave);
+
+  Clock::settle();
+  Clock::advance(slaveFlags.registration_backoff_factor);
 
   AWAIT_READY(slaveRegisteredMessage);
 
@@ -8029,13 +8084,11 @@ TEST_F(MasterTest, IgnoreOldAgentReregistration)
   Future<ReregisterSlaveMessage> reregisterSlaveMessage =
     DROP_PROTOBUF(ReregisterSlaveMessage(), _, _);
 
-  Clock::pause();
-
   // Simulate a new master detected event on the slave,
   // so that the slave will attempt to re-register.
   detector.appoint(master.get()->pid);
 
-  Clock::advance(slaveFlags.authentication_backoff_factor);
+  Clock::settle();
   Clock::advance(slaveFlags.registration_backoff_factor);
 
   AWAIT_READY(reregisterSlaveMessage);
@@ -8055,10 +8108,152 @@ TEST_F(MasterTest, IgnoreOldAgentReregistration)
 }
 
 
+// This test checks that the master correctly garbage collects
+// information about gone agents from the registry using the
+// count-based GC criterion.
+//
+// TODO(andschwa): Enable this when MESOS-7604 is fixed.
+TEST_F_TEMP_DISABLED_ON_WINDOWS(MasterTest, RegistryGcByCount)
+{
+  // Configure GC to only keep the most recent gone agent in the gone list.
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry_max_agent_count = 1;
+
+  Try<Owned<cluster::Master>> master = this->StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Ensure that the agent is registered successfully with the master
+  // before marking it as gone.
+  AWAIT_READY(slaveRegisteredMessage);
+
+  ContentType contentType = ContentType::PROTOBUF;
+
+  const SlaveID& slaveId = slaveRegisteredMessage->slave_id();
+
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::MARK_AGENT_GONE);
+
+    v1::master::Call::MarkAgentGone* markAgentGone =
+      v1Call.mutable_mark_agent_gone();
+
+    markAgentGone->mutable_agent_id()->CopyFrom(evolve(slaveId));
+
+    Future<process::http::Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        serialize(contentType, v1Call),
+        stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
+  }
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage2 =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  slave::Flags slaveFlags2 = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get(), slaveFlags2);
+  ASSERT_SOME(slave2);
+
+  AWAIT_READY(slaveRegisteredMessage2);
+
+  const SlaveID& slaveId2 = slaveRegisteredMessage2->slave_id();
+
+  {
+    v1::master::Call v1Call;
+    v1Call.set_type(v1::master::Call::MARK_AGENT_GONE);
+
+    v1::master::Call::MarkAgentGone* markAgentGone =
+      v1Call.mutable_mark_agent_gone();
+
+    markAgentGone->mutable_agent_id()->CopyFrom(evolve(slaveId2));
+
+    Future<process::http::Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        serialize(contentType, v1Call),
+        stringify(contentType));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
+  }
+
+  // Advance the clock to cause GC to be performed.
+  Clock::pause();
+  Clock::advance(masterFlags.registry_gc_interval);
+  Clock::settle();
+
+  // Start a framework and do explicit reconciliation for a random task ID
+  // on `slave1` and `slave2`. Since, `slave1` has been GC'ed from the list
+  // of gone agents, a 'TASK_UNKNOWN' update should be received for it.
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::PARTITION_AWARE);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  driver.start();
+
+  AWAIT_READY(registered);
+
+  TaskStatus status1;
+  status1.mutable_task_id()->set_value(UUID::random().toString());
+  status1.mutable_slave_id()->CopyFrom(slaveId);
+  status1.set_state(TASK_STAGING); // Dummy value.
+
+  TaskStatus status2;
+  status2.mutable_task_id()->set_value(UUID::random().toString());
+  status2.mutable_slave_id()->CopyFrom(slaveId2);
+  status2.set_state(TASK_STAGING); // Dummy value.
+
+  Future<TaskStatus> reconcileUpdate1;
+  Future<TaskStatus> reconcileUpdate2;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&reconcileUpdate1))
+    .WillOnce(FutureArg<1>(&reconcileUpdate2));
+
+  driver.reconcileTasks({status1, status2});
+
+  AWAIT_READY(reconcileUpdate1);
+  AWAIT_READY(reconcileUpdate2);
+
+  ASSERT_EQ(TASK_UNKNOWN, reconcileUpdate1->state());
+  ASSERT_EQ(TASK_GONE_BY_OPERATOR, reconcileUpdate2->state());
+}
+
+
 class MasterTestPrePostReservationRefinement
   : public MasterTest,
     public WithParamInterface<bool> {
 public:
+  virtual master::Flags CreateMasterFlags()
+  {
+    // Turn off periodic allocations to avoid the race between
+    // `HierarchicalAllocator::updateAvailable()` and periodic allocations.
+    master::Flags flags = MasterTest::CreateMasterFlags();
+    flags.allocation_interval = Seconds(1000);
+    return flags;
+  }
+
   Resources inboundResources(RepeatedPtrField<Resource> resources)
   {
     // If reservation refinement is enabled, inbound resources are already
@@ -8255,7 +8450,7 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
       evolve<v1::Resource>(outboundResources(resources)));
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   const v1::Offer& offer = offers->offers(0);
   const v1::AgentID& agentId = offer.agent_id();
@@ -8269,9 +8464,11 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
   v1::TaskGroupInfo taskGroup;
   taskGroup.add_tasks()->CopyFrom(taskInfo);
 
-  Future<v1::scheduler::Event::Update> update;
+  Future<v1::scheduler::Event::Update> startingUpdate;
+  Future<v1::scheduler::Event::Update> runningUpdate;
   EXPECT_CALL(*scheduler, update(_, _))
-    .WillOnce(FutureArg<1>(&update));
+    .WillOnce(FutureArg<1>(&startingUpdate))
+    .WillOnce(FutureArg<1>(&runningUpdate));
 
   {
     Call call;
@@ -8293,11 +8490,17 @@ TEST_P(MasterTestPrePostReservationRefinement, LaunchGroup)
     mesos.send(call);
   }
 
-  AWAIT_READY(update);
+  AWAIT_READY(startingUpdate);
 
-  EXPECT_EQ(TASK_RUNNING, update->status().state());
-  EXPECT_EQ(taskInfo.task_id(), update->status().task_id());
-  EXPECT_TRUE(update->status().has_timestamp());
+  EXPECT_EQ(TASK_STARTING, startingUpdate->status().state());
+  EXPECT_EQ(taskInfo.task_id(), startingUpdate->status().task_id());
+  EXPECT_TRUE(startingUpdate->status().has_timestamp());
+
+  AWAIT_READY(runningUpdate);
+
+  EXPECT_EQ(TASK_STARTING, runningUpdate->status().state());
+  EXPECT_EQ(taskInfo.task_id(), runningUpdate->status().task_id());
+  EXPECT_TRUE(runningUpdate->status().has_timestamp());
 
   // Ensure that the task sandbox symbolic link is created.
   EXPECT_TRUE(os::exists(path::join(

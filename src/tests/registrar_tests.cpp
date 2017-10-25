@@ -175,7 +175,7 @@ protected:
     state = new State(storage);
 
     // Compensate for slow CI machines / VMs.
-    flags.registry_store_timeout = Seconds(10);
+    flags.registry_store_timeout = Seconds(15);
 
     master.CopyFrom(protobuf::createMasterInfo(UPID("master@127.0.0.1:5050")));
 
@@ -339,7 +339,69 @@ TEST_F(RegistrarTest, MarkUnreachable)
 }
 
 
-TEST_F(RegistrarTest, PruneUnreachable)
+// Verify that an admitted slave can be marked as gone.
+TEST_F(RegistrarTest, MarkGone)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  SlaveID id1;
+  id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(id1);
+
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+
+  AWAIT_TRUE(
+      registrar.apply(
+          Owned<Operation>(
+              new MarkSlaveGone(info1.id(), protobuf::getCurrentTime()))));
+}
+
+
+// Verify that an unreachable slave can be marked as gone.
+TEST_F(RegistrarTest, MarkUnreachableGone)
+{
+  Registrar registrar(flags, state);
+  AWAIT_READY(registrar.recover(master));
+
+  SlaveID id1;
+  id1.set_value("1");
+
+  SlaveInfo info1;
+  info1.set_hostname("localhost");
+  info1.mutable_id()->CopyFrom(id1);
+
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+
+  AWAIT_TRUE(
+    registrar.apply(
+        Owned<Operation>(
+            new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(
+    registrar.apply(
+        Owned<Operation>(
+            new MarkSlaveGone(info1.id(), protobuf::getCurrentTime()))));
+
+  // If a slave is already gone, trying to mark it gone again should fail.
+  AWAIT_FALSE(
+      registrar.apply(
+          Owned<Operation>(
+              new MarkSlaveGone(info1.id(), protobuf::getCurrentTime()))));
+
+  // If a slave is already gone, trying to mark it unreachable
+  // again should fail.
+  AWAIT_FALSE(
+      registrar.apply(
+          Owned<Operation>(
+              new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
+}
+
+
+TEST_F(RegistrarTest, Prune)
 {
   Registrar registrar(flags, state);
   AWAIT_READY(registrar.recover(master));
@@ -358,8 +420,16 @@ TEST_F(RegistrarTest, PruneUnreachable)
   info2.set_hostname("localhost");
   info2.mutable_id()->CopyFrom(id2);
 
+  SlaveID id3;
+  id3.set_value("3");
+
+  SlaveInfo info3;
+  info3.set_hostname("localhost");
+  info3.mutable_id()->CopyFrom(id3);
+
   AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
   AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info3))));
 
   AWAIT_TRUE(
       registrar.apply(
@@ -371,17 +441,37 @@ TEST_F(RegistrarTest, PruneUnreachable)
           Owned<Operation>(
               new MarkSlaveUnreachable(info2, protobuf::getCurrentTime()))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new PruneUnreachable({id1}))));
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new PruneUnreachable({id2}))));
+  AWAIT_TRUE(
+      registrar.apply(
+          Owned<Operation>(
+              new MarkSlaveGone(info3.id(), protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new Prune({id1}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new Prune({id2}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new Prune({}, {id3}))));
 
   AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info3))));
 
   AWAIT_TRUE(
       registrar.apply(
           Owned<Operation>(
               new MarkSlaveUnreachable(info1, protobuf::getCurrentTime()))));
 
-  AWAIT_TRUE(registrar.apply(Owned<Operation>(new PruneUnreachable({id1}))));
+  AWAIT_TRUE(
+      registrar.apply(
+          Owned<Operation>(
+              new MarkSlaveUnreachable(info2, protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(
+      registrar.apply(
+          Owned<Operation>(
+              new MarkSlaveGone(info3.id(), protobuf::getCurrentTime()))));
+
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new Prune({id1}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new Prune({id2}, {}))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new Prune({}, {id3}))));
 }
 
 
@@ -1186,8 +1276,7 @@ TEST_F(RegistrarTest, Authentication)
 
   // Requests without credentials should be rejected.
   Future<Response> response = process::http::get(registrar.pid(), "registry");
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
 
   Credential badCredential;
   badCredential.set_principal("bad-principal");
@@ -1199,8 +1288,7 @@ TEST_F(RegistrarTest, Authentication)
       "registry",
       None(),
       createBasicAuthHeaders(badCredential));
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
 
   // Requests with good credentials should be permitted.
   response = process::http::get(
@@ -1208,8 +1296,7 @@ TEST_F(RegistrarTest, Authentication)
       "registry",
       None(),
       createBasicAuthHeaders(DEFAULT_CREDENTIAL));
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
-    << response->body;
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
   AWAIT_READY(authentication::unsetAuthenticator(AUTHENTICATION_REALM));
 }
@@ -1433,7 +1520,9 @@ TEST_P(Registrar_BENCHMARK_Test, GcManyAgents)
 
   // Do GC.
   watch.start();
-  result = registrar.apply(Owned<Operation>(new PruneUnreachable(toRemove)));
+  result = registrar.apply(Owned<Operation>(
+      new Prune(toRemove, hashset<SlaveID>())));
+
   AWAIT_READY_FOR(result, Minutes(5));
   cout << "Garbage collected " << toRemove.size() << " agents in "
        << watch.elapsed() << endl;

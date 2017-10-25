@@ -108,6 +108,12 @@ private:
     // `WAIT_NESTED_CONTAINER` call has not been established yet.
     Option<Connection> waiting;
 
+    // TODO(bennoe): Create a real state machine instead of adding
+    // more and more ad-hoc boolean values.
+
+    // Indicates whether a container has been launched.
+    bool launched;
+
     // Indicates whether a status update acknowledgement
     // has been received for any status update.
     bool acknowledged;
@@ -318,12 +324,14 @@ protected:
       subscribe->add_unacknowledged_updates()->MergeFrom(update);
     }
 
-    // Send all unacknowledged tasks. We don't send unacknowledged terminated
-    // (and hence already removed from `containers`) tasks, because for such
-    // tasks `WAIT_NESTED_CONTAINER` call has already succeeded, meaning the
-    // agent knows about the tasks and corresponding containers.
+    // Send all unacknowledged tasks. We don't send tasks whose container
+    // didn't launch yet, because the agent will learn about once it launches.
+    // We also don't send unacknowledged terminated (and hence already removed
+    // from `containers`) tasks, because for such tasks `WAIT_NESTED_CONTAINER`
+    // call has already succeeded, meaning the agent knows about the tasks and
+    // corresponding containers.
     foreachvalue (const Owned<Container>& container, containers) {
-      if (!container->acknowledged) {
+      if (container->launched && !container->acknowledged) {
         subscribe->add_unacknowledged_tasks()->MergeFrom(container->taskInfo);
       }
     }
@@ -402,6 +410,23 @@ protected:
       containerId.mutable_parent()->CopyFrom(executorContainerId.get());
 
       containerIds.push_back(containerId);
+
+      containers[task.task_id()] = Owned<Container>(new Container{
+        containerId,
+        task,
+        taskGroup,
+        None(),
+        None(),
+        None(),
+        None(),
+        false,
+        false,
+        false,
+        false});
+
+      // Send out the initial TASK_STARTING update.
+      const TaskStatus status = createTaskStatus(task.task_id(), TASK_STARTING);
+      forward(status);
 
       agent::Call call;
       call.set_type(agent::Call::LAUNCH_NESTED_CONTAINER);
@@ -526,17 +551,8 @@ protected:
       const TaskInfo& task = taskGroup.tasks().Get(index++);
       const TaskID& taskId = task.task_id();
 
-      containers[taskId] = Owned<Container>(new Container{
-        containerId,
-        task,
-        taskGroup,
-        None(),
-        None(),
-        None(),
-        None(),
-        false,
-        false,
-        false});
+      CHECK(containers.contains(taskId));
+      containers.at(taskId)->launched = true;
 
       if (task.has_check()) {
         Try<Owned<checks::Checker>> checker =
@@ -799,16 +815,19 @@ protected:
 
     TaskState taskState;
     Option<string> message;
+    Option<TaskStatus::Reason> reason;
+    Option<TaskResourceLimitation> limitation;
 
-    Option<int> status = waitResponse->wait_nested_container().exit_status();
-
-    if (status.isNone()) {
+    if (!waitResponse->wait_nested_container().has_exit_status()) {
       taskState = TASK_FAILED;
+      message = "Command terminated with unknown status";
     } else {
-      CHECK(WIFEXITED(status.get()) || WIFSIGNALED(status.get()))
-        << "Unexpected wait status " << status.get();
+      int status = waitResponse->wait_nested_container().exit_status();
 
-      if (WSUCCEEDED(status.get())) {
+      CHECK(WIFEXITED(status) || WIFSIGNALED(status))
+        << "Unexpected wait status " << status;
+
+      if (WSUCCEEDED(status)) {
         taskState = TASK_FINISHED;
       } else if (container->killing) {
         // Send TASK_KILLED if the task was killed as a result of
@@ -818,14 +837,41 @@ protected:
         taskState = TASK_FAILED;
       }
 
-      message = "Command " + WSTRINGIFY(status.get());
+      message = "Command " + WSTRINGIFY(status);
+    }
+
+    // Note that we always prefer the task state and reason from the
+    // agent response over what we can determine ourselves because
+    // in general, the agent has more specific information about why
+    // the container exited (e.g. this might be a container resource
+    // limitation).
+    if (waitResponse->wait_nested_container().has_state()) {
+      taskState = waitResponse->wait_nested_container().state();
+    }
+
+    if (waitResponse->wait_nested_container().has_reason()) {
+      reason = waitResponse->wait_nested_container().reason();
+    }
+
+    if (waitResponse->wait_nested_container().has_message()) {
+      if (message.isSome()) {
+        message->append(
+            ": " +  waitResponse->wait_nested_container().message());
+      } else {
+        message = waitResponse->wait_nested_container().message();
+      }
+    }
+
+    if (waitResponse->wait_nested_container().has_limitation()) {
+      limitation = waitResponse->wait_nested_container().limitation();
     }
 
     TaskStatus taskStatus = createTaskStatus(
         taskId,
         taskState,
-        None(),
-        message);
+        reason,
+        message,
+        limitation);
 
     // Indicate that a task has been unhealthy upon termination.
     if (unhealthy) {
@@ -841,9 +887,8 @@ protected:
 
     LOG(INFO)
       << "Child container " << container->containerId << " of task '" << taskId
-      << "' in state " << stringify(taskState) << " "
-      << (status.isSome() ? WSTRINGIFY(status.get())
-                          : "terminated with unknown status");
+      << "' completed in state " << stringify(taskState)
+      << ": " << message.get();
 
     // Shutdown the executor if all the active child containers have terminated.
     if (containers.empty()) {
@@ -1241,7 +1286,8 @@ private:
       const TaskID& taskId,
       const TaskState& state,
       const Option<TaskStatus::Reason>& reason = None(),
-      const Option<string>& message = None())
+      const Option<string>& message = None(),
+      const Option<TaskResourceLimitation>& limitation = None())
   {
     TaskStatus status = protobuf::createTaskStatus(
         taskId,
@@ -1258,6 +1304,10 @@ private:
 
     if (message.isSome()) {
       status.set_message(message.get());
+    }
+
+    if (limitation.isSome()) {
+      status.mutable_limitation()->CopyFrom(limitation.get());
     }
 
     CHECK(containers.contains(taskId));
@@ -1376,7 +1426,7 @@ private:
 
     CHECK_EQ(SUBSCRIBED, state);
     CHECK_SOME(connectionId);
-    CHECK(containers.contains(taskId));
+    CHECK(containers.contains(taskId) && containers.at(taskId)->launched);
 
     const Owned<Container>& container = containers.at(taskId);
 
@@ -1435,7 +1485,7 @@ private:
 
   LinkedHashMap<UUID, Call::Update> unacknowledgedUpdates;
 
-  // Active child containers.
+  // Child containers.
   LinkedHashMap<TaskID, Owned<Container>> containers;
 
   // There can be multiple simulataneous ongoing (re-)connection attempts
@@ -1467,14 +1517,12 @@ public:
 
 int main(int argc, char** argv)
 {
-  process::initialize();
-
-  Flags flags;
   mesos::FrameworkID frameworkId;
   mesos::ExecutorID executorId;
   string scheme = "http"; // Default scheme.
   ::URL agent;
   string sandboxDirectory;
+  Flags flags;
 
   // Load flags from command line.
   Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
@@ -1489,7 +1537,7 @@ int main(int argc, char** argv)
     return EXIT_FAILURE;
   }
 
-  mesos::internal::logging::initialize(argv[0], flags, true); // Catch signals.
+  mesos::internal::logging::initialize(argv[0], true, flags); // Catch signals.
 
   // Log any flag warnings (after logging is initialized).
   foreach (const flags::Warning& warning, load->warnings) {
@@ -1528,6 +1576,8 @@ int main(int argc, char** argv)
     EXIT(EXIT_FAILURE)
       << "Expecting 'MESOS_SLAVE_PID' to be set in the environment";
   }
+
+  process::initialize();
 
   UPID upid(value.get());
   CHECK(upid) << "Failed to parse MESOS_SLAVE_PID '" << value.get() << "'";

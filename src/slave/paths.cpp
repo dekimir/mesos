@@ -70,6 +70,7 @@ const char SLAVES_DIR[] = "slaves";
 const char FRAMEWORKS_DIR[] = "frameworks";
 const char EXECUTORS_DIR[] = "executors";
 const char EXECUTOR_RUNS_DIR[] = "runs";
+const char RESOURCE_PROVIDER_REGISTRY[] = "resource_provider_registry";
 
 
 Try<ExecutorRunPath> parseExecutorRunPath(
@@ -303,6 +304,20 @@ string getExecutorSentinelPath(
 }
 
 
+string getExecutorVirtualPath(
+    const FrameworkID& frameworkId,
+    const ExecutorID& executorId)
+{
+  return path::join(
+      stringify(os::PATH_SEPARATOR) + FRAMEWORKS_DIR,
+      stringify(frameworkId),
+      EXECUTORS_DIR,
+      stringify(executorId),
+      EXECUTOR_RUNS_DIR,
+      LATEST_SYMLINK);
+}
+
+
 string getExecutorLatestRunPath(
     const string& rootDir,
     const SlaveID& slaveId,
@@ -433,6 +448,16 @@ string getTaskUpdatesPath(
 }
 
 
+string getResourceProviderRegistryPath(
+    const string& rootDir,
+    const SlaveID& slaveId)
+{
+  return path::join(
+      getSlavePath(getMetaRootDir(rootDir), slaveId),
+      RESOURCE_PROVIDER_REGISTRY);
+}
+
+
 string getResourcesInfoPath(
     const string& rootDir)
 {
@@ -517,6 +542,8 @@ string getPersistentVolumePath(
       CHECK(volume.disk().source().mount().has_root());
       return volume.disk().source().mount().root();
     }
+    case Resource::DiskInfo::Source::BLOCK:
+    case Resource::DiskInfo::Source::RAW:
     case Resource::DiskInfo::Source::UNKNOWN:
       LOG(FATAL) << "Unsupported DiskInfo.Source.type";
       break;

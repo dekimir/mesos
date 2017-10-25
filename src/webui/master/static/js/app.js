@@ -1,3 +1,19 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 (function() {
   'use strict';
 
@@ -68,12 +84,17 @@
       paginationConfig.rotate = false;
     }])
     .filter('truncateMesosID', function() {
+      // Returns a truncated ID, for example:
+      // Input: 9d4b2f2b-a759-4458-bebf-7d3507a6f0ca-S9
+      // Output: ...7d3507a6f0ca-S9
+      //
+      // Note that an ellipsis is used for display purposes.
       return function(id) {
         if (id) {
           var truncatedIdParts = id.split('-');
 
-          if (truncatedIdParts.length > 3) {
-            return '…' + truncatedIdParts.splice(3, 3).join('-');
+          if (truncatedIdParts.length > 4) {
+            return '\u2026' + truncatedIdParts.splice(4).join('-');
           } else {
             return id;
           }
@@ -88,17 +109,29 @@
         return state.substring(5);
       };
     })
+    .filter('taskHealth', function() {
+      return function(healthy) {
+        if (healthy == null) {
+          return "-";
+        }
+
+        // Note that this string value is relied on to match
+        // against CSS classes to color the UI. Changing this
+        // also requires an update to the CSS.
+        return healthy ? "healthy" : "unhealthy";
+      }
+    })
     .filter('isoDate', function($filter) {
       return function(date) {
         var i = parseInt(date, 10);
-        if (_.isNaN(i)) { return '' };
+        if (_.isNaN(i)) { return '' }
         return $filter('date')(i, 'yyyy-MM-ddTHH:mm:ssZ');
       };
     })
     .filter('relativeDate', function() {
       return function(date, refDate) {
         var i = parseInt(date, 10);
-        if (_.isNaN(i)) { return '' };
+        if (_.isNaN(i)) { return '' }
         return relativeDate(i, refDate);
       };
     })
@@ -293,7 +326,7 @@
           // ---
 
           scope.$watch(attrs.tableContent, function(data) {
-            if (!data) { scope.originalData = []; return };
+            if (!data) { scope.originalData = []; return }
             if (angular.isObject(data)) { data = _.values(data) }
 
             scope.originalData = data;
@@ -322,7 +355,7 @@
           // ---
 
           // --- Filtering
-          var el = angular.element('<div m-table-header></div>');
+          el = angular.element('<div m-table-header></div>');
           $compile(el)(scope);
           element.before(el);
           // ---

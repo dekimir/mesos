@@ -25,6 +25,9 @@
 #include <set>
 #include <string>
 
+#include <glog/logging.h>
+#include <glog/raw_logging.h>
+
 #include <process/subprocess.hpp>
 
 #include <stout/foreach.hpp>
@@ -32,6 +35,8 @@
 #include <stout/protobuf.hpp>
 #include <stout/path.hpp>
 #include <stout/unreachable.hpp>
+
+#include <stout/os/write.hpp>
 
 #include <mesos/mesos.hpp>
 #include <mesos/type_utils.hpp>
@@ -131,14 +136,15 @@ static void signalSafeWriteStatus(int status)
 {
   const string statusString = std::to_string(status);
 
-  Try<Nothing> write = os::write(
-      containerStatusFd.get(),
-      statusString);
+  ssize_t result =
+    os::signal_safe::write(containerStatusFd.get(), statusString);
 
-  if (write.isError()) {
-    os::write(STDERR_FILENO,
-              "Failed to write container status '" +
-              statusString + "': " + ::strerror(errno));
+  if (result < 0) {
+    // NOTE: We use RAW_LOG instead of LOG because RAW_LOG doesn't
+    // allocate any memory or grab locks. And according to
+    // https://code.google.com/p/google-glog/issues/detail?id=161
+    // it should work in 'most' cases in signal handlers.
+    RAW_LOG(ERROR, "Failed to write container status '%d': %d", status, errno);
   }
 }
 
@@ -227,6 +233,61 @@ static void exitWithStatus(int status)
   }
 #endif // __WINDOWS__
   ::_exit(status);
+}
+
+
+static Try<Nothing> installResourceLimits(const RLimitInfo& limits)
+{
+#ifdef __WINDOWS__
+  return Error("Rlimits are not supported on Windows");
+#else
+  foreach (const RLimitInfo::RLimit& limit, limits.rlimits()) {
+    Try<Nothing> set = rlimits::set(limit);
+    if (set.isError()) {
+      return Error(
+          "Failed to set " +
+          RLimitInfo::RLimit::Type_Name(limit.type()) + " limit: " +
+          set.error());
+    }
+  }
+
+  return Nothing();
+#endif // __WINDOWS__
+}
+
+
+static Try<Nothing> enterChroot(const string& rootfs)
+{
+#ifdef __WINDOWS__
+  return Error("Changing rootfs is not supported on Windows");
+#else
+  // Verify that rootfs is an absolute path.
+  Result<string> realpath = os::realpath(rootfs);
+  if (realpath.isError()) {
+    return Error(
+        "Failed to determine if rootfs '" + rootfs +
+        "' is an absolute path: " + realpath.error());
+  } else if (realpath.isNone()) {
+    return Error("Rootfs path '" + rootfs + "' does not exist");
+  } else if (realpath.get() != rootfs) {
+    return Error("Rootfs path '" + rootfs + "' is not an absolute path");
+  }
+
+#ifdef __linux__
+  Try<Nothing> chroot = fs::chroot::enter(rootfs);
+#else
+  // For any other platform we'll just use POSIX chroot.
+  Try<Nothing> chroot = os::chroot(rootfs);
+#endif // __linux__
+
+  if (chroot.isError()) {
+    return Error(
+        "Failed to enter chroot '" + rootfs + "': " +
+        chroot.error());
+  }
+
+  return Nothing();
+#endif // __WINDOWS__
 }
 
 
@@ -507,62 +568,27 @@ int MesosContainerizerLaunch::execute()
   }
 #endif // __linux__
 
-#ifndef __WINDOWS__
   // Change root to a new root, if provided.
   if (launchInfo.has_rootfs()) {
     cout << "Changing root to " << launchInfo.rootfs() << endl;
 
-    // Verify that rootfs is an absolute path.
-    Result<string> realpath = os::realpath(launchInfo.rootfs());
-    if (realpath.isError()) {
-      cerr << "Failed to determine if rootfs is an absolute path: "
-           << realpath.error() << endl;
-      exitWithStatus(EXIT_FAILURE);
-    } else if (realpath.isNone()) {
-      cerr << "Rootfs path does not exist" << endl;
-      exitWithStatus(EXIT_FAILURE);
-    } else if (realpath.get() != launchInfo.rootfs()) {
-      cerr << "Rootfs path is not an absolute path" << endl;
-      exitWithStatus(EXIT_FAILURE);
-    }
-
-#ifdef __linux__
-    Try<Nothing> chroot = fs::chroot::enter(launchInfo.rootfs());
-#else
-    // For any other platform we'll just use POSIX chroot.
-    Try<Nothing> chroot = os::chroot(launchInfo.rootfs());
-#endif // __linux__
+    Try<Nothing> chroot = enterChroot(launchInfo.rootfs());
 
     if (chroot.isError()) {
-      cerr << "Failed to enter chroot '" << launchInfo.rootfs()
-           << "': " << chroot.error();
+      cerr << chroot.error() << endl;
       exitWithStatus(EXIT_FAILURE);
     }
   }
-#else
-  if (launchInfo.has_rootfs()) {
-    cerr << "Changing rootfs is not supported on Windows" << endl;
-    exitWithStatus(EXIT_FAILURE);
-  }
-#endif // __WINDOWS__
 
-#ifndef __WINDOWS__
-  // Setting resource limits for the process.
+  // Install resource limits for the process.
   if (launchInfo.has_rlimits()) {
-    foreach (const RLimitInfo::RLimit& limit, launchInfo.rlimits().rlimits()) {
-      Try<Nothing> set = rlimits::set(limit);
-      if (set.isError()) {
-        cerr << "Failed to set rlimit: " << set.error() << endl;
-        exitWithStatus(EXIT_FAILURE);
-      }
+    Try<Nothing> set = installResourceLimits(launchInfo.rlimits());
+
+    if (set.isError()) {
+      cerr << set.error() << endl;
+      exitWithStatus(EXIT_FAILURE);
     }
   }
-#else
-  if (launchInfo.has_rlimits()) {
-    cerr << "Rlimits are not supported on Windows" << endl;
-    exitWithStatus(EXIT_FAILURE);
-  }
-#endif // __WINDOWS__
 
   if (launchInfo.has_working_directory()) {
     // If working directory does not exist (e.g., being removed from
@@ -691,6 +717,24 @@ int MesosContainerizerLaunch::execute()
     ? os::Shell::name
     : launchInfo.command().value().c_str());
 
+#ifndef __WINDOWS__
+  // Search executable in the current working directory as well.
+  // execvpe and execvp will only search executable from the current
+  // working directory if environment variable PATH is not set.
+  // TODO(aaron.wood): 'os::which' current does not work on Windows.
+  // Remove the ifndef guard once it's supported on Windows.
+  if (!path::absolute(executable) &&
+      launchInfo.has_working_directory()) {
+    Option<string> which = os::which(
+        executable,
+        launchInfo.working_directory());
+
+    if (which.isSome()) {
+      executable = which.get();
+    }
+  }
+#endif // __WINDOWS__
+
   os::raw::Argv argv(launchInfo.command().shell()
     ? vector<string>({
           os::Shell::arg0,
@@ -815,24 +859,6 @@ int MesosContainerizerLaunch::execute()
       signalSafeWriteStatus(status);
       os::close(containerStatusFd.get());
       ::_exit(EXIT_SUCCESS);
-    }
-  }
-#endif // __WINDOWS__
-
-#ifndef __WINDOWS__
-  // Search executable in the current working directory as well.
-  // execvpe and execvp will only search executable from the current
-  // working directory if environment variable PATH is not set.
-  // TODO(aaron.wood): 'os::which' current does not work on Windows.
-  // Remove the ifndef guard once it's supported on Windows.
-  if (!path::absolute(executable) &&
-      launchInfo.has_working_directory()) {
-    Option<string> which = os::which(
-        executable,
-        launchInfo.working_directory());
-
-    if (which.isSome()) {
-      executable = which.get();
     }
   }
 #endif // __WINDOWS__

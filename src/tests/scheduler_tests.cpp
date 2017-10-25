@@ -459,7 +459,7 @@ TEST_P(SchedulerTest, TaskRunning)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
@@ -589,7 +589,7 @@ TEST_P(SchedulerTest, TaskGroupRunning)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   Future<RunTaskGroupMessage> runTaskGroupMessage =
     FUTURE_PROTOBUF(RunTaskGroupMessage(), master.get()->pid, slave.get()->pid);
@@ -623,11 +623,15 @@ TEST_P(SchedulerTest, TaskGroupRunning)
   taskGroup.add_tasks()->CopyFrom(task1);
   taskGroup.add_tasks()->CopyFrom(task2);
 
+  Future<Event::Update> startingUpdate1;
+  Future<Event::Update> startingUpdate2;
   Future<Event::Update> runningUpdate1;
   Future<Event::Update> runningUpdate2;
   Future<Event::Update> finishedUpdate1;
   Future<Event::Update> finishedUpdate2;
   EXPECT_CALL(*scheduler, update(_, _))
+    .WillOnce(FutureArg<1>(&startingUpdate1))
+    .WillOnce(FutureArg<1>(&startingUpdate2))
     .WillOnce(FutureArg<1>(&runningUpdate1))
     .WillOnce(FutureArg<1>(&runningUpdate2))
     .WillOnce(FutureArg<1>(&finishedUpdate1))
@@ -669,13 +673,57 @@ TEST_P(SchedulerTest, TaskGroupRunning)
   EXPECT_EQ(devolve(task2.task_id()),
             runTaskGroupMessage->task_group().tasks(1).task_id());
 
+  AWAIT_READY(startingUpdate1);
+  ASSERT_EQ(v1::TASK_STARTING, startingUpdate1->status().state());
+
+  AWAIT_READY(startingUpdate2);
+  ASSERT_EQ(v1::TASK_STARTING, startingUpdate2->status().state());
+
+  const hashset<v1::TaskID> tasks{task1.task_id(), task2.task_id()};
+
+  // TASK_STARTING updates for the tasks in a
+  // task group can be received in any order.
+  const hashset<v1::TaskID> tasksStarting{
+    startingUpdate1->status().task_id(),
+    startingUpdate2->status().task_id()};
+
+  ASSERT_EQ(tasks, tasksStarting);
+
+  // Acknowledge the TASK_STARTING updates so
+  // that subsequent updates can be received.
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::ACKNOWLEDGE);
+
+    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
+    acknowledge->mutable_task_id()->CopyFrom(
+        startingUpdate1->status().task_id());
+    acknowledge->mutable_agent_id()->CopyFrom(offers->offers(0).agent_id());
+    acknowledge->set_uuid(startingUpdate1->status().uuid());
+
+    mesos.send(call);
+  }
+
+  {
+    Call call;
+    call.mutable_framework_id()->CopyFrom(frameworkId);
+    call.set_type(Call::ACKNOWLEDGE);
+
+    Call::Acknowledge* acknowledge = call.mutable_acknowledge();
+    acknowledge->mutable_task_id()->CopyFrom(
+        startingUpdate2->status().task_id());
+    acknowledge->mutable_agent_id()->CopyFrom(offers->offers(0).agent_id());
+    acknowledge->set_uuid(startingUpdate2->status().uuid());
+
+    mesos.send(call);
+  }
+
   AWAIT_READY(runningUpdate1);
   ASSERT_EQ(v1::TASK_RUNNING, runningUpdate1->status().state());
 
   AWAIT_READY(runningUpdate2);
   ASSERT_EQ(v1::TASK_RUNNING, runningUpdate2->status().state());
-
-  const hashset<v1::TaskID> tasks{task1.task_id(), task2.task_id()};
 
   // TASK_RUNNING updates for the tasks in a
   // task group can be received in any order.
@@ -783,7 +831,7 @@ TEST_P(SchedulerTest, ReconcileTask)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
@@ -911,7 +959,7 @@ TEST_P(SchedulerTest, KillTask)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
@@ -1057,7 +1105,7 @@ TEST_P(SchedulerTest, ShutdownExecutor)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
@@ -1274,7 +1322,7 @@ TEST_P(SchedulerTest, Revive)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->offers().empty());
+  ASSERT_FALSE(offers1->offers().empty());
 
   const v1::Offer& offer = offers1->offers(0);
 
@@ -1317,7 +1365,7 @@ TEST_P(SchedulerTest, Revive)
   }
 
   AWAIT_READY(offers2);
-  EXPECT_FALSE(offers2->offers().empty());
+  ASSERT_FALSE(offers2->offers().empty());
   ASSERT_EQ(offer.resources(), offers2->offers(0).resources());
 }
 
@@ -1372,7 +1420,7 @@ TEST_P(SchedulerTest, Suppress)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers1);
-  EXPECT_FALSE(offers1->offers().empty());
+  ASSERT_FALSE(offers1->offers().empty());
 
   const v1::Offer& offer = offers1->offers(0);
 
@@ -1432,7 +1480,7 @@ TEST_P(SchedulerTest, Suppress)
 
   AWAIT_READY(offers2);
 
-  EXPECT_FALSE(offers2->offers().empty());
+  ASSERT_FALSE(offers2->offers().empty());
   ASSERT_EQ(offer.resources(), offers2->offers(0).resources());
 }
 
@@ -1572,7 +1620,7 @@ TEST_P(SchedulerTest, Message)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));
@@ -2031,7 +2079,7 @@ TEST_P(SchedulerSSLTest, RunTaskAndTeardown)
   v1::FrameworkID frameworkId(subscribed->framework_id());
 
   AWAIT_READY(offers);
-  EXPECT_FALSE(offers->offers().empty());
+  ASSERT_FALSE(offers->offers().empty());
 
   EXPECT_CALL(*executor, connected(_))
     .WillOnce(v1::executor::SendSubscribe(frameworkId, evolve(executorId)));

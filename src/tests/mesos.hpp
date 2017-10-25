@@ -472,56 +472,6 @@ using DefaultFrameworkInfo =
 // We factor out all common behavior and templatize it so that we can
 // can call it from both `v1::` and `internal::`.
 namespace common {
-template <typename TExecutorInfo, typename TResources, typename TCommandInfo>
-inline TExecutorInfo createExecutorInfo(
-    const std::string& executorId,
-    const Option<TCommandInfo>& command = None(),
-    const Option<std::string>& resources = None(),
-    const Option<typename TExecutorInfo::Type>& type = None())
-{
-  TExecutorInfo executor;
-  executor.mutable_executor_id()->set_value(executorId);
-  if (command.isSome()) {
-    executor.mutable_command()->CopyFrom(command.get());
-  }
-  if (resources.isSome()) {
-    executor.mutable_resources()->CopyFrom(
-        TResources::parse(resources.get()).get());
-  }
-  if (type.isSome()) {
-    executor.set_type(type.get());
-  }
-  return executor;
-}
-
-
-template <typename TExecutorInfo, typename TResources, typename TCommandInfo>
-inline TExecutorInfo createExecutorInfo(
-    const std::string& executorId,
-    const std::string& command,
-    const Option<std::string>& resources = None(),
-    const Option<typename TExecutorInfo::Type>& type = None())
-{
-  TCommandInfo commandInfo;
-  commandInfo.set_value(command);
-  return createExecutorInfo<TExecutorInfo, TResources, TCommandInfo>(
-      executorId, commandInfo, resources, type);
-}
-
-
-template <typename TExecutorInfo, typename TResources, typename TCommandInfo>
-inline TExecutorInfo createExecutorInfo(
-    const std::string& executorId,
-    const char* command,
-    const Option<std::string>& resources = None(),
-    const Option<typename TExecutorInfo::Type>& type = None())
-{
-  return createExecutorInfo<TExecutorInfo, TResources, TCommandInfo>(
-      executorId,
-      std::string(command),
-      resources);
-}
-
 
 template <typename TCommandInfo>
 inline TCommandInfo createCommandInfo(
@@ -539,6 +489,140 @@ inline TCommandInfo createCommandInfo(
     }
   }
   return commandInfo;
+}
+
+
+template <typename TExecutorInfo,
+          typename TExecutorID,
+          typename TResources,
+          typename TCommandInfo,
+          typename TFrameworkID>
+inline TExecutorInfo createExecutorInfo(
+    const TExecutorID& executorId,
+    const Option<TCommandInfo>& command,
+    const Option<TResources>& resources,
+    const Option<typename TExecutorInfo::Type>& type,
+    const Option<TFrameworkID>& frameworkId)
+{
+  TExecutorInfo executor;
+  executor.mutable_executor_id()->CopyFrom(executorId);
+  if (command.isSome()) {
+    executor.mutable_command()->CopyFrom(command.get());
+  }
+  if (resources.isSome()) {
+    executor.mutable_resources()->CopyFrom(resources.get());
+  }
+  if (type.isSome()) {
+    executor.set_type(type.get());
+  }
+  if (frameworkId.isSome()) {
+    executor.mutable_framework_id()->CopyFrom(frameworkId.get());
+  }
+  return executor;
+}
+
+
+template <typename TExecutorInfo,
+          typename TExecutorID,
+          typename TResources,
+          typename TCommandInfo,
+          typename TFrameworkID>
+inline TExecutorInfo createExecutorInfo(
+    const std::string& _executorId,
+    const Option<TCommandInfo>& command,
+    const Option<TResources>& resources,
+    const Option<typename TExecutorInfo::Type>& type,
+    const Option<TFrameworkID>& frameworkId)
+{
+  TExecutorID executorId;
+  executorId.set_value(_executorId);
+  return createExecutorInfo<TExecutorInfo,
+                            TExecutorID,
+                            TResources,
+                            TCommandInfo,
+                            TFrameworkID>(
+      executorId, command, resources, type, frameworkId);
+}
+
+
+template <typename TExecutorInfo,
+          typename TExecutorID,
+          typename TResources,
+          typename TCommandInfo,
+          typename TFrameworkID>
+inline TExecutorInfo createExecutorInfo(
+    const std::string& executorId,
+    const Option<TCommandInfo>& command = None(),
+    const Option<std::string>& resources = None(),
+    const Option<typename TExecutorInfo::Type>& type = None(),
+    const Option<TFrameworkID>& frameworkId = None())
+{
+  if (resources.isSome()) {
+    return createExecutorInfo<TExecutorInfo,
+                              TExecutorID,
+                              TResources,
+                              TCommandInfo,
+                              TFrameworkID>(
+        executorId,
+        command,
+        TResources::parse(resources.get()).get(),
+        type,
+        frameworkId);
+  }
+
+  return createExecutorInfo<TExecutorInfo,
+                            TExecutorID,
+                            TResources,
+                            TCommandInfo,
+                            TFrameworkID>(
+      executorId, command, Option<TResources>::none(), type, frameworkId);
+}
+
+
+template <typename TExecutorInfo,
+          typename TExecutorID,
+          typename TResources,
+          typename TCommandInfo,
+          typename TFrameworkID>
+inline TExecutorInfo createExecutorInfo(
+    const TExecutorID& executorId,
+    const Option<TCommandInfo>& command,
+    const std::string& resources,
+    const Option<typename TExecutorInfo::Type>& type = None(),
+    const Option<TFrameworkID>& frameworkId = None())
+{
+  return createExecutorInfo<TExecutorInfo,
+                            TExecutorID,
+                            TResources,
+                            TCommandInfo,
+                            TFrameworkID>(
+      executorId,
+      command,
+      TResources::parse(resources).get(),
+      type,
+      frameworkId);
+}
+
+
+template <typename TExecutorInfo,
+          typename TExecutorID,
+          typename TResources,
+          typename TCommandInfo,
+          typename TFrameworkID>
+inline TExecutorInfo createExecutorInfo(
+    const std::string& executorId,
+    const std::string& command,
+    const Option<std::string>& resources = None(),
+    const Option<typename TExecutorInfo::Type>& type = None(),
+    const Option<TFrameworkID>& frameworkId = None())
+{
+  TCommandInfo commandInfo = createCommandInfo<TCommandInfo>(command);
+  return createExecutorInfo<TExecutorInfo,
+                            TExecutorID,
+                            TResources,
+                            TCommandInfo,
+                            TFrameworkID>(
+      executorId, commandInfo, resources, type, frameworkId);
 }
 
 
@@ -857,12 +941,25 @@ inline typename TResource::DiskInfo createDiskInfo(
 // Helper for creating a disk source with type `PATH`.
 template <typename TResource>
 inline typename TResource::DiskInfo::Source createDiskSourcePath(
-    const std::string& root)
+    const Option<std::string>& root,
+    const Option<std::string>& id = None(),
+    const Option<std::string>& profile = None())
 {
   typename TResource::DiskInfo::Source source;
 
   source.set_type(TResource::DiskInfo::Source::PATH);
-  source.mutable_path()->set_root(root);
+
+  if (root.isSome()) {
+    source.mutable_path()->set_root(root.get());
+  }
+
+  if (id.isSome()) {
+    source.set_id(id.get());
+  }
+
+  if (profile.isSome()) {
+    source.set_profile(profile.get());
+  }
 
   return source;
 }
@@ -871,12 +968,25 @@ inline typename TResource::DiskInfo::Source createDiskSourcePath(
 // Helper for creating a disk source with type `MOUNT`.
 template <typename TResource>
 inline typename TResource::DiskInfo::Source createDiskSourceMount(
-    const std::string& root)
+    const Option<std::string>& root,
+    const Option<std::string>& id = None(),
+    const Option<std::string>& profile = None())
 {
   typename TResource::DiskInfo::Source source;
 
   source.set_type(TResource::DiskInfo::Source::MOUNT);
-  source.mutable_mount()->set_root(root);
+
+  if (root.isSome()) {
+    source.mutable_mount()->set_root(root.get());
+  }
+
+  if (id.isSome()) {
+    source.set_id(id.get());
+  }
+
+  if (profile.isSome()) {
+    source.set_profile(profile.get());
+  }
 
   return source;
 }
@@ -1146,8 +1256,10 @@ inline ExecutorInfo createExecutorInfo(Args&&... args)
 {
   return common::createExecutorInfo<
       ExecutorInfo,
+      ExecutorID,
       Resources,
-      CommandInfo>(std::forward<Args>(args)...);
+      CommandInfo,
+      FrameworkID>(std::forward<Args>(args)...);
 }
 
 
@@ -1439,8 +1551,10 @@ inline mesos::v1::ExecutorInfo createExecutorInfo(Args&&... args)
 {
   return common::createExecutorInfo<
       mesos::v1::ExecutorInfo,
+      mesos::v1::ExecutorID,
       mesos::v1::Resources,
-      mesos::v1::CommandInfo>(std::forward<Args>(args)...);
+      mesos::v1::CommandInfo,
+      mesos::v1::FrameworkID>(std::forward<Args>(args)...);
 }
 
 
@@ -1696,6 +1810,48 @@ inline mesos::v1::scheduler::Call createCallAccept(
 
   foreach (const mesos::v1::Offer::Operation& operation, operations) {
     accept->add_operations()->CopyFrom(operation);
+  }
+
+  return call;
+}
+
+
+inline mesos::v1::scheduler::Call createCallAcknowledge(
+    const mesos::v1::FrameworkID& frameworkId,
+    const mesos::v1::AgentID& agentId,
+    const mesos::v1::scheduler::Event::Update& update)
+{
+  mesos::v1::scheduler::Call call;
+  call.set_type(mesos::v1::scheduler::Call::ACKNOWLEDGE);
+  call.mutable_framework_id()->CopyFrom(frameworkId);
+
+  mesos::v1::scheduler::Call::Acknowledge* acknowledge =
+    call.mutable_acknowledge();
+
+  acknowledge->mutable_task_id()->CopyFrom(
+      update.status().task_id());
+
+  acknowledge->mutable_agent_id()->CopyFrom(agentId);
+  acknowledge->set_uuid(update.status().uuid());
+
+  return call;
+}
+
+
+inline mesos::v1::scheduler::Call createCallKill(
+    const mesos::v1::FrameworkID& frameworkId,
+    const mesos::v1::TaskID& taskId,
+    const Option<mesos::v1::KillPolicy>& killPolicy = None())
+{
+  mesos::v1::scheduler::Call call;
+  call.set_type(mesos::v1::scheduler::Call::KILL);
+  call.mutable_framework_id()->CopyFrom(frameworkId);
+
+  mesos::v1::scheduler::Call::Kill* kill = call.mutable_kill();
+  kill->mutable_task_id()->CopyFrom(taskId);
+
+  if (killPolicy.isSome()) {
+    kill->mutable_kill_policy()->CopyFrom(killPolicy.get());
   }
 
   return call;
