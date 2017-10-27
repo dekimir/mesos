@@ -14,8 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <gtest/gtest.h>
+#include <memory>
 
+#include <gtest/gtest.h>
 #include <mesos/mesos.hpp>
 #include <mesos/resources.hpp>
 
@@ -23,20 +24,18 @@
 
 using namespace mesos;
 using namespace mesos::internal;
+using namespace ramfuzz::runtime;
+using namespace std;
 
-class RamFuzzTest : public ::testing::Test {
-protected:
-  static ramfuzz::runtime::gen rfg;
-};
+extern unique_ptr<gen> global_gen;
 
-ramfuzz::runtime::gen RamFuzzTest::rfg;
 unsigned ramfuzz::runtime::spinlimit = 3;
 
-using RamFuzz_HTTPTest = RamFuzzTest;
+using RamFuzz_HTTPTest = ::testing::Test;
 
 TEST_F(RamFuzz_HTTPTest, ModelResources)
 {
-  rfg.make<Resources>(rfg.or_subclass);
+  global_gen->make<Resources>(global_gen->or_subclass);
 
   // Invariant: resources are grouped by (name, revocation) in a Resources
   // object.  There should be exactly one Resources element (between begin() and

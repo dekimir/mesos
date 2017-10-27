@@ -27,12 +27,21 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include <stdio.h>
+#include <memory>
 
 #include "gtest/gtest.h"
 
-GTEST_API_ int main(int argc, char **argv) {
-  printf("Running main() from gtest_main.cc\n");
-  testing::InitGoogleTest(&argc, argv);
+#include "ramfuzz-rt.hpp"
+
+using namespace ramfuzz::runtime;
+using namespace std;
+using namespace testing;
+
+unique_ptr<gen> global_gen;
+
+GTEST_API_ int main(int argc, char** argv)
+{
+  InitGoogleTest(&argc, argv);
+  global_gen.reset(new gen(argc, argv));
   return RUN_ALL_TESTS();
 }
