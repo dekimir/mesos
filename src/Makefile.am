@@ -80,7 +80,7 @@ EXTRA_DIST =
 PHONY_TARGETS =
 LDADD =
 
-AM_LDFLAGS =
+AM_LDFLAGS = -fsanitize=address
 
 if DISABLE_LIBTOOL_WRAPPERS
 # This is used to force libtool to generate executables instead of wrapper
@@ -131,6 +131,7 @@ MESOS_CPPFLAGS += -DPKGDATADIR=\"$(pkgdatadir)\"
 MESOS_CPPFLAGS += -DPKGMODULEDIR=\"$(pkgmoduledir)\"
 MESOS_CPPFLAGS += -I$(top_srcdir)/include
 MESOS_CPPFLAGS += -I../include
+MESOS_CPPFLAGS += -fsanitize=address
 
 # Protobuf headers that depend on mesos.pb.h need this.
 MESOS_CPPFLAGS += -I../include/mesos
@@ -2625,7 +2626,7 @@ EXTRA_DIST +=							\
   examples/python/test_executor.py				\
   examples/python/test_framework.py
 
-ramfuzz_tests_CPPFLAGS = $(mesos_tests_CPPFLAGS) -I../../ramfuzz -I../../../ramfuzz/runtime
+ramfuzz_tests_CPPFLAGS = $(mesos_tests_CPPFLAGS) -g -I../../ramfuzz -I../../../ramfuzz/runtime
 ramfuzz_tests_LDADD = libmesos.la $(mesos_tests_LDADD)
 
 check_PROGRAMS += ramfuzz-tests
