@@ -11,3 +11,6 @@
    and `check-ramfuzz` (to run them)
    * assumes RamFuzz source is in a directory `ramfuzz` sibling to top-level
      `mesos` to set include paths properly
+   * if you're building with `-Werror` (the default), you will need to manually
+     delete some unused variables from `fuzz.?pp`; otherwise, you'll see an
+     error similar to `fuzz.hpp:759:17: error: private field 'g' is not used`.
