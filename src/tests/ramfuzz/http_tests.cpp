@@ -35,5 +35,5 @@ using RamFuzz_HTTPTest = ::testing::Test;
 
 TEST_F(RamFuzz_HTTPTest, ModelResources)
 {
-  global_gen->make<Resources>(global_gen->or_subclass);
+  global_gen->make<Resources>(33, global_gen->or_subclass);
 }

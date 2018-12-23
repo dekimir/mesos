@@ -11,26 +11,26 @@ const Descriptor* makeDesc(gen& g)
 {
   FileDescriptorProto fp;
   fp.mutable_message_type()->AddAllocated(
-    g.make<DescriptorProto>(g.or_subclass));
-  return g.make<DescriptorPool>()->BuildFile(fp)->message_type(0);
+    g.make<DescriptorProto>(10, g.or_subclass));
+  return g.make<DescriptorPool>(11)->BuildFile(fp)->message_type(0);
 }
 
 const FileDescriptor* makeFileDesc(gen& g)
 {
   FileDescriptorProto fp;
   fp.mutable_message_type()->AddAllocated(
-    g.make<DescriptorProto>(g.or_subclass));
-  return g.make<DescriptorPool>()->BuildFile(fp);
+    g.make<DescriptorProto>(12, g.or_subclass));
+  return g.make<DescriptorPool>(13)->BuildFile(fp);
 }
 
 const FieldDescriptor* makeField(gen& g)
 {
   FileDescriptorProto fp;
   fp.mutable_message_type()->AddAllocated(
-    g.make<DescriptorProto>(g.or_subclass));
+    g.make<DescriptorProto>(14, g.or_subclass));
   fp.mutable_message_type(0)->mutable_field()->AddAllocated(
-    g.make<FieldDescriptorProto>(g.or_subclass));
-  return g.make<DescriptorPool>()->BuildFile(fp)->message_type(0)->field(0);
+    g.make<FieldDescriptorProto>(15, g.or_subclass));
+  return g.make<DescriptorPool>(16)->BuildFile(fp)->message_type(0)->field(0);
 }
 
 const OneofDescriptor* makeOneof(gen& g)
@@ -44,14 +44,14 @@ const OneofDescriptor* makeOneof(gen& g)
   // (likely from the FieldDescriptorProto::oneof_index, set by the parser).
   FileDescriptorProto fp;
   fp.mutable_message_type()->AddAllocated(
-    g.make<DescriptorProto>(g.or_subclass));
+    g.make<DescriptorProto>(17, g.or_subclass));
   fp.mutable_message_type(0)->mutable_field()->AddAllocated(
-    g.make<FieldDescriptorProto>(g.or_subclass));
+    g.make<FieldDescriptorProto>(18, g.or_subclass));
   fp.mutable_message_type(0)->mutable_field(0)->set_oneof_index(
-    *g.make<int32_t>());
+    *g.make<int32_t>(19));
   fp.mutable_message_type(0)->mutable_oneof_decl()->AddAllocated(
-    g.make<OneofDescriptorProto>());
-  return g.make<DescriptorPool>()
+    g.make<OneofDescriptorProto>(20));
+  return g.make<DescriptorPool>(21)
     ->BuildFile(fp)
     ->message_type(0)
     ->field(0)
@@ -61,11 +61,11 @@ const OneofDescriptor* makeOneof(gen& g)
 const EnumValueDescriptor* makeEnumVal(gen& g)
 {
   EnumDescriptorProto ep;
-  ep.mutable_value()->AddAllocated(g.make<EnumValueDescriptorProto>());
+  ep.mutable_value()->AddAllocated(g.make<EnumValueDescriptorProto>(22));
   FileDescriptorProto fp;
   fp.mutable_enum_type()->AddAllocated(
-    g.make<EnumDescriptorProto>(g.or_subclass));
-  return g.make<DescriptorPool>()->BuildFile(fp)->enum_type(0)->value(0);
+    g.make<EnumDescriptorProto>(23, g.or_subclass));
+  return g.make<DescriptorPool>(24)->BuildFile(fp)->enum_type(0)->value(0);
 }
 
 } // anonymous namespace
